@@ -1,0 +1,32 @@
+# Policy for the notes fixture servers.
+#
+# Relative paths are resolved against the PROJECT ROOT (the folder that
+# contains guard/), never the current working directory.
+#
+# Placeholders, filled in by guard/policy.py at load time:
+#   {python_base}    the Python installation running the server (sys.base_prefix)
+#   {venv}           the active virtual environment (sys.prefix)
+#   {server_script}  the server source file being tested
+
+name: notes_readonly
+description: Notes server may only read .txt files from its notes folder.
+
+filesystem:
+  # Files the server's tools are allowed to read. Any other file read is a violation.
+  read_allow:
+    - test_servers/allowed_notes
+  # No writes anywhere.
+  write_allow: []
+
+network:
+  # No inbound or outbound connections.
+  allow: false
+
+# Files the interpreter and server legitimately need just to start and run
+# (stdlib, installed packages, the server's own source). Step 2 will record
+# ALL file opens; anything under these paths is excluded from violations so
+# that Python's own imports don't drown out the real findings.
+runtime_allow:
+  - "{python_base}"
+  - "{venv}"
+  - "{server_script}"
