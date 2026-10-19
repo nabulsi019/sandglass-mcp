@@ -3,10 +3,12 @@
 # Relative paths are resolved against the PROJECT ROOT (the folder that
 # contains guard/), never the current working directory.
 #
-# Placeholders, filled in by guard/policy.py at load time:
+# Placeholders, filled in by guard/policy.py at load time (host paths, or
+# container paths with --sandbox):
 #   {python_base}    the Python installation running the server (sys.base_prefix)
 #   {venv}           the active virtual environment (sys.prefix)
 #   {server_script}  the server source file being tested
+#   {server_dir}     the folder containing the server source file
 
 name: notes_readonly
 description: Notes server may only read .txt files from its notes folder.
@@ -19,14 +21,26 @@ filesystem:
   write_allow: []
 
 network:
-  # No inbound or outbound connections.
+  # No inbound or outbound connections. Attempts count even when they fail.
   allow: false
 
+process:
+  # Programs the server may launch. The server's own launch (the first exec
+  # in the trace) is always allowed; anything else listed here must be explicit.
+  exec_allow: []
+
 # Files the interpreter and server legitimately need just to start and run
-# (stdlib, installed packages, the server's own source). Step 2 will record
-# ALL file opens; anything under these paths is excluded from violations so
-# that Python's own imports don't drown out the real findings.
+# (stdlib, installed packages, the server's own source). The sandbox records
+# ALL file opens; READS under these paths are excluded from violations so
+# Python's own imports don't drown out the real findings. Writes here are
+# still violations. System files (libc, locale, ...) live in the container
+# baseline, guard/baselines/python312_slim.yaml, loaded automatically.
+#
+# "=" means EXACT match, for directory listings only: Python's import system
+# lists the server's own folder (sys.path[0]). This allows that one listing,
+# but nothing inside the folder (e.g. test_servers/decoy_home/ stays off-limits).
 runtime_allow:
   - "{python_base}"
   - "{venv}"
   - "{server_script}"
+  - "={server_dir}"
