@@ -20,9 +20,9 @@ Please include:
 - steps to reproduce: the server or trace you used, the policy, the command line
 - the Sandglass version (commit or tag) and your OS / Docker setup
 
-You'll get a reply through the same channel. Once a fix is ready, it's released
-first and the details are published afterwards in a GitHub security advisory,
-crediting you unless you prefer otherwise.
+We aim to acknowledge reports within 7 days, through the same channel you used.
+Once a fix is ready, it's released first and the details are published
+afterwards in a GitHub security advisory, crediting you unless you prefer otherwise.
 
 Only the latest commit on `main` is supported. Fixes are not backported to older tags.
 
@@ -60,6 +60,10 @@ When Sandglass finds a real MCP server doing something its description doesn't
 admit, the finding is **disclosed privately to that server's maintainers first**:
 through their security policy, GitHub private vulnerability reporting, or a
 direct contact. Nothing is published (no issue, write-up, report or example)
-until the maintainers have had a chance to respond and fix it. Example reports in
-this repository only ever come from our own fixtures or from findings that have
-already been disclosed and resolved.
+before the deadline below.
+
+Findings in third-party MCP packages follow a 90-day coordinated disclosure
+deadline, or earlier if the maintainer releases a fix.
+
+Example reports in this repository only ever come from our own fixtures or
+from findings that have already been disclosed.
