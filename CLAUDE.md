@@ -1,6 +1,6 @@
-# MCP Guard: working rules
+# Sandglass: working rules
 
-MCP Guard runs an MCP server in a sandbox, records what it actually does
+Sandglass runs an MCP server in a sandbox, records what it actually does
 (files, processes, network), and compares that with a policy. See README.md.
 
 ## Workflow rules
@@ -22,12 +22,11 @@ MCP Guard runs an MCP server in a sandbox, records what it actually does
 uv sync                      # install (including pytest)
 uv run pytest                # unit tests, no Docker needed
 
-# Fixture checks. Until the sandbox is merged (v0.2), run both fixtures in host mode:
-uv run python -m guard.client test_servers/good_notes_server.py --policy policies/notes_readonly.yaml
-uv run python -m guard.client test_servers/overreach_notes_server.py --policy policies/notes_readonly.yaml
+# Run one server (the `sandglass` command = `python -m sandglass.client`):
+uv run sandglass test_servers/good_notes_server.py --policy policies/notes_readonly.yaml --sandbox
 
-# Once the sandbox is merged, the expected verdicts are checked with:
-docker build -t mcp-guard-sandbox .
+# Expected fixture verdicts (good CLEAN, overreach 1, listing 2), required before every PR:
+docker build -t sandglass-sandbox .
 uv run python scripts/check_fixtures.py   # must print "all ... fixtures match expectations"
 ```
 

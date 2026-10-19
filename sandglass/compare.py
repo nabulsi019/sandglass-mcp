@@ -31,8 +31,8 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-from guard.policy import Policy
-from guard.trace_parser import Event
+from sandglass.policy import Policy
+from sandglass.trace_parser import Event
 
 # Errors that mean "this exists but you're not allowed": a real access attempt.
 BLOCKED_ERRORS = {"EACCES", "EPERM"}
@@ -207,7 +207,7 @@ def write_reports(report: dict, reports_dir: Path) -> tuple[Path, Path]:
 def _markdown(r: dict) -> str:
     """Human-readable version of the report."""
     out = [
-        f"# MCP Guard report: {r['server']}",
+        f"# Sandglass report: {r['server']}",
         "",
         f"**Verdict: {r['verdict']}**",
         "",

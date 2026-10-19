@@ -1,6 +1,6 @@
 """Docker sandbox settings: container paths and the `docker run` command.
 
-The server runs inside the mcp-guard-sandbox image (see Dockerfile) under
+The server runs inside the sandglass-sandbox image (see Dockerfile) under
 strace. Inside the container:
 
     /project    the project folder, mounted READ-ONLY
@@ -13,9 +13,9 @@ import shutil
 import subprocess
 from pathlib import Path, PurePosixPath
 
-from guard import PROJECT_ROOT
+from sandglass import PROJECT_ROOT
 
-IMAGE = "mcp-guard-sandbox"
+IMAGE = "sandglass-sandbox"
 
 CONTAINER_PROJECT = PurePosixPath("/project")
 CONTAINER_TRACE_DIR = PurePosixPath("/trace")
