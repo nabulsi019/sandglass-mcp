@@ -1,0 +1,33 @@
+# Builds the sandbox image and checks every fixture's verdict under strace.
+# Runs on x86_64 Linux, so it also proves {multiarch} resolves inside the image.
+name: Sandbox
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  fixtures:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.1"
+      - name: Install dependencies (exactly as locked)
+        run: uv sync --locked
+      - name: Build sandbox image
+        run: docker build -t mcp-guard-sandbox .
+      - name: Check fixture verdicts (good CLEAN, overreach 1, listing 2)
+        run: uv run python scripts/check_fixtures.py
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports
+          path: reports/
