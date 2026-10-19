@@ -1,0 +1,24 @@
+# Unit tests on every PR (and on main after a merge). No Docker needed.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.1"   # same uv as local development
+      - name: Install dependencies (exactly as locked)
+        run: uv sync --locked
+      - name: Run tests
+        run: uv run pytest -v
