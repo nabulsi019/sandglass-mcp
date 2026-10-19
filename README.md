@@ -209,3 +209,9 @@ uv run pytest
 4. **Disclose real findings privately.** If you find a real server misbehaving,
    report it privately to its maintainers (security contact or private advisory)
    and give them time to fix it before you publish anything.
+
+## License
+
+Copyright 2026 Mohammed AlNabulsi.
+
+Licensed under the [Apache License, Version 2.0](LICENSE). See [NOTICE](NOTICE).

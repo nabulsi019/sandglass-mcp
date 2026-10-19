@@ -6,7 +6,8 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
 ## Workflow rules
 
 - **One branch per issue**: `feat/<issue#>-short-name`. **Never commit or push to `main`.**
-  (Branch protection is not available on this private repo, so this rule is the only guard.)
+  (Branch protection was not available while the repo was private. Once it is public it can
+  be turned on for `main`; until then this rule is the only guard.)
 - **Open a PR with `Closes #<n>`. Never merge.** The owner reviews and merges.
 - **Before opening a PR**: tests pass locally, and the fixtures give the expected
   verdicts (see Commands below). Put the real results in the PR's "How I tested it".
