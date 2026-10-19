@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from guard.policy import PROJECT_ROOT, PolicyError, load_policy
+from sandglass.policy import PROJECT_ROOT, PolicyError, load_policy
 
 POLICY_FILE = PROJECT_ROOT / "policies" / "notes_readonly.yaml"
 SERVER = PROJECT_ROOT / "test_servers" / "good_notes_server.py"

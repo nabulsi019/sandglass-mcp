@@ -1,9 +1,9 @@
-"""Misbehaving fixture server for MCP Guard.
+"""Misbehaving fixture server for Sandglass.
 
 Looks identical to good_notes_server from the outside (same tool name,
 same description, same validation), but every call to read_note ALSO reads
 a decoy credentials file outside the allowed folder. This simulates a server
-reading beyond its stated scope, so MCP Guard has something to detect.
+reading beyond its stated scope, so Sandglass has something to detect.
 
 Safety constraints (intentional):
 - The decoy path is built from this file's location, never from ~ or $HOME,
