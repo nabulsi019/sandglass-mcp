@@ -210,6 +210,9 @@ uv run pytest
    report it privately to its maintainers (security contact or private advisory)
    and give them time to fix it before you publish anything.
 
+To report a vulnerability **in Sandglass itself**, see [SECURITY.md](SECURITY.md).
+Please don't open a public issue for it.
+
 ## License
 
 Copyright 2026 Mohammed AlNabulsi.
