@@ -1,12 +1,15 @@
-# MCP Guard
+# Sandglass
 
-MCP Guard is a security research tool for [Model Context Protocol](https://modelcontextprotocol.io)
+Sandglass is a security research tool for [Model Context Protocol](https://modelcontextprotocol.io)
 servers. The goal: run an MCP server in isolation, exercise its tools, record
 what it **actually does** (files, processes, network), and compare that with a
 stated **policy**.
 
-A server's tool description says what it *claims* to do. MCP Guard checks what
+A server's tool description says what it *claims* to do. Sandglass checks what
 it *really* does.
+
+Repository: <https://github.com/nabulsi019/sandglass-mcp>. Formerly **MCP Guard**
+(the `v0.2` tag predates the rename).
 
 > **Status: v0.2 (first demo).** Servers run in a Docker sandbox under `strace`.
 > Every file open, process exec and network attempt is recorded and compared
@@ -15,7 +18,7 @@ it *really* does.
 ## Layout
 
 ```
-guard/
+sandglass/
   client.py          Runs a server over stdio, calls each tool once; --sandbox adds tracing + report
   sandbox.py         Container paths and the `docker run ... strace ...` command
   trace_parser.py    strace output -> file / probe / process / network / exit events
@@ -27,7 +30,7 @@ policies/
   notes_readonly.yaml
 scripts/
   check_fixtures.py  Runs all fixtures in the sandbox and checks the expected verdicts
-test_servers/        Fixture servers written for testing MCP Guard. Not real targets.
+test_servers/        Fixture servers written for testing Sandglass. Not real targets.
   good_notes_server.py       read_note(name): reads only from allowed_notes/
   overreach_notes_server.py  Same tool, but also reads decoy_home/.fake_credentials
   listing_notes_server.py    Same tool, but also reads /etc/passwd and lists decoy_home/
@@ -45,7 +48,7 @@ Requires [uv](https://docs.astral.sh/uv/) and, for the sandbox, Docker
 
 ```bash
 uv sync
-docker build -t mcp-guard-sandbox .   # rebuild only when dependencies change
+docker build -t sandglass-sandbox .   # rebuild only when dependencies change
 ```
 
 The image installs the project's locked dependencies (`uv.lock`) into
@@ -54,10 +57,12 @@ The image installs the project's locked dependencies (`uv.lock`) into
 ## Running a server in the sandbox
 
 ```bash
-uv run python -m guard.client test_servers/good_notes_server.py      --policy policies/notes_readonly.yaml --sandbox
-uv run python -m guard.client test_servers/overreach_notes_server.py --policy policies/notes_readonly.yaml --sandbox
-uv run python -m guard.client test_servers/listing_notes_server.py   --policy policies/notes_readonly.yaml --sandbox
+uv run sandglass test_servers/good_notes_server.py      --policy policies/notes_readonly.yaml --sandbox
+uv run sandglass test_servers/overreach_notes_server.py --policy policies/notes_readonly.yaml --sandbox
+uv run sandglass test_servers/listing_notes_server.py   --policy policies/notes_readonly.yaml --sandbox
 ```
+
+`sandglass` is a console script for `python -m sandglass.client`; both work.
 
 Expected verdicts:
 
@@ -82,7 +87,7 @@ The client runs:
 
 ```
 docker run -i --rm --network none --read-only --tmpfs /tmp --user 10001:10001 \
-  -v <project>:/project:ro -v reports/trace/<run>:/trace:rw -w /project mcp-guard-sandbox \
+  -v <project>:/project:ro -v reports/trace/<run>:/trace:rw -w /project sandglass-sandbox \
   strace -f -tt -e trace=file,process,network -o /trace/trace.txt /opt/venv/bin/python <server>
 ```
 
@@ -96,7 +101,7 @@ docker run -i --rm --network none --read-only --tmpfs /tmp --user 10001:10001 \
 ### Without `--sandbox`
 
 ```bash
-uv run python -m guard.client test_servers/good_notes_server.py --policy policies/notes_readonly.yaml
+uv run sandglass test_servers/good_notes_server.py --policy policies/notes_readonly.yaml
 ```
 
 Runs the server directly on your machine with no tracing and no report. Useful
@@ -124,7 +129,7 @@ runtime_allow:                               # READS only, excluded from violati
 
 **Path resolution:** relative paths in a policy are resolved against the
 **project root**, **not the current working directory**: the folder that
-contains `guard/` on the host, or `/project` in the sandbox. Absolute paths
+contains `sandglass/` on the host, or `/project` in the sandbox. Absolute paths
 are used as-is.
 
 **Placeholders** are filled in at load time, with container paths in `--sandbox` mode:
@@ -145,7 +150,7 @@ for directory listings**. `={server_dir}` exists because Python's import
 system lists the server's folder (`sys.path[0]`). A prefix entry there would
 also cover `test_servers/decoy_home/` and hide the very thing we test for.
 
-**Container baseline:** `guard/baselines/python312_slim.yaml` holds system files
+**Container baseline:** `sandglass/baselines/python312_slim.yaml` holds system files
 the image reads at startup (dynamic linker cache, libc and friends under
 `/lib/{multiarch}`, locale data, `/etc/localtime`, OpenSSL config, cgroup CPU
 quota, `/dev/null`). It's loaded automatically with `--sandbox`, and every
@@ -179,7 +184,7 @@ uv run pytest
 ## Known limitations
 
 - **The whole project is mounted read-only into the container**, so a server
-  can read `guard/`, `policies/` and the other fixtures. That is acceptable for
+  can read `sandglass/`, `policies/` and the other fixtures. That is acceptable for
   our own fixtures. For real packages, only the package itself should be mounted
   (planned for v0.4).
 - **Paths are compared as text.** strace shows the path the server asked for, not

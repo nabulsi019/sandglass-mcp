@@ -1,9 +1,9 @@
 # Policy for the notes fixture servers.
 #
 # Relative paths are resolved against the PROJECT ROOT (the folder that
-# contains guard/), never the current working directory.
+# contains sandglass/), never the current working directory.
 #
-# Placeholders, filled in by guard/policy.py at load time (host paths, or
+# Placeholders, filled in by sandglass/policy.py at load time (host paths, or
 # container paths with --sandbox):
 #   {python_base}    the Python installation running the server (sys.base_prefix)
 #   {venv}           the active virtual environment (sys.prefix)
@@ -34,7 +34,7 @@ process:
 # ALL file opens; READS under these paths are excluded from violations so
 # Python's own imports don't drown out the real findings. Writes here are
 # still violations. System files (libc, locale, ...) live in the container
-# baseline, guard/baselines/python312_slim.yaml, loaded automatically.
+# baseline, sandglass/baselines/python312_slim.yaml, loaded automatically.
 #
 # "=" means EXACT match, for directory listings only: Python's import system
 # lists the server's own folder (sys.path[0]). This allows that one listing,

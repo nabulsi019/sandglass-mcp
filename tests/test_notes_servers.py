@@ -10,7 +10,7 @@ import sys
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
-from guard.policy import PROJECT_ROOT
+from sandglass.policy import PROJECT_ROOT
 
 SERVERS = PROJECT_ROOT / "test_servers"
 

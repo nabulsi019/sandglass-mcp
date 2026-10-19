@@ -1,4 +1,4 @@
-"""Minimal MCP Guard client.
+"""Minimal Sandglass client.
 
 Launches an MCP server as a subprocess over stdio, lists its tools, calls
 each tool once with a simple safe input, and prints what came back.
@@ -8,7 +8,7 @@ afterwards the trace is compared with the policy and a report is written
 to reports/<server>_<timestamp>.json and .md.
 
 Usage:
-    uv run python -m guard.client <server.py> [--policy <policy.yaml>] [--sandbox]
+    uv run python -m sandglass.client <server.py> [--policy <policy.yaml>] [--sandbox]
 
 With --sandbox the exit code is the verdict: 0 CLEAN, 1 VIOLATIONS, 2 INCOMPLETE.
 """
@@ -23,10 +23,10 @@ from pathlib import Path
 from mcp import ClientSession, StdioServerParameters, stdio_client
 from mcp.types import CallToolResult, TextContent, Tool
 
-from guard import PROJECT_ROOT, sandbox
-from guard.compare import build_report, compare, write_reports
-from guard.policy import BASELINE_FILE, Policy, load_policy
-from guard.trace_parser import parse_trace
+from sandglass import PROJECT_ROOT, sandbox
+from sandglass.compare import build_report, compare, write_reports
+from sandglass.policy import BASELINE_FILE, Policy, load_policy
+from sandglass.trace_parser import parse_trace
 
 # The one input value we use for every string argument. For the notes
 # servers this means read_note("hello") -> allowed_notes/hello.txt.

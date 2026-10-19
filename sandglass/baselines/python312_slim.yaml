@@ -1,4 +1,4 @@
-# Container baseline for the mcp-guard-sandbox image (python:3.12-slim).
+# Container baseline for the sandglass-sandbox image (python:3.12-slim).
 #
 # Files the Python interpreter and its C libraries READ just by starting up,
 # found in real traces of the notes fixtures. Loaded automatically in
