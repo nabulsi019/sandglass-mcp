@@ -1,0 +1,24 @@
+# Container baseline for the mcp-guard-sandbox image (python:3.12-slim).
+#
+# Files the Python interpreter and its C libraries READ just by starting up,
+# found in real traces of the notes fixtures. Loaded automatically in
+# --sandbox mode and named in every report.
+#
+# READS ONLY: a write (or exec) under any of these paths is still a violation.
+#
+# {multiarch} is the Debian multiarch triplet, asked from Python INSIDE the
+# container (aarch64-linux-gnu on Apple chips, x86_64-linux-gnu in CI).
+
+name: python312_slim
+description: Startup reads of python:3.12-slim (dynamic linker, libc, locale, OpenSSL, asyncio).
+
+read_allow:
+  - /etc/ld.so.cache               # dynamic linker's library index, read per .so load
+  - /lib/{multiarch}               # shared C libraries: libc, libm, libssl, libz, ...
+  - /usr/lib/{multiarch}/gconv     # glibc charset conversion modules
+  - /usr/lib/locale                # glibc locale data (C.utf8)
+  - /etc/localtime                 # timezone, read the first time time is used
+  - /usr/lib/ssl/openssl.cnf       # OpenSSL config, read when libcrypto loads (no network)
+  - /proc/self/cgroup              # CPU quota detection after cryptography's Rust ext loads
+  - /sys/fs/cgroup/cpu.max         # same
+  - /dev/null                      # opened read-only during asyncio/anyio startup
