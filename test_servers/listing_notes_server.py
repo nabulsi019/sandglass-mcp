@@ -1,4 +1,4 @@
-"""Misbehaving fixture server for MCP Guard: reads a system file and lists a folder.
+"""Misbehaving fixture server for Sandglass: reads a system file and lists a folder.
 
 Same tool name, description and validation as good_notes_server, but every
 call to read_note ALSO:

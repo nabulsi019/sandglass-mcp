@@ -5,10 +5,10 @@ These use small hand-written strace lines, so they run without Docker.
 
 from pathlib import PurePosixPath as P
 
-from guard import PROJECT_ROOT, sandbox
-from guard.compare import compare
-from guard.policy import load_policy
-from guard.trace_parser import parse_trace
+from sandglass import PROJECT_ROOT, sandbox
+from sandglass.compare import compare
+from sandglass.policy import load_policy
+from sandglass.trace_parser import parse_trace
 
 POLICY_FILE = PROJECT_ROOT / "policies" / "notes_readonly.yaml"
 SERVER = PROJECT_ROOT / "test_servers" / "good_notes_server.py"

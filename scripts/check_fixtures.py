@@ -3,14 +3,14 @@
 Used before opening a PR and by the CI sandbox job. Exits 0 only if every
 fixture matches its expectation exactly.
 
-    docker build -t mcp-guard-sandbox .
+    docker build -t sandglass-sandbox .
     uv run python scripts/check_fixtures.py
 """
 
 import sys
 
-from guard import PROJECT_ROOT
-from guard.client import run_sandboxed
+from sandglass import PROJECT_ROOT
+from sandglass.client import run_sandboxed
 
 POLICY = PROJECT_ROOT / "policies" / "notes_readonly.yaml"
 

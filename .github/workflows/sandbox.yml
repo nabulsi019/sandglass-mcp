@@ -22,7 +22,7 @@ jobs:
       - name: Install dependencies (exactly as locked)
         run: uv sync --locked
       - name: Build sandbox image
-        run: docker build -t mcp-guard-sandbox .
+        run: docker build -t sandglass-sandbox .
       - name: Check fixture verdicts (good CLEAN, overreach 1, listing 2)
         run: uv run python scripts/check_fixtures.py
       - name: Upload reports

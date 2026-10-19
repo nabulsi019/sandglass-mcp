@@ -1,9 +1,9 @@
-# MCP Guard sandbox image: Python 3.12 + strace + the project's locked dependencies.
+# Sandglass sandbox image: Python 3.12 + strace + the project's locked dependencies.
 #
-# Build:  docker build -t mcp-guard-sandbox .
+# Build:  docker build -t sandglass-sandbox .
 #
 # Only dependencies are baked in. The project source is mounted read-only at
-# /project at run time (see guard/sandbox.py), so editing a server never
+# /project at run time (see sandglass/sandbox.py), so editing a server never
 # requires a rebuild. The host's macOS .venv is never used.
 
 FROM python:3.12-slim
@@ -33,8 +33,8 @@ RUN uv sync --frozen --no-install-project --no-dev && rm -rf /build
 # now so Python doesn't try to write them into /usr/local at run time.
 RUN python -m compileall -q /usr/local/lib/python3.12
 
-# Non-root user that runs the server. guard/sandbox.py passes the same uid with --user.
-RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin guard
+# Non-root user that runs the server. sandglass/sandbox.py passes the same uid with --user.
+RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin sandglass
 USER 10001:10001
 
 ENV PATH=/opt/venv/bin:$PATH

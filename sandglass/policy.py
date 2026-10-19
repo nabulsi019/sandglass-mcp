@@ -1,11 +1,11 @@
-"""Load and validate MCP Guard policy files (and the container baseline).
+"""Load and validate Sandglass policy files (and the container baseline).
 
-A policy states what a server is ALLOWED to do. guard/compare.py checks the
+A policy states what a server is ALLOWED to do. sandglass/compare.py checks the
 recorded behaviour against it.
 
 Path resolution rule: every relative path in a policy is resolved against
 the PROJECT ROOT, NOT the current working directory:
-  - host mode:    the folder containing guard/
+  - host mode:    the folder containing sandglass/
   - sandbox mode: /project, where the project is mounted in the container
 That way the policy means the same thing wherever you launch the client from.
 
@@ -16,7 +16,7 @@ Exact-match entries: a runtime_allow entry starting with "=" (e.g.
 "={server_dir}") matches ONLY that exact directory, and only for directory
 listings. It never allows anything inside the directory.
 
-In sandbox mode the container baseline (guard/baselines/python312_slim.yaml)
+In sandbox mode the container baseline (sandglass/baselines/python312_slim.yaml)
 is loaded automatically: system files the interpreter reads at startup.
 runtime_allow and the baseline allow READS (and listings) only, never writes.
 """
@@ -28,10 +28,10 @@ from pathlib import Path, PurePosixPath
 
 import yaml
 
-from guard import PROJECT_ROOT
-from guard import sandbox
+from sandglass import PROJECT_ROOT
+from sandglass import sandbox
 
-BASELINE_FILE = PROJECT_ROOT / "guard" / "baselines" / "python312_slim.yaml"
+BASELINE_FILE = PROJECT_ROOT / "sandglass" / "baselines" / "python312_slim.yaml"
 
 
 class PolicyError(ValueError):

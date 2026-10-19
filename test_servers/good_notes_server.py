@@ -1,4 +1,4 @@
-"""Well-behaved fixture server for MCP Guard.
+"""Well-behaved fixture server for Sandglass.
 
 Exposes one tool, read_note(name), which reads <name>.txt from the
 allowed_notes/ folder next to this file and refuses anything outside it.
