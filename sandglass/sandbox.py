@@ -15,8 +15,9 @@ read, change or delete it. There is no trace file in the container at all:
   1. strace writes the trace to the container's stderr. The client saves that
      stream to reports/trace/<run>/trace.txt on the HOST.
   2. The server never gets a handle on that stream. `sh` gives strace an
-     extra fd 3 pointing at /dev/null; the launcher below swaps the server's
-     stderr for it (and closes fd 3) before any package code runs.
+     extra fd 3 pointing at /dev/null; the launcher (sandglass/launcher.py)
+     swaps the server's stderr for it (and closes fd 3) before any package
+     code runs.
   3. strace's own fds can't be reopened through /proc/1/fd/...: the Dockerfile
      makes the strace binary executable but not readable, which makes the
      strace process "non-dumpable", so the server gets EACCES there.
@@ -43,26 +44,13 @@ CONTAINER_USER = "10001:10001"
 # sandbox/decoy_home/. The host's home is never mounted.
 CONTAINER_HOME = PurePosixPath("/home/sandglass")
 
-# Runs first inside the traced Python (`python -S -c LAUNCHER <server>`), in
-# this order:
-#   - point the server's stderr (fd 2, which is the trace stream) at /dev/null
-#     (fd 3, opened by sh), then close fd 3
-#   - make sys.argv / sys.path[0] look like `python <server>` would
-#   - only THEN load site-packages (-S skipped it, because .pth files there can
-#     run code), and run the server as __main__
-# Everything before site.main() is frozen stdlib, so no package code runs while
-# the trace stream is still reachable.
-LAUNCHER = "; ".join([
-    "import os, sys",
-    "os.dup2(3, 2)",
-    "os.close(3)",
-    "sys.argv = sys.argv[1:]",
-    "sys.path[0] = os.path.dirname(sys.argv[0])",
-    "import site",
-    "site.main()",
-    "import runpy",
-    "runpy.run_path(sys.argv[0], run_name='__main__')",
-])
+# The launcher (sandglass/launcher.py) runs first inside the traced Python as
+# `python -S -c LAUNCHER <server>`: it hides the trace stream from the server,
+# starts the local network sink, then runs the server. Its source is read here,
+# on the host, so the container doesn't have to read an extra file.
+LAUNCHER = (PROJECT_ROOT / "sandglass" / "launcher.py").read_text(encoding="utf-8")
+# The local network sink the launcher starts (see sandglass/netsink.py).
+NETSINK = (PROJECT_ROOT / "sandglass" / "netsink.py").read_text(encoding="utf-8")
 
 
 def to_container_path(host_path: Path) -> PurePosixPath:
@@ -114,7 +102,7 @@ def docker_command(server_script: Path) -> tuple[str, list[str]]:
     #   -o /proc/self/fd/2   write to strace's own stderr; strace opens it
     #                    close-on-exec, so the server doesn't inherit that copy
     strace = ("exec strace -f -tt -e trace=file,process,network --kill-on-exit"
-              f" -o /proc/self/fd/2 {CONTAINER_PYTHON} -S -c \"$1\" \"$2\" 3>/dev/null")
+              f" -o /proc/self/fd/2 {CONTAINER_PYTHON} -S -c \"$1\" \"$2\" \"$3\" 3>/dev/null")
     args = [
         "run",
         "-i",                       # keep stdin open: it's the MCP stdio channel
@@ -129,9 +117,9 @@ def docker_command(server_script: Path) -> tuple[str, list[str]]:
         "--mount", f"type=tmpfs,destination={CONTAINER_REPORTS},tmpfs-mode=0555",
         "-w", str(CONTAINER_PROJECT),
         IMAGE,
-        # sh runs before strace, so it isn't traced. "$1"/"$2" are the
-        # launcher code and the server path, passed as separate arguments.
+        # sh runs before strace, so it isn't traced. "$1"/"$2"/"$3" are the
+        # launcher code, the server path and the sink code, as separate arguments.
         "sh", "-c", strace, "sandglass-launch",
-        LAUNCHER, str(to_container_path(server_script)),
+        LAUNCHER, str(to_container_path(server_script)), NETSINK,
     ]
     return docker, args
