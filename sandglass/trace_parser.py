@@ -72,6 +72,8 @@ UNFINISHED = "<unfinished ...>"
 EXIT_RE = re.compile(r"^\+\+\+ (exited with \d+|killed by \w+.*) \+\+\+$")
 # A double-quoted strace string, allowing escaped characters inside.
 STRING_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
+# Target for an exec whose arguments strace couldn't read.
+UNREADABLE = "<unreadable>"
 
 
 @dataclass
@@ -138,7 +140,13 @@ def _classify(syscall: str, args: str, cwd: str) -> tuple[str, str, str | None] 
         # already-open fd, not a new path, so it's skipped.
         return "probe", _absolute(strings[0], args, cwd), None
 
-    if syscall in EXEC_SYSCALLS and strings:
+    if syscall in EXEC_SYSCALLS:
+        if not strings:
+            # strace couldn't read the arguments (shown as addresses). This
+            # happens for the very first exec, because the strace binary is
+            # non-dumpable (see sandbox.py). Keep it: compare.py treats only the
+            # FIRST exec as the server launch; any other is still a violation.
+            return "process", UNREADABLE, None
         return "process", _absolute(strings[0], args, cwd), None
 
     if syscall in NETWORK_SYSCALLS:

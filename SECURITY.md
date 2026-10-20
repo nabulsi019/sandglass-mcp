@@ -36,8 +36,9 @@ Only the latest commit on `main` is supported. Fixes are not backported to older
 - **Verdict integrity**: a run that should be INCOMPLETE (server didn't start,
   truncated trace, failed session) is reported as CLEAN.
 - **Sandbox weaknesses in our configuration**: the `docker run` command or the
-  Dockerfile letting a server write outside `/trace` and `/tmp`, reach the
-  network despite `--network none`, gain privileges, or affect the host.
+  Dockerfile letting a server write outside `/tmp`, read or change its own
+  trace, reach the network despite `--network none`, gain privileges, or
+  affect the host.
 - **Unsafe handling of inputs**: policy files, baselines, traces or MCP responses
   that can make Sandglass itself misbehave (code execution, writing outside `reports/`).
 - **This repository**: secrets committed by mistake, or CI workflows that can be abused.

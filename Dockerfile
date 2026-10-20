@@ -13,6 +13,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends strace \
     && rm -rf /var/lib/apt/lists/*
 
+# Executable but NOT readable for the server's user. Linux marks a process
+# running an unreadable binary "non-dumpable", so the server (same uid) can't
+# open strace's file descriptors through /proc/1/fd/... and reach the trace.
+RUN chmod 0711 /usr/bin/strace
+
 # uv, pinned to the same version used on the host, installs from uv.lock.
 COPY --from=ghcr.io/astral-sh/uv:0.13.1 /uv /usr/local/bin/uv
 

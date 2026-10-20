@@ -168,7 +168,7 @@ def test_sandbox_placeholders_and_multiarch():
 
 
 def test_docker_command_is_least_privilege():
-    _, args = sandbox.docker_command(SERVER, PROJECT_ROOT / "reports" / "trace" / "x")
+    _, args = sandbox.docker_command(SERVER)
     joined = " ".join(args)
     assert "--network none" in joined
     assert "--read-only" in joined
@@ -176,6 +176,45 @@ def test_docker_command_is_least_privilege():
     assert f"{PROJECT_ROOT}:/project:ro" in joined
     assert "--cap-add" not in joined and "--privileged" not in joined
     assert ".venv" not in joined  # the Mac's venv is never mounted
+
+
+# --- trace integrity (#47) ---------------------------------------------------
+
+def test_trace_is_never_a_file_in_the_container():
+    _, args = sandbox.docker_command(SERVER)
+    joined = " ".join(args)
+    # No read-write mount at all: the only -v is the read-only project.
+    volumes = [args[i + 1] for i, a in enumerate(args) if a == "-v"]
+    assert volumes == [f"{PROJECT_ROOT}:/project:ro"]
+    # strace writes to its stderr, and the server's stderr is swapped out.
+    assert "-o /proc/self/fd/2" in joined and "3>/dev/null" in joined
+    assert "--kill-on-exit" in joined
+    # reports/ (where the host keeps traces) is covered by an empty read-only tmpfs.
+    assert "type=tmpfs,destination=/project/reports,tmpfs-mode=0555" in joined
+
+
+def test_launcher_closes_the_trace_stream_before_loading_packages():
+    steps = sandbox.LAUNCHER.split("; ")
+    # fd 2 swapped and fd 3 closed before site.main() (which runs .pth files)
+    # and before the server itself runs.
+    assert steps.index("os.dup2(3, 2)") < steps.index("site.main()")
+    assert steps.index("os.close(3)") < steps.index("site.main()")
+    assert steps[-1].startswith("runpy.run_path(")
+
+
+UNREADABLE_EXEC = '8  10:00:00.000001 execve(0x7ffdc67270d0, 0x7ffdc6728518, 0x7ffdc6728548) = 0'
+
+
+def test_unreadable_first_exec_is_the_server_launch():
+    # The non-dumpable strace can't read the first execve's arguments.
+    result = run([UNREADABLE_EXEC, NOTE_READ, EXITED])
+    assert result["verdict"] == "CLEAN"
+
+
+def test_unreadable_later_exec_is_still_a_violation():
+    later = '11 10:00:00.2 execve(0x7ffdc67270d0, 0x7ffdc6728518, 0x7ffdc6728548) = 0'
+    result = run([LAUNCH, later, EXITED])
+    assert [v["target"] for v in result["violations"]] == ["<unreadable>"]
 
 
 def test_probes_grouped_by_path_with_counts_per_syscall():
