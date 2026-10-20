@@ -14,7 +14,13 @@ from sandglass.client import run_sandboxed
 
 POLICY = PROJECT_ROOT / "policies" / "notes_readonly.yaml"
 
+# Requests the network sink must have recorded, per fixture (others: none).
+EXPECTED_DOMAINS = {
+    "undeclared_domain_server.py": [("GET", "undeclared.example", 80)],
+}
+
 # fixture -> (expected verdict, expected set of (mode, path) violations)
+# (mode is None for an exec, "domain" for a domain asked of the network sink)
 EXPECTED = {
     "good_notes_server.py": ("CLEAN", set()),
     "overreach_notes_server.py": ("VIOLATIONS", {
@@ -31,6 +37,10 @@ EXPECTED = {
     # Starts /bin/sh. Exec violations have no mode, hence None.
     "shell_command_server.py": ("VIOLATIONS", {
         (None, "/bin/sh"),
+    }),
+    # Sends a GET to undeclared.example; the local sink records it.
+    "undeclared_domain_server.py": ("VIOLATIONS", {
+        ("domain", "undeclared.example"),
     }),
     # Tries to read, overwrite and delete its trace. Only the /proc attempts on
     # strace's fds get as far as EACCES (= violation); the rest fail with ENOENT.
@@ -53,6 +63,16 @@ def main() -> int:
         if not ok:
             failures.append(f"{fixture}: expected {want_verdict} {sorted(want_violations)}, "
                             f"got {report['verdict']} {sorted(got)}")
+
+        # Every run: the sandbox must have no route out (the sink's check failed)...
+        isolation = report["network_isolation"]
+        if not isolation or isolation["succeeded"]:
+            failures.append(f"{fixture}: network isolation check did not fail: {isolation}")
+        # ...and the sink logged exactly the requests we expect.
+        domains = [(d["method"], d["host"], d["port"]) for d in report["domains"]]
+        if domains != EXPECTED_DOMAINS.get(fixture, []):
+            failures.append(f"{fixture}: expected sink requests {EXPECTED_DOMAINS.get(fixture, [])}, "
+                            f"got {domains}")
 
     print("\n===== summary =====")
     for line in failures:
