@@ -19,6 +19,7 @@ read_allow:
   - /usr/lib/locale                # glibc locale data (C.utf8)
   - /etc/localtime                 # timezone, read the first time time is used
   - /usr/lib/ssl/openssl.cnf       # OpenSSL config, read when libcrypto loads (no network)
+  - /usr/lib/ssl/cert.pem          # system CA certificates (public), loaded when an HTTPS-capable client is set up
   - /proc/self/cgroup              # CPU quota detection after cryptography's Rust ext loads
   - /sys/fs/cgroup/cpu.max         # same
   - /proc/self/mountinfo           # cgroup v1 hosts: finding where the cpu controller is mounted
