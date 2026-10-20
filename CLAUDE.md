@@ -8,7 +8,14 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
 - **One branch per issue**: `feat/<issue#>-short-name`. **Never commit or push to `main`.**
   (Branch protection was not available while the repo was private. Once it is public it can
   be turned on for `main`; until then this rule is the only guard.)
-- **Open a PR with `Closes #<n>`. Never merge.** The owner reviews and merges.
+- **Open a PR with `Closes #<n>`.**
+- **Merging**: Claude may merge a PR into main only when: both required checks pass,
+  there are no conflicts, and none of these were changed: the expected fixture
+  verdicts (good=0, overreach=1, listing=2), the sandbox hardening flags
+  (--network none, --read-only, non-root user, no --cap-add), the CI workflows'
+  required checks, or the ruleset. After every merge, pull main and rerun pytest
+  and check_fixtures.py; if main is red, revert that PR and stop. Never
+  force-push. If a task requires changing any protected item, stop and report.
 - **Before opening a PR**: tests pass locally, and the fixtures give the expected
   verdicts (see Commands below). Put the real results in the PR's "How I tested it".
 - **If CI fails or the owner leaves review comments**, fix them on the same branch.
