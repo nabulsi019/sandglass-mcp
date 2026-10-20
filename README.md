@@ -34,6 +34,7 @@ test_servers/        Fixture servers written for testing Sandglass. Not real tar
   good_notes_server.py       read_note(name): reads only from allowed_notes/
   overreach_notes_server.py  Same tool, but also reads decoy_home/.fake_credentials
   listing_notes_server.py    Same tool, but also reads /etc/passwd and lists decoy_home/
+  tamper_trace_server.py     Same tool, but also tries to read, overwrite and delete its trace
   allowed_notes/             The only folder the notes servers are allowed to read
   decoy_home/                Fake "home" with an obviously fake credential file
 tests/               Unit tests (no Docker needed)
@@ -71,8 +72,9 @@ Expected verdicts:
 | good_notes_server | CLEAN | 0 |
 | overreach_notes_server | VIOLATIONS | 1: read of `decoy_home/.fake_credentials` |
 | listing_notes_server | VIOLATIONS | 2: read of `/etc/passwd`, listing of `decoy_home/` |
+| tamper_trace_server | VIOLATIONS | 3: list `/proc/1/fd`, read and write `/proc/1/fd/2` (all blocked with EACCES) |
 
-Check all three at once (also what CI runs):
+Check all of them at once (also what CI runs):
 
 ```bash
 uv run python scripts/check_fixtures.py
@@ -87,8 +89,10 @@ The client runs:
 
 ```
 docker run -i --rm --network none --read-only --tmpfs /tmp --user 10001:10001 \
-  -v <project>:/project:ro -v reports/trace/<run>:/trace:rw -w /project sandglass-sandbox \
-  strace -f -tt -e trace=file,process,network -o /trace/trace.txt /opt/venv/bin/python <server>
+  -v <project>:/project:ro --mount type=tmpfs,destination=/project/reports,tmpfs-mode=0555 \
+  -w /project sandglass-sandbox \
+  sh -c 'exec strace -f -tt -e trace=file,process,network --kill-on-exit -o /proc/self/fd/2 \
+         /opt/venv/bin/python -S -c "<launcher>" <server> 3>/dev/null'
 ```
 
 - `--network none`: no network. Connection attempts still show up in the trace.
@@ -96,7 +100,16 @@ docker run -i --rm --network none --read-only --tmpfs /tmp --user 10001:10001 \
 - `--user 10001:10001`: never root in the container.
 - No `--cap-add SYS_PTRACE`: strace only traces its own child process, which
   Docker's default seccomp profile already allows.
-- strace writes to a file (`-o`), never stderr, so it can't mix with MCP traffic.
+- **The server can't touch its own trace.** strace writes the trace to the
+  container's stderr (never stdout, so it can't mix with MCP traffic), and the
+  client saves it on the host as `reports/trace/<run>/trace.txt`. There is no
+  trace file in the container, and `/project/reports` is hidden behind an
+  empty read-only folder. A short launcher (`sandglass/sandbox.py`) gives the
+  server a `/dev/null` stderr before any package code runs, and the strace
+  binary is executable but not readable (Dockerfile), which stops the server
+  from reopening strace's fds through `/proc/1/fd/`. Because of that, strace
+  can't read the arguments of the very first exec; the report shows it as
+  `<unreadable>`, and only the first exec counts as the server's launch.
 
 ### Without `--sandbox`
 
@@ -182,6 +195,10 @@ uv run pytest
 ```
 
 ## Known limitations
+
+- **The server's own stderr is discarded in `--sandbox` mode** (it would share
+  a stream with the trace). To see a server's tracebacks, run it without
+  `--sandbox`.
 
 - **The whole project is mounted read-only into the container**, so a server
   can read `sandglass/`, `policies/` and the other fixtures. That is acceptable for

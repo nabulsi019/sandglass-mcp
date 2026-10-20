@@ -75,12 +75,16 @@ def print_policy(policy: Policy) -> None:
     print()
 
 
-async def run(params: StdioServerParameters, server_name: str) -> dict:
-    """Run one MCP session and return a record of what was exercised."""
+async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr) -> dict:
+    """Run one MCP session and return a record of what was exercised.
+
+    `errlog` receives the subprocess's stderr. In the sandbox that stream is
+    the strace trace, so run_sandboxed passes the trace file here.
+    """
     session_record = {"tools": [], "calls": []}
 
     # stdio_client spawns the subprocess and gives us its stdin/stdout streams.
-    async with stdio_client(params) as (read_stream, write_stream):
+    async with stdio_client(params, errlog=errlog) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()  # MCP handshake
 
@@ -121,9 +125,8 @@ def run_sandboxed(server_script: Path, policy_path: Path) -> dict:
     server = server_script.stem
     trace_dir = REPORTS_DIR / "trace" / f"{server}_{timestamp}"
     trace_dir.mkdir(parents=True)
-    # The container runs as uid 10001, which doesn't own this folder on a Linux
-    # host (e.g. CI). Let it write here; the folder only ever holds this run's trace.
-    trace_dir.chmod(0o777)
+    # Written on the HOST from the container's stderr (strace's output). The
+    # container never sees this file: reports/ is hidden inside it.
     trace_file = trace_dir / sandbox.TRACE_FILENAME
 
     # Container paths, because that's what the trace will contain. The
@@ -133,19 +136,21 @@ def run_sandboxed(server_script: Path, policy_path: Path) -> dict:
                          in_sandbox=True, multiarch=multiarch)
     print_policy(policy)
 
-    command, args = sandbox.docker_command(server_script, trace_dir)
+    command, args = sandbox.docker_command(server_script)
     params = StdioServerParameters(command=command, args=args)
 
     # Any failure (image missing, server crash, timeout) is recorded, not
     # raised: the report must still be written, with verdict INCOMPLETE.
-    try:
-        session = asyncio.run(asyncio.wait_for(run(params, server_script.name),
-                                               SESSION_TIMEOUT_SECONDS))
-    except BaseException as exc:  # includes ExceptionGroup from anyio task groups
-        if isinstance(exc, KeyboardInterrupt):
-            raise
-        session = {"tools": [], "calls": [], "error": f"{type(exc).__name__}: {exc}"}
-        print(f"Session failed: {session['error']}")
+    # The container's stderr (the trace) goes straight into trace_file.
+    with open(trace_file, "w", encoding="utf-8") as trace_out:
+        try:
+            session = asyncio.run(asyncio.wait_for(run(params, server_script.name, trace_out),
+                                                   SESSION_TIMEOUT_SECONDS))
+        except BaseException as exc:  # includes ExceptionGroup from anyio task groups
+            if isinstance(exc, KeyboardInterrupt):
+                raise
+            session = {"tools": [], "calls": [], "error": f"{type(exc).__name__}: {exc}"}
+            print(f"Session failed: {session['error']}")
 
     trace_text = trace_file.read_text(encoding="utf-8", errors="replace") if trace_file.exists() else ""
     events = parse_trace(trace_text, cwd=str(sandbox.CONTAINER_PROJECT))
@@ -153,7 +158,8 @@ def run_sandboxed(server_script: Path, policy_path: Path) -> dict:
 
     path_mapping = {
         str(sandbox.CONTAINER_PROJECT): f"{PROJECT_ROOT} (read-only)",
-        str(sandbox.CONTAINER_TRACE_DIR): str(trace_dir),
+        str(sandbox.CONTAINER_REPORTS): "hidden (empty read-only tmpfs)",
+        "(container stderr)": f"strace output, saved on the host as {trace_file}",
         str(sandbox.CONTAINER_VENV): "dependencies baked into the image",
         str(sandbox.CONTAINER_PYTHON_BASE): "Python from python:3.12-slim",
     }
