@@ -188,3 +188,24 @@ def test_probes_grouped_by_path_with_counts_per_syscall():
         "first_timestamp": "10:00:00.2",
     }]
     assert result["verdict"] == "CLEAN"  # probes never change the verdict
+
+
+def test_baseline_covers_cgroup_v1_cpu_quota_reads_only():
+    # On cgroup v1 hosts the runtime finds its CPU quota through these three
+    # files instead of cgroup v2's cpu.max. Reads are fine; writes are not,
+    # and neighbouring files are not covered.
+    v1_files = [
+        "/proc/self/mountinfo",
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us",
+    ]
+    reads = [f'8 10:00:00.2 openat(AT_FDCWD, "{path}", O_RDONLY|O_CLOEXEC) = 3' for path in v1_files]
+    assert run([LAUNCH, *reads, EXITED])["verdict"] == "CLEAN"
+
+    write = '8 10:00:00.3 openat(AT_FDCWD, "/sys/fs/cgroup/cpu/cpu.cfs_quota_us", O_WRONLY) = 3'
+    neighbour = '8 10:00:00.4 openat(AT_FDCWD, "/proc/self/environ", O_RDONLY) = 3'
+    result = run([LAUNCH, write, neighbour, EXITED])
+    assert [(v["mode"], v["target"]) for v in result["violations"]] == [
+        ("write", "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"),
+        ("read", "/proc/self/environ"),
+    ]

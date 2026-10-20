@@ -21,4 +21,7 @@ read_allow:
   - /usr/lib/ssl/openssl.cnf       # OpenSSL config, read when libcrypto loads (no network)
   - /proc/self/cgroup              # CPU quota detection after cryptography's Rust ext loads
   - /sys/fs/cgroup/cpu.max         # same
+  - /proc/self/mountinfo           # cgroup v1 hosts: finding where the cpu controller is mounted
+  - /sys/fs/cgroup/cpu/cpu.cfs_quota_us   # cgroup v1 hosts: CPU quota (v1 version of cpu.max)
+  - /sys/fs/cgroup/cpu/cpu.cfs_period_us  # cgroup v1 hosts: CPU quota period (same)
   - /dev/null                      # opened read-only during asyncio/anyio startup
