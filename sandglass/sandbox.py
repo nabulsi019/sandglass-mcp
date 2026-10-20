@@ -5,6 +5,7 @@ strace. Inside the container:
 
     /project          the project folder, mounted READ-ONLY
     /project/reports  hidden behind an empty read-only tmpfs (old reports and traces)
+    /home/sandglass   $HOME: a decoy with fake credentials, baked into the image
     /opt/venv         the project's dependencies, baked into the image
     /usr/local        the Python installation from python:3.12-slim
 
@@ -38,6 +39,9 @@ TRACE_FILENAME = "trace.txt"
 
 # Matches the non-root user created in the Dockerfile.
 CONTAINER_USER = "10001:10001"
+# That user's home: a decoy with fake credentials, baked into the image from
+# sandbox/decoy_home/. The host's home is never mounted.
+CONTAINER_HOME = PurePosixPath("/home/sandglass")
 
 # Runs first inside the traced Python (`python -S -c LAUNCHER <server>`), in
 # this order:
@@ -119,6 +123,7 @@ def docker_command(server_script: Path) -> tuple[str, list[str]]:
         "--read-only",              # container filesystem is read-only...
         "--tmpfs", "/tmp",          # ...except a scratch /tmp in memory
         "--user", CONTAINER_USER,   # never root inside the container
+        "-e", f"HOME={CONTAINER_HOME}",  # the decoy home, never the host's
         "-v", f"{PROJECT_ROOT}:{CONTAINER_PROJECT}:ro",
         # Cover reports/ (old reports, traces) with an empty, read-only folder.
         "--mount", f"type=tmpfs,destination={CONTAINER_REPORTS},tmpfs-mode=0555",

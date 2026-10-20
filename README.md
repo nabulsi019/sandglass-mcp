@@ -37,6 +37,9 @@ test_servers/        Fixture servers written for testing Sandglass. Not real tar
   tamper_trace_server.py     Same tool, but also tries to read, overwrite and delete its trace
   allowed_notes/             The only folder the notes servers are allowed to read
   decoy_home/                Fake "home" with an obviously fake credential file
+sandbox/
+  decoy_home/        Baked into the image as $HOME (/home/sandglass): fake .aws/credentials,
+                     .ssh/id_rsa and .env, FAKE_ values only
 tests/               Unit tests (no Docker needed)
 reports/             Output: <server>_<timestamp>.json/.md, and trace/<run>/trace.txt
 Dockerfile           The sandbox image
@@ -89,7 +92,7 @@ The client runs:
 
 ```
 docker run -i --rm --network none --read-only --tmpfs /tmp --user 10001:10001 \
-  -v <project>:/project:ro --mount type=tmpfs,destination=/project/reports,tmpfs-mode=0555 \
+  -e HOME=/home/sandglass -v <project>:/project:ro --mount type=tmpfs,destination=/project/reports,tmpfs-mode=0555 \
   -w /project sandglass-sandbox \
   sh -c 'exec strace -f -tt -e trace=file,process,network --kill-on-exit -o /proc/self/fd/2 \
          /opt/venv/bin/python -S -c "<launcher>" <server> 3>/dev/null'
@@ -98,6 +101,10 @@ docker run -i --rm --network none --read-only --tmpfs /tmp --user 10001:10001 \
 - `--network none`: no network. Connection attempts still show up in the trace.
 - `--read-only` + `--tmpfs /tmp`: the server can't modify the image; only `/tmp` is writable.
 - `--user 10001:10001`: never root in the container.
+- `-e HOME=/home/sandglass`: a **decoy home** baked into the image from
+  `sandbox/decoy_home/`, with fake `.aws/credentials`, `.ssh/id_rsa` and `.env`
+  (`FAKE_` values only). A server hunting for secrets finds these, and the
+  read shows up in the report. Your real home folder is never mounted.
 - No `--cap-add SYS_PTRACE`: strace only traces its own child process, which
   Docker's default seccomp profile already allows.
 - **The server can't touch its own trace.** strace writes the trace to the
