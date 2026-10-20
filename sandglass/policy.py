@@ -48,6 +48,7 @@ class Policy:
     exec_allow: list[Path]     # programs the server may launch (besides itself)
     runtime_allow: list[Path]  # interpreter/server files: READS only
     list_exact: list[Path] = field(default_factory=list)        # "=" entries: exact dir listings only
+    allow_domains: list[str] = field(default_factory=list)      # domains the server may contact (via the sink)
     baseline_name: str | None = None                            # sandbox only
     baseline_read_allow: list[Path] = field(default_factory=list)  # sandbox only: READS only
 
@@ -126,6 +127,20 @@ def _path_list(data: dict, key: str, where: str, values: dict, in_sandbox: bool)
     return [_expand(item, values, in_sandbox) for item in items]
 
 
+def _domains(network: dict) -> list[str]:
+    """network.allow_domains: optional list of host names. "example.com" means
+    exactly that host; "*.example.com" means any subdomain of it."""
+    if "allow_domains" not in network:
+        return []
+    domains = _strings(network, "allow_domains", "network.")
+    for domain in domains:
+        bare = domain[2:] if domain.startswith("*.") else domain
+        if not bare or "*" in bare or "/" in bare or ":" in bare:
+            raise PolicyError(f"'network.allow_domains': {domain!r} is not a host name "
+                              "(use 'example.com' or '*.example.com')")
+    return [d.lower() for d in domains]
+
+
 def _read_yaml(path: str | Path) -> dict:
     with open(path, encoding="utf-8") as f:
         data = yaml.safe_load(f)  # safe_load: never constructs arbitrary objects
@@ -176,6 +191,7 @@ def load_policy(
         read_allow=_path_list(filesystem, "read_allow", "filesystem.", values, in_sandbox),
         write_allow=_path_list(filesystem, "write_allow", "filesystem.", values, in_sandbox),
         network_allow=_require(network, "allow", bool, "network."),
+        allow_domains=_domains(network),
         exec_allow=_path_list(process, "exec_allow", "process.", values, in_sandbox),
         runtime_allow=runtime_allow,
         list_exact=list_exact,

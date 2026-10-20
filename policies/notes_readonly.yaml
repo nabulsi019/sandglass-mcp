@@ -23,6 +23,9 @@ filesystem:
 network:
   # No inbound or outbound connections. Attempts count even when they fail.
   allow: false
+  # Domains the server may contact through Sandglass's local network sink
+  # (nothing ever leaves the sandbox). "*.example.com" allows subdomains.
+  allow_domains: []
 
 process:
   # Programs the server may launch. The server's own launch (the first exec

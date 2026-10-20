@@ -15,13 +15,21 @@ Rules (one place, so they're easy to explain):
     -> "probes" (informational only)
   Network (when network.allow is false):
     any attempt, even a failed one -> VIOLATION
+    except a SUCCESSFUL connect to the local network sink (sandglass/netsink.py):
+      the sink then records the domain the server asked for, and
+    a domain not in network.allow_domains -> VIOLATION naming the domain
+  The sink itself (the first process to stat its "ready" marker, which the
+  launcher waits for before any server code runs) is Sandglass, not the
+  server: its own exec and sockets are not violations. Its startup connect to
+  a public IP is the isolation check; if that ever succeeds -> INCOMPLETE.
   Process exec:
     the first exec in the trace is the server itself -> allowed
     anything else not in exec_allow: same rules as files
 
 Verdicts:
   INCOMPLETE  the run can't be trusted: the server didn't start, the session
-              errored, nothing was exercised, or the trace is missing/truncated.
+              errored, nothing was exercised, the trace is missing/truncated,
+              the network sink didn't start, or the sandbox could reach the internet.
               Never treated as clean, even when no violations were seen.
   VIOLATIONS  at least one violation.
   CLEAN       a complete run with zero violations.
@@ -31,6 +39,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
+from sandglass import netsink
 from sandglass.policy import Policy
 from sandglass.trace_parser import Event
 
@@ -43,6 +52,37 @@ def _is_under(path: str, roots: list) -> bool:
     for root in roots:
         root = str(root)
         if path == root or path.startswith(root.rstrip("/") + "/"):
+            return True
+    return False
+
+
+def _sink_pid(events: list[Event]) -> int | None:
+    """The network sink's pid: the FIRST process to stat the sink's ready marker."""
+    for event in events:
+        if event.kind == "probe" and event.target == netsink.SINK_READY:
+            return event.pid
+    return None
+
+
+def _is_address(target: str, host: str, port: int) -> bool:
+    """Does a network event's target (strace's sockaddr text) name host:port?"""
+    return f"sin_port=htons({port})" in target and f'inet_addr("{host}")' in target
+
+
+def _sink_request(target: str) -> tuple[str, str, int] | None:
+    """(method, host, port) from a sink marker path like /sandglass-netsink/GET/example.com/80."""
+    parts = target[len(netsink.SINK_MARKER_DIR) + 1:].split("/")
+    if not target.startswith(netsink.SINK_MARKER_DIR + "/") or len(parts) != 3 or not parts[2].isdigit():
+        return None
+    return parts[0], parts[1], int(parts[2])
+
+
+def _domain_allowed(host: str, policy: Policy) -> bool:
+    """network.allow -> everything; else exact match or a "*.example.com" suffix rule."""
+    if policy.network_allow:
+        return True
+    for domain in policy.allow_domains:
+        if host == domain or (domain.startswith("*.") and host.endswith(domain[1:])):
             return True
     return False
 
@@ -68,9 +108,32 @@ def compare(events: list[Event], policy: Policy, session: dict) -> dict:
     # or /lib is exactly what we want to catch.
     write_ok = policy.write_allow
     server_launch: Event | None = None
+    sink_pid = _sink_pid(events)
+    domains: list[dict] = []       # every request the sink recorded
+    isolation: dict | None = None  # the sink's connect-to-a-public-IP check
 
     for event in events:
-        if event.kind == "file":
+        if sink_pid is not None and event.pid == sink_pid and event.kind in ("process", "network", "probe"):
+            # Sandglass's own sink: its exec and sockets are ours, not the server's.
+            if event.kind == "network" and _is_address(event.target, *netsink.ISOLATION_CHECK):
+                isolation = {"target": "%s:%d" % netsink.ISOLATION_CHECK,
+                             "succeeded": event.succeeded, "error": event.error,
+                             "evidence": event.raw}
+            request = _sink_request(event.target) if event.kind == "probe" else None
+            if request is None:
+                continue  # its own exec/bind/listen/accept, or the ready marker
+            method, host, port = request
+            allowed = _domain_allowed(host, policy)
+            domains.append({"method": method, "host": host, "port": port,
+                            "allowed": allowed, "timestamp": event.timestamp})
+            if allowed:
+                continue
+            reason = "contacted a domain not in network.allow_domains"
+            bucket = "violation"
+            event = Event("domain", "proxy request", event.pid, event.timestamp, host,
+                          "domain", True, None, event.raw)
+
+        elif event.kind == "file":
             if event.mode == "write":
                 allowed = _is_under(event.target, write_ok)
             elif event.mode == "list":
@@ -108,6 +171,12 @@ def compare(events: list[Event], policy: Policy, session: dict) -> dict:
         elif event.kind == "network":
             if policy.network_allow:
                 continue
+            # Talking to the sink is fine if it worked: the sink records the
+            # domain itself. A FAILED connect to it (e.g. the server killed the
+            # sink first) could hide where it wanted to go, so it counts.
+            if (event.syscall == "connect" and _is_address(event.target, netsink.SINK_HOST, netsink.SINK_PORT)
+                    and (event.succeeded or event.error == "EINPROGRESS")):
+                continue
             reason = "network activity while network.allow is false"
             bucket = "violation"  # attempts count, even failed ones
 
@@ -128,6 +197,12 @@ def compare(events: list[Event], policy: Policy, session: dict) -> dict:
         (violations if bucket == "violation" else attempted).append(record)
 
     incomplete = _incomplete_reasons(events, server_launch, session)
+    if events and sink_pid is None:
+        incomplete.append("the network sink did not start, so contacted domains can't be recorded")
+    elif events and isolation is None:
+        incomplete.append("the network isolation check is missing from the trace")
+    elif isolation and isolation["succeeded"]:
+        incomplete.append(f"the sandbox reached the internet: connect to {isolation['target']} succeeded")
     if incomplete:
         verdict = "INCOMPLETE"
     elif violations:
@@ -141,6 +216,8 @@ def compare(events: list[Event], policy: Policy, session: dict) -> dict:
         "violations": violations,
         "attempted": attempted,
         "probes": sorted(probes.values(), key=lambda p: p["first_timestamp"]),
+        "domains": domains,
+        "network_isolation": isolation,
         "event_counts": {
             kind: sum(1 for e in events if e.kind == kind)
             for kind in ("file", "probe", "process", "network", "exit")
@@ -189,6 +266,8 @@ def build_report(server: str, timestamp: str, policy: Policy, session: dict,
         "violations": result["violations"],
         "attempted": result["attempted"],
         "probes": result["probes"],
+        "domains": result["domains"],
+        "network_isolation": result["network_isolation"],
         "event_counts": result["event_counts"],
     }
 
@@ -232,6 +311,7 @@ def _markdown(r: dict) -> str:
     else:
         out.append("None.")
 
+    out += _network_section(r)
     out += _event_section("Violations", r["violations"])
     out += _event_section("Attempted (failed, not violations)", r["attempted"])
 
@@ -249,6 +329,25 @@ def _markdown(r: dict) -> str:
     counts = ", ".join(f"{k}: {v}" for k, v in r["event_counts"].items())
     out += ["", f"Event counts: {counts}", ""]
     return "\n".join(out)
+
+
+def _network_section(r: dict) -> list[str]:
+    """Contacted domains (via the local sink) and the isolation check."""
+    lines = ["", "## Network", ""]
+    iso = r.get("network_isolation")
+    if iso is None:
+        lines.append("- Isolation check: **not in the trace**")
+    elif iso["succeeded"]:
+        lines.append(f"- Isolation check: connect to `{iso['target']}` **SUCCEEDED** (the sandbox can reach the internet)")
+    else:
+        lines.append(f"- Isolation check: connect to `{iso['target']}` failed ({iso['error']}): no route to the internet")
+    lines += ["", "Domains the server asked the local sink for (nothing was sent anywhere):", ""]
+    if not r.get("domains"):
+        return lines + ["None."]
+    lines += ["| Domain | Port | Method | Allowed |", "|---|---|---|---|"]
+    for d in r["domains"]:
+        lines.append(f"| `{d['host']}` | {d['port']} | {d['method']} | {'yes' if d['allowed'] else '**no**'} |")
+    return lines
 
 
 def _event_section(title: str, records: list[dict]) -> list[str]:
