@@ -1,4 +1,4 @@
-# Only pyproject.toml and uv.lock are needed to build the image.
+# Only pyproject.toml, uv.lock and sandbox/ are needed to build the image.
 .venv/
 .git/
 reports/
