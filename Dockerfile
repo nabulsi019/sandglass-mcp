@@ -39,7 +39,16 @@ RUN uv sync --frozen --no-install-project --no-dev && rm -rf /build
 RUN python -m compileall -q /usr/local/lib/python3.12
 
 # Non-root user that runs the server. sandglass/sandbox.py passes the same uid with --user.
-RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin sandglass
+RUN useradd --system --uid 10001 --home-dir /home/sandglass --no-create-home \
+        --shell /usr/sbin/nologin sandglass
+
+# Decoy $HOME with obviously fake credentials (sandbox/decoy_home/, FAKE_ values
+# only), so a server that goes looking for secrets finds something to read and
+# shows up in the report. Permissions like a real home; the container's root
+# filesystem is --read-only, so the server can read these but never change them.
+COPY --chown=10001:10001 sandbox/decoy_home/ /home/sandglass/
+RUN chmod 700 /home/sandglass /home/sandglass/.ssh /home/sandglass/.aws \
+    && chmod 600 /home/sandglass/.ssh/id_rsa /home/sandglass/.aws/credentials /home/sandglass/.env
 USER 10001:10001
 
 ENV PATH=/opt/venv/bin:$PATH
