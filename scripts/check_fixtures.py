@@ -24,6 +24,13 @@ EXPECTED = {
         ("read", "/etc/passwd"),
         ("list", "/project/test_servers/decoy_home"),
     }),
+    # Tries to read, overwrite and delete its trace. Only the /proc attempts on
+    # strace's fds get as far as EACCES (= violation); the rest fail with ENOENT.
+    "tamper_trace_server.py": ("VIOLATIONS", {
+        ("list", "/proc/1/fd"),
+        ("read", "/proc/1/fd/2"),
+        ("write", "/proc/1/fd/2"),
+    }),
 }
 
 
