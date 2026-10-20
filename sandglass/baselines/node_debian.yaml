@@ -23,3 +23,6 @@ read_allow:
   - /proc/self/maps                                    # V8/libuv read their own memory map (stack, code ranges)
   - /sys/fs/cgroup/memory/memory.limit_in_bytes        # cgroup v1 hosts: libuv's memory limit
   - /sys/fs/cgroup/memory/memory.soft_limit_in_bytes   # cgroup v1 hosts: same, soft limit
+  - /sys/fs/cgroup/memory.max                          # cgroup v2 hosts: libuv's memory limit
+  - /sys/fs/cgroup/memory.high                         # cgroup v2 hosts: same, soft limit
+  - /proc/version_signature                            # libuv reads the kernel version (exists on Ubuntu kernels, e.g. CI)
