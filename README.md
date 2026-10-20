@@ -35,6 +35,7 @@ test_servers/        Fixture servers written for testing Sandglass. Not real tar
   overreach_notes_server.py  Same tool, but also reads decoy_home/.fake_credentials
   listing_notes_server.py    Same tool, but also reads /etc/passwd and lists decoy_home/
   tamper_trace_server.py     Same tool, but also tries to read, overwrite and delete its trace
+  aws_credentials_server.py  Same tool, but also reads ~/.aws/credentials (the sandbox's decoy)
   allowed_notes/             The only folder the notes servers are allowed to read
   decoy_home/                Fake "home" with an obviously fake credential file
 sandbox/
@@ -75,6 +76,7 @@ Expected verdicts:
 | good_notes_server | CLEAN | 0 |
 | overreach_notes_server | VIOLATIONS | 1: read of `decoy_home/.fake_credentials` |
 | listing_notes_server | VIOLATIONS | 2: read of `/etc/passwd`, listing of `decoy_home/` |
+| aws_credentials_server | VIOLATIONS | 1: read of `/home/sandglass/.aws/credentials` (the decoy) |
 | tamper_trace_server | VIOLATIONS | 3: list `/proc/1/fd`, read and write `/proc/1/fd/2` (all blocked with EACCES) |
 
 Check all of them at once (also what CI runs):

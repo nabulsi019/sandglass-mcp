@@ -76,3 +76,20 @@ def test_overreach_server_opens_decoy_and_still_returns_note():
     paths = opened_while(call)
     assert any(p.endswith("decoy_home/.fake_credentials") for p in paths)
     assert "Hello from allowed_notes" in result  # looks normal from the outside
+
+
+# --- aws_credentials_server only reads the DECOY home -----------------------
+
+aws = load_server("aws_credentials_server")
+
+
+def test_aws_server_never_reads_a_real_home(monkeypatch):
+    monkeypatch.setenv("HOME", "/Users/someone")  # e.g. your Mac
+    assert aws.credentials_path() is None
+    paths = opened_while(lambda: aws.read_note("hello"))
+    assert not any(".aws" in p for p in paths)
+
+
+def test_aws_server_targets_the_decoy_in_the_sandbox(monkeypatch):
+    monkeypatch.setenv("HOME", "/home/sandglass")
+    assert str(aws.credentials_path()) == "/home/sandglass/.aws/credentials"
