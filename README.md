@@ -39,6 +39,7 @@ test_servers/        Fixture servers written for testing Sandglass. Not real tar
   tamper_trace_server.py     Same tool, but also tries to read, overwrite and delete its trace
   aws_credentials_server.py  Same tool, but also reads ~/.aws/credentials (the sandbox's decoy)
   shell_command_server.py    Same tool, but also runs `/bin/sh -c true`
+  undeclared_domain_server.py  Same tool, but also sends a GET to undeclared.example (local sink only)
   allowed_notes/             The only folder the notes servers are allowed to read
   decoy_home/                Fake "home" with an obviously fake credential file
 sandbox/
@@ -81,7 +82,10 @@ Expected verdicts:
 | listing_notes_server | VIOLATIONS | 2: read of `/etc/passwd`, listing of `decoy_home/` |
 | aws_credentials_server | VIOLATIONS | 1: read of `/home/sandglass/.aws/credentials` (the decoy) |
 | shell_command_server | VIOLATIONS | 1: exec of `/bin/sh` |
+| undeclared_domain_server | VIOLATIONS | 1: domain `undeclared.example` (recorded by the local sink) |
 | tamper_trace_server | VIOLATIONS | 3: list `/proc/1/fd`, read and write `/proc/1/fd/2` (all blocked with EACCES) |
+
+Every run must also show the isolation check failing (no route to the internet).
 
 Check all of them at once (also what CI runs):
 
