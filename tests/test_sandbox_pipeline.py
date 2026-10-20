@@ -58,6 +58,8 @@ def test_parser_stitches_unfinished_and_resumed_lines():
     by_pid = {e.pid: e for e in events}
     assert by_pid[9].target == "/secret" and by_pid[9].succeeded
     assert by_pid[10].target == "/other"
+    # The evidence is the whole call, not just the "<... resumed>" half.
+    assert by_pid[9].raw == '9  10:00:00.1 openat(AT_FDCWD, "/secret", O_RDONLY) = 3'
 
 
 def test_parser_network_ignores_sendto_without_address():

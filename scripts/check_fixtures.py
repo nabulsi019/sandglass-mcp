@@ -28,6 +28,10 @@ EXPECTED = {
     "aws_credentials_server.py": ("VIOLATIONS", {
         ("read", "/home/sandglass/.aws/credentials"),
     }),
+    # Starts /bin/sh. Exec violations have no mode, hence None.
+    "shell_command_server.py": ("VIOLATIONS", {
+        (None, "/bin/sh"),
+    }),
     # Tries to read, overwrite and delete its trace. Only the /proc attempts on
     # strace's fds get as far as EACCES (= violation); the rest fail with ENOENT.
     "tamper_trace_server.py": ("VIOLATIONS", {
