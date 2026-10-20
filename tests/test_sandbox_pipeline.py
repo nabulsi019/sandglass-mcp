@@ -26,8 +26,23 @@ def sandbox_policy():
                        multiarch="x86_64-linux-gnu")
 
 
-def run(lines, session=SESSION_OK):
-    return compare(parse_trace("\n".join(lines)), sandbox_policy(), session)
+# The local network sink (sandglass/netsink.py) as it shows up in every real
+# trace: its own exec, its listening socket, the isolation check, the ready marker.
+SINK_LINES = [
+    '9  10:00:00.000010 execve("/opt/venv/bin/python", ["/opt/venv/bin/python", "-I", "-S", "-c", "..."], 0x0 /* 0 vars */) = 0',
+    '9  10:00:00.000020 bind(0, {sa_family=AF_INET, sin_port=htons(18080), sin_addr=inet_addr("127.0.0.1")}, 16) = 0',
+    '9  10:00:00.000030 listen(0, 16)     = 0',
+    '9  10:00:00.000040 connect(1, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("1.1.1.1")}, 16) = -1 ENETUNREACH (Network is unreachable)',
+    '9  10:00:00.000050 newfstatat(AT_FDCWD, "/sandglass-netsink/ready", 0x7ffe8cb57b40, 0) = -1 ENOENT (No such file or directory)',
+]
+
+
+def run(lines, session=SESSION_OK, sink=True, policy=None):
+    """Compare a hand-written trace. Unless sink=False, the sink's startup lines
+    are slipped in right after the first line (the launch), like in a real run."""
+    if sink and lines:
+        lines = lines[:1] + SINK_LINES + lines[1:]
+    return compare(parse_trace("\n".join(lines)), policy or sandbox_policy(), session)
 
 
 # --- trace_parser ----------------------------------------------------------
@@ -196,12 +211,13 @@ def test_trace_is_never_a_file_in_the_container():
 
 
 def test_launcher_closes_the_trace_stream_before_loading_packages():
-    steps = sandbox.LAUNCHER.split("; ")
-    # fd 2 swapped and fd 3 closed before site.main() (which runs .pth files)
-    # and before the server itself runs.
-    assert steps.index("os.dup2(3, 2)") < steps.index("site.main()")
-    assert steps.index("os.close(3)") < steps.index("site.main()")
-    assert steps[-1].startswith("runpy.run_path(")
+    # In main(): fd 2 swapped and fd 3 closed before the sink starts, before
+    # site.main() (which runs .pth files) and before the server itself runs.
+    main = sandbox.LAUNCHER[sandbox.LAUNCHER.index("def main()"):]
+    order = ["os.dup2(3, 2)", "os.close(3)", "sys.path[0] =", "start_sink(",
+             "site.main()", "runpy.run_path("]
+    positions = [main.index(step) for step in order]
+    assert positions == sorted(positions)
 
 
 UNREADABLE_EXEC = '8  10:00:00.000001 execve(0x7ffdc67270d0, 0x7ffdc6728518, 0x7ffdc6728548) = 0'

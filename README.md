@@ -21,6 +21,8 @@ Repository: <https://github.com/nabulsi019/sandglass-mcp>. Formerly **MCP Guard*
 sandglass/
   client.py          Runs a server over stdio, calls each tool once; --sandbox adds tracing + report
   sandbox.py         Container paths and the `docker run ... strace ...` command
+  launcher.py        Runs first in the container: hides the trace, starts the sink, runs the server
+  netsink.py         Local fake HTTP(S) proxy: records contacted domains, never connects anywhere
   trace_parser.py    strace output -> file / probe / process / network / exit events
   compare.py         Events vs policy -> verdict, violations, report files
   policy.py          Loads + validates a policy (and the container baseline)
@@ -99,7 +101,7 @@ docker run -i --rm --network none --read-only --tmpfs /tmp --user 10001:10001 \
   -e HOME=/home/sandglass -v <project>:/project:ro --mount type=tmpfs,destination=/project/reports,tmpfs-mode=0555 \
   -w /project sandglass-sandbox \
   sh -c 'exec strace -f -tt -e trace=file,process,network --kill-on-exit -o /proc/self/fd/2 \
-         /opt/venv/bin/python -S -c "<launcher>" <server> 3>/dev/null'
+         /opt/venv/bin/python -S -c "<launcher.py>" <server> "<netsink.py>" 3>/dev/null'
 ```
 
 - `--network none`: no network. Connection attempts still show up in the trace.
@@ -122,6 +124,31 @@ docker run -i --rm --network none --read-only --tmpfs /tmp --user 10001:10001 \
   can't read the arguments of the very first exec; the report shows it as
   `<unreadable>`, and only the first exec counts as the server's launch.
 
+### Network: a local sink, no route out
+
+The container keeps `--network none`, so it has no route anywhere. To still
+see *which domain* a server wanted, the launcher starts
+`sandglass/netsink.py` on `127.0.0.1:18080` before the server and points
+`HTTP_PROXY`/`HTTPS_PROXY` at it. The sink never connects anywhere. For each
+request it records method, host and port, and answers locally (`200` for plain
+HTTP, `403` for HTTPS `CONNECT`).
+
+The sink records through the trace itself: it `stat()`s a path like
+`/sandglass-netsink/GET/example.com/80`, which doesn't exist. So it needs no
+log the server could tamper with. Only the process that marks itself ready
+first counts as the sink, and the launcher waits for that before any server
+code runs. A server forging those stats from its own process just produces
+probes. The report's **Network** section lists every domain as allowed or
+not.
+
+At startup the sink also tries to `connect()` to `1.1.1.1:443` (the
+**isolation check**). It must fail. If it ever succeeds, or the sink never
+starts, the verdict is INCOMPLETE.
+
+Limitation: a server that ignores the proxy variables and resolves names
+itself shows up only as a failed `connect()` (a violation), without the
+domain name.
+
 ### Without `--sandbox`
 
 ```bash
@@ -142,6 +169,7 @@ filesystem:
   write_allow: []                            # no writes
 network:
   allow: false                               # no connections (attempts count)
+  allow_domains: [api.example.com, "*.example.org"]   # optional; see "Network" below
 process:
   exec_allow: []                             # no programs besides the server itself
 runtime_allow:                               # READS only, excluded from violations
@@ -193,11 +221,14 @@ library in `/opt/venv` or `/lib` is a violation.
 | File open that failed otherwise (e.g. `ENOENT`) | listed under "attempted", verdict unchanged |
 | `stat` / `access` / `readlink` (looking, not reading) | listed under "probes", grouped by path with a count per syscall; informational |
 | Any network attempt, even a failed one | VIOLATION |
+| A successful connect to the local network sink | not counted itself; the sink records the domain |
+| A domain asked of the sink that isn't in `network.allow_domains` | VIOLATION naming the domain |
 | Any exec besides the server's own launch | VIOLATION (same failure rules as files) |
 
 The verdict is **INCOMPLETE**, and never clean, if the server didn't start, the MCP
-session failed, no tool was exercised, or the trace is missing or has no
-`+++ exited` line for the server (a truncated trace).
+session failed, no tool was exercised, the trace is missing or has no
+`+++ exited` line for the server (a truncated trace), the network sink didn't
+start, or the isolation check reached the internet.
 
 ## Tests
 
