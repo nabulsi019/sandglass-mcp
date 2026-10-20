@@ -1,0 +1,25 @@
+# Container baseline for Node.js servers in the sandglass-sandbox image
+# (Debian's nodejs package on python:3.12-slim).
+#
+# Files Node.js READS just by starting up, found in real traces of
+# test_servers/good_notes_node_server.js. Loaded in --sandbox mode for .js
+# servers, together with python312_slim.yaml (Sandglass's launcher is Python
+# and runs before Node). Exact files only, no folders.
+#
+# READS ONLY: a write (or exec) under any of these paths is still a violation.
+
+name: node_debian
+description: Startup reads of Debian's Node.js (libnode, bundled JS deps, memory limits).
+
+read_allow:
+  - /usr/lib/{multiarch}/libnode.so.115                # Node's own shared library, re-read at startup
+  - /usr/share/nodejs/cjs-module-lexer/lexer.js        # Debian ships Node's bundled JS deps here
+  - /usr/share/nodejs/cjs-module-lexer/dist/lexer.js   # same
+  - /usr/share/nodejs/undici/undici-fetch.js           # same (built-in fetch)
+  - /usr/share/nodejs/acorn/dist/acorn.js              # same (JS parser)
+  - /usr/share/nodejs/acorn-walk/dist/walk.js          # same
+  - /usr/share/nodejs/minimatch/dist/cjs/index.bundle.js  # same
+  - /proc/meminfo                                      # V8 sizes its heap from total memory
+  - /proc/self/maps                                    # V8/libuv read their own memory map (stack, code ranges)
+  - /sys/fs/cgroup/memory/memory.limit_in_bytes        # cgroup v1 hosts: libuv's memory limit
+  - /sys/fs/cgroup/memory/memory.soft_limit_in_bytes   # cgroup v1 hosts: same, soft limit

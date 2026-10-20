@@ -42,6 +42,8 @@ EXPECTED = {
     "undeclared_domain_server.py": ("VIOLATIONS", {
         ("domain", "undeclared.example"),
     }),
+    # The Node.js twin of good_notes_server, with its own baseline (node_debian).
+    "good_notes_node_server.js": ("CLEAN", set()),
     # Tries to read, overwrite and delete its trace. Only the /proc attempts on
     # strace's fds get as far as EACCES (= violation); the rest fail with ENOENT.
     "tamper_trace_server.py": ("VIOLATIONS", {
