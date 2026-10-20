@@ -165,7 +165,7 @@ def parse_trace(text: str, cwd: str = "/project") -> list[Event]:
     absolute (the sandbox runs with -w /project).
     """
     events: list[Event] = []
-    pending: dict[int, str] = {}  # pid -> first half of an unfinished call
+    pending: dict[int, tuple[str, str]] = {}  # pid -> (first line, its body), unfinished
 
     for line in text.splitlines():
         match = LINE_RE.match(line)
@@ -183,11 +183,15 @@ def parse_trace(text: str, cwd: str = "/project") -> list[Event]:
         # With -f, a call in one thread can be interrupted by another thread's
         # output. strace then prints it in two halves; stitch them together.
         if body.endswith(UNFINISHED):
-            pending[pid] = body[: -len(UNFINISHED)].rstrip()
+            pending[pid] = (line[: -len(UNFINISHED)].rstrip(), body[: -len(UNFINISHED)].rstrip())
             continue
         resumed = RESUMED_RE.match(body)
         if resumed:
-            body = pending.pop(pid, f"{resumed[1]}(") + resumed[2]
+            first_line, first_body = pending.pop(pid, (line, f"{resumed[1]}("))
+            body = first_body + resumed[2]
+            # Evidence = the whole call, as strace would have printed it
+            # uninterrupted: the first half's line plus the resumed ending.
+            line = first_line + resumed[2]
 
         call = CALL_RE.match(body)
         if not call:
