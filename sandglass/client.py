@@ -59,8 +59,11 @@ def result_text(result) -> tuple[str, str]:
     return ("ERROR" if result.is_error else "OK"), "\n".join(texts).strip()
 
 
-def print_policy(policy: Policy) -> None:
-    print(f"Policy: {policy.name} (loaded, NOT enforced yet)")
+def print_policy(policy: Policy, enforced: bool) -> None:
+    """Print the policy. `enforced` is True only in --sandbox mode, where the
+    trace is compared with it; host mode just loads and shows it."""
+    status = "enforced" if enforced else "not enforced (host mode)"
+    print(f"Policy: {policy.name} ({status})")
     print(f"  {policy.description}")
     print(f"  read_allow:    {[str(p) for p in policy.read_allow]}")
     print(f"  write_allow:   {[str(p) for p in policy.write_allow]}")
@@ -134,7 +137,7 @@ def run_sandboxed(server_script: Path, policy_path: Path) -> dict:
     multiarch = sandbox.detect_multiarch()
     policy = load_policy(policy_path, server_script=server_script,
                          in_sandbox=True, multiarch=multiarch)
-    print_policy(policy)
+    print_policy(policy, enforced=True)
 
     command, args = sandbox.docker_command(server_script)
     params = StdioServerParameters(command=command, args=args)
@@ -213,7 +216,7 @@ def main() -> None:
         sys.exit(EXIT_CODES[report["verdict"]])
 
     if args.policy:
-        print_policy(load_policy(args.policy, server_script=server_script))
+        print_policy(load_policy(args.policy, server_script=server_script), enforced=False)
     run_host(server_script)
 
 
