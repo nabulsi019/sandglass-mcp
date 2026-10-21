@@ -60,7 +60,7 @@ def test_undeclared_domain_is_one_violation_naming_it():
     assert result["verdict"] == "VIOLATIONS"
     assert [(v["mode"], v["target"]) for v in result["violations"]] == [("domain", "undeclared.example")]
     assert result["domains"] == [{"method": "GET", "host": "undeclared.example", "port": 80,
-                                  "allowed": False, "timestamp": "10:00:00.5"}]
+                                  "allowed": False, "timestamp": "10:00:00.5", "phase": "startup"}]
 
 
 def test_allowed_domains_exact_and_wildcard(tmp_path):

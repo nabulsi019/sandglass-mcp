@@ -66,6 +66,13 @@ def main() -> int:
             failures.append(f"{fixture}: expected {want_verdict} {sorted(want_violations)}, "
                             f"got {report['verdict']} {sorted(got)}")
 
+        # Every fixture misbehaves only inside read_note, so every violation
+        # must be in the tool-call phase (#18), e.g. overreach's decoy read.
+        wrong_phase = [(v["mode"], v["target"], v["phase"]) for v in report["violations"]
+                       if v["phase"] != "tool-call"]
+        if wrong_phase:
+            failures.append(f"{fixture}: violations outside the tool-call phase: {wrong_phase}")
+
         # Every run: the sandbox must have no route out (the sink's check failed)...
         isolation = report["network_isolation"]
         if not isolation or isolation["succeeded"]:
