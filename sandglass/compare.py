@@ -24,6 +24,8 @@ Rules (one place, so they're easy to explain):
   a public IP is the isolation check; if that ever succeeds -> INCOMPLETE.
   Process exec:
     the first exec in the trace is the server itself -> allowed
+    (Node servers: the launcher then execs node in that same process; that
+    one exec is part of the launch too, but only when runtime is "node")
     anything else not in exec_allow: same rules as files
 
 Verdicts:
@@ -39,7 +41,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-from sandglass import netsink
+from sandglass import netsink, sandbox
 from sandglass.policy import Policy
 from sandglass.trace_parser import Event
 
@@ -94,8 +96,12 @@ def _bucket_for_failure_or_success(event: Event) -> str:
     return "attempted"
 
 
-def compare(events: list[Event], policy: Policy, session: dict) -> dict:
-    """Apply the rules above. Returns a plain dict (ready for JSON)."""
+def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "python") -> dict:
+    """Apply the rules above. Returns a plain dict (ready for JSON).
+
+    `runtime` is "node" for a .js server: the launcher's exec of node is then
+    part of the launch, not a violation.
+    """
     violations: list[dict] = []
     attempted: list[dict] = []
     probes: dict[str, dict] = {}  # path -> summary, deduplicated
@@ -108,6 +114,7 @@ def compare(events: list[Event], policy: Policy, session: dict) -> dict:
     # or /lib is exactly what we want to catch.
     write_ok = policy.write_allow
     server_launch: Event | None = None
+    node_launch: Event | None = None  # runtime "node" only
     sink_pid = _sink_pid(events)
     domains: list[dict] = []       # every request the sink recorded
     isolation: dict | None = None  # the sink's connect-to-a-public-IP check
@@ -162,6 +169,10 @@ def compare(events: list[Event], policy: Policy, session: dict) -> dict:
         elif event.kind == "process":
             if server_launch is None and event.succeeded:
                 server_launch = event  # strace launching the server itself
+                continue
+            if (runtime == "node" and node_launch is None and event.succeeded
+                    and event.pid == server_launch.pid and event.target == str(sandbox.CONTAINER_NODE)):
+                node_launch = event  # the launcher handing over to node, same process
                 continue
             if _is_under(event.target, policy.exec_allow):
                 continue

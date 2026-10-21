@@ -17,7 +17,10 @@ Exact-match entries: a runtime_allow entry starting with "=" (e.g.
 listings. It never allows anything inside the directory.
 
 In sandbox mode the container baseline (sandglass/baselines/python312_slim.yaml)
-is loaded automatically: system files the interpreter reads at startup.
+is loaded automatically: system files the interpreter reads at startup. For a
+Node.js server (runtime="node") the Node baseline (node_debian.yaml) is loaded
+as well; the Python one is still needed for Sandglass's launcher, which runs
+before Node.
 runtime_allow and the baseline allow READS (and listings) only, never writes.
 """
 
@@ -31,7 +34,13 @@ import yaml
 from sandglass import PROJECT_ROOT
 from sandglass import sandbox
 
-BASELINE_FILE = PROJECT_ROOT / "sandglass" / "baselines" / "python312_slim.yaml"
+BASELINES_DIR = PROJECT_ROOT / "sandglass" / "baselines"
+BASELINE_FILE = BASELINES_DIR / "python312_slim.yaml"
+# Baselines per server runtime. Python's is always first: the launcher is Python.
+BASELINE_FILES = {
+    "python": [BASELINE_FILE],
+    "node": [BASELINE_FILE, BASELINES_DIR / "node_debian.yaml"],
+}
 
 
 class PolicyError(ValueError):
@@ -154,6 +163,7 @@ def load_policy(
     server_script: str | Path | None = None,
     in_sandbox: bool = False,
     multiarch: str | None = None,
+    runtime: str = "python",
 ) -> Policy:
     """Read a YAML policy file and return a validated Policy.
 
@@ -162,6 +172,7 @@ def load_policy(
     `server_script` fills {server_script} and {server_dir}.
     `in_sandbox` switches to container paths and loads the container baseline;
     `multiarch` (asked from the container) fills {multiarch} in the baseline.
+    `runtime` ("python" or "node") picks which baselines are loaded.
     """
     script = Path(server_script).resolve() if server_script else None
     values = _placeholders(script, in_sandbox, multiarch)
@@ -181,9 +192,14 @@ def load_policy(
 
     baseline_name, baseline_read_allow = None, []
     if in_sandbox:
-        baseline = _read_yaml(BASELINE_FILE)
-        baseline_name = _require(baseline, "name", str, "baseline.")
-        baseline_read_allow = _path_list(baseline, "read_allow", "baseline.", values, in_sandbox)
+        if runtime not in BASELINE_FILES:
+            raise PolicyError(f"Unknown runtime {runtime!r} (expected one of {sorted(BASELINE_FILES)})")
+        names = []
+        for baseline_file in BASELINE_FILES[runtime]:
+            baseline = _read_yaml(baseline_file)
+            names.append(_require(baseline, "name", str, "baseline."))
+            baseline_read_allow += _path_list(baseline, "read_allow", "baseline.", values, in_sandbox)
+        baseline_name = " + ".join(names)  # e.g. "python312_slim + node_debian"
 
     return Policy(
         name=_require(data, "name", str, ""),
