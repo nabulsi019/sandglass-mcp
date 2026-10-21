@@ -242,7 +242,7 @@ def test_probes_grouped_by_path_with_counts_per_syscall():
     assert result["probes"] == [{
         "path": "/project/test_servers", "count": 4,
         "syscalls": {"newfstatat": 3, "readlinkat": 1},
-        "first_timestamp": "10:00:00.2",
+        "first_timestamp": "10:00:00.2", "phase": "startup",
     }]
     assert result["verdict"] == "CLEAN"  # probes never change the verdict
 

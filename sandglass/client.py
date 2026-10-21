@@ -17,7 +17,7 @@ import argparse
 import asyncio
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters, stdio_client
@@ -99,6 +99,11 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
                 print(f"    input schema: {json.dumps(tool.input_schema)}")
                 session_record["tools"].append({"name": tool.name, "description": tool.description})
             print()
+
+            # Phase boundary for the report (#18): everything the trace shows
+            # from now on happened during tool calls. UTC, like the container's
+            # clock (the image's /etc/localtime is UTC), in strace -tt format.
+            session_record["tool_calls_started"] = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")
 
             for tool in tools:
                 args = build_safe_arguments(tool)
