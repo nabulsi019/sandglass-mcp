@@ -28,6 +28,13 @@ Rules (one place, so they're easy to explain):
     one exec is part of the launch too, but only when runtime is "node")
     anything else not in exec_allow: same rules as files
 
+Phases (#18): every reported event gets a phase:
+  install    nothing is installed at run time yet (see #16), so always empty
+  startup    before the client sent its first tool call
+  tool-call  from the first tool call on
+  The boundary is the client's UTC clock just before the first call_tool,
+  compared with strace's -tt times (same clock, UTC inside the container).
+
 Verdicts:
   INCOMPLETE  the run can't be trusted: the server didn't start, the session
               errored, nothing was exercised, the trace is missing/truncated,
@@ -89,6 +96,30 @@ def _domain_allowed(host: str, policy: Policy) -> bool:
     return False
 
 
+PHASES = ("install", "startup", "tool-call")
+
+
+def _seconds(timestamp: str) -> float:
+    """'HH:MM:SS.micro' -> seconds since midnight."""
+    hours, minutes, seconds = timestamp.split(":")
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+def _phase_of(events: list[Event], session: dict):
+    """Return a function timestamp -> "startup" / "tool-call".
+
+    strace's -tt has no date, so times are measured from the first trace line
+    and wrapped at 24h: a run that crosses midnight still sorts correctly.
+    """
+    boundary = session.get("tool_calls_started")
+    if not events or not boundary:
+        return lambda timestamp: "startup"  # no tool was called
+    start = _seconds(events[0].timestamp)
+    since_start = lambda timestamp: (_seconds(timestamp) - start) % 86400
+    cutoff = since_start(boundary)
+    return lambda timestamp: "tool-call" if since_start(timestamp) >= cutoff else "startup"
+
+
 def _bucket_for_failure_or_success(event: Event) -> str:
     """Shared rule for files and execs: 'violation' or 'attempted'."""
     if event.succeeded or event.error in BLOCKED_ERRORS:
@@ -116,6 +147,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
     server_launch: Event | None = None
     node_launch: Event | None = None  # runtime "node" only
     sink_pid = _sink_pid(events)
+    phase_of = _phase_of(events, session)
     domains: list[dict] = []       # every request the sink recorded
     isolation: dict | None = None  # the sink's connect-to-a-public-IP check
 
@@ -132,7 +164,8 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
             method, host, port = request
             allowed = _domain_allowed(host, policy)
             domains.append({"method": method, "host": host, "port": port,
-                            "allowed": allowed, "timestamp": event.timestamp})
+                            "allowed": allowed, "timestamp": event.timestamp,
+                            "phase": phase_of(event.timestamp)})
             if allowed:
                 continue
             reason = "contacted a domain not in network.allow_domains"
@@ -161,6 +194,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
             entry = probes.setdefault(event.target, {
                 "path": event.target, "count": 0, "syscalls": {},
                 "first_timestamp": event.timestamp,
+                "phase": phase_of(event.timestamp),  # of the first occurrence
             })
             entry["count"] += 1
             entry["syscalls"][event.syscall] = entry["syscalls"].get(event.syscall, 0) + 1
@@ -200,6 +234,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
             "target": event.target,
             "mode": event.mode,
             "timestamp": event.timestamp,
+            "phase": phase_of(event.timestamp),
             "pid": event.pid,
             "succeeded": event.succeeded,
             "error": event.error,
@@ -323,7 +358,7 @@ def _markdown(r: dict) -> str:
         out.append("None.")
 
     out += _network_section(r)
-    out += _event_section("Violations", r["violations"])
+    out += _phase_sections(r)
     out += _event_section("Attempted (failed, not violations)", r["attempted"])
 
     out += ["", "## Probes (stat/access, informational only)", ""]
@@ -331,7 +366,8 @@ def _markdown(r: dict) -> str:
         # One line per path, most-probed first: "/project/test_servers: newfstatat x150, readlinkat x7"
         for p in sorted(r["probes"], key=lambda p: -p["count"]):
             calls = ", ".join(f"{name} x{n}" for name, n in p["syscalls"].items())
-            out.append(f"- `{p['path']}`: {calls} (total {p['count']}, first at {p['first_timestamp']})")
+            out.append(f"- `{p['path']}`: {calls} (total {p['count']}, first at {p['first_timestamp']},"
+                       f" {p.get('phase', '?')})")
     else:
         out.append("None.")
 
@@ -355,21 +391,36 @@ def _network_section(r: dict) -> list[str]:
     lines += ["", "Domains the server asked the local sink for (nothing was sent anywhere):", ""]
     if not r.get("domains"):
         return lines + ["None."]
-    lines += ["| Domain | Port | Method | Allowed |", "|---|---|---|---|"]
+    lines += ["| Domain | Port | Method | Allowed | Phase |", "|---|---|---|---|---|"]
     for d in r["domains"]:
-        lines.append(f"| `{d['host']}` | {d['port']} | {d['method']} | {'yes' if d['allowed'] else '**no**'} |")
+        lines.append(f"| `{d['host']}` | {d['port']} | {d['method']} |"
+                     f" {'yes' if d['allowed'] else '**no**'} | {d.get('phase', '?')} |")
     return lines
 
 
-def _event_section(title: str, records: list[dict]) -> list[str]:
-    lines = ["", f"## {title}", ""]
+def _phase_sections(r: dict) -> list[str]:
+    """Violations grouped by phase: install / startup / tool calls."""
+    titles = {"install": "Install", "startup": "Startup", "tool-call": "Tool calls"}
+    lines = ["", "## Violations by phase"]
+    for phase in PHASES:
+        records = [v for v in r["violations"] if v.get("phase") == phase]
+        section = _event_section(titles[phase], records, level="###")
+        if phase == "install" and not records:
+            section[-1:] = ["Not captured in this version: nothing is installed at run time (see #16)."]
+        lines += section
+    return lines
+
+
+def _event_section(title: str, records: list[dict], level: str = "##") -> list[str]:
+    lines = ["", f"{level} {title}", ""]
     if not records:
         return lines + ["None."]
     for i, v in enumerate(records, 1):
         status = "succeeded" if v["succeeded"] else f"failed ({v['error']})"
         lines += [
             f"{i}. **{v['reason']}**: `{v['target']}`",
-            f"   - syscall `{v['syscall']}`, {status}, pid {v['pid']}, at {v['timestamp']}",
+            f"   - syscall `{v['syscall']}`, {status}, pid {v['pid']}, at {v['timestamp']}"
+            f" ({v.get('phase', '?')})",
             "   - evidence:",
             "",
             "     ```",

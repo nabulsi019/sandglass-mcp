@@ -239,6 +239,21 @@ library in `/opt/venv` or `/lib` is a violation.
 | A domain asked of the sink that isn't in `network.allow_domains` | VIOLATION naming the domain |
 | Any exec besides the server's own launch | VIOLATION (same failure rules as files) |
 
+**Phases.** Every reported event has a phase, and the Markdown report
+groups violations under three headings:
+
+- **Install**: not captured yet. Nothing is installed at run time (see #16),
+  so this section says so.
+- **Startup**: before the client sent its first tool call (imports, the
+  server setting itself up).
+- **Tool calls**: from the first tool call on. A server that only
+  misbehaves when a tool is used shows up here, like all our fixtures.
+
+The boundary is the client's UTC clock just before the first `call_tool`,
+compared with strace's `-tt` times. The container uses the same clock, in
+UTC. On a Mac the VM's clock can be a few ms off macOS, so an event right at
+the boundary could land in the wrong phase.
+
 The verdict is **INCOMPLETE**, and never clean, if the server didn't start, the MCP
 session failed, no tool was exercised, the trace is missing or has no
 `+++ exited` line for the server (a truncated trace), the network sink didn't
