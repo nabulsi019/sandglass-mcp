@@ -11,8 +11,10 @@ so the container never has to read an extra file. In this order it:
      (fd 3, opened by sh) and closes fd 3, so the server can't touch the trace;
   2. (#13) starts the local network sink (sandglass/netsink.py) as its own
      process and waits until it listens, then points HTTP(S)_PROXY at it;
-  3. loads site-packages (skipped by -S, because .pth files can run code)
-     and runs the server as __main__.
+  3. runs the server: a .py server as __main__ in this same Python, after
+     loading site-packages (skipped by -S, because .pth files can run code);
+     a .js server by exec'ing Node in this same process (#17), so the fds
+     stay closed and compare.py sees one extra exec it treats as the launch.
 
 Until step 3 only frozen stdlib modules (os, sys, runpy, site) are used, so no
 package code runs while the trace stream is still reachable.
@@ -25,6 +27,7 @@ import sys
 SINK_URL = "http://127.0.0.1:18080"
 SINK_READY_FD = 3
 PYTHON = "/opt/venv/bin/python"
+NODE = "/usr/bin/node"  # must match sandglass/sandbox.py CONTAINER_NODE
 
 
 def start_sink(source: str) -> None:
@@ -63,7 +66,11 @@ def main() -> None:
     for name in ("NO_PROXY", "no_proxy"):
         os.environ.pop(name, None)
 
-    # 3. Packages, then the server.
+    # 3. The server. Node: replace this process with node (same pid, same fds).
+    if server.endswith(".js"):
+        os.execv(NODE, [NODE, server])
+
+    # Python: packages, then the server.
     import site
     site.main()
     import runpy

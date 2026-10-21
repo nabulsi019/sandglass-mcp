@@ -25,7 +25,7 @@ from mcp.types import CallToolResult, TextContent, Tool
 
 from sandglass import PROJECT_ROOT, sandbox
 from sandglass.compare import build_report, compare, write_reports
-from sandglass.policy import BASELINE_FILE, Policy, load_policy
+from sandglass.policy import BASELINE_FILES, Policy, load_policy
 from sandglass.trace_parser import parse_trace
 
 # The one input value we use for every string argument. For the notes
@@ -117,8 +117,10 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
 def run_host(server_script: Path) -> None:
     """Original behaviour: run the server directly, no tracing, no report."""
     # Start the server with the same Python interpreter running this client,
-    # so it sees the same installed packages (the project's .venv).
-    params = StdioServerParameters(command=sys.executable, args=[str(server_script)])
+    # so it sees the same installed packages (the project's .venv). A .js
+    # server runs with the `node` on your PATH.
+    command = "node" if sandbox.runtime_for(server_script) == "node" else sys.executable
+    params = StdioServerParameters(command=command, args=[str(server_script)])
     asyncio.run(run(params, server_script.name))
 
 
@@ -135,8 +137,9 @@ def run_sandboxed(server_script: Path, policy_path: Path) -> dict:
     # Container paths, because that's what the trace will contain. The
     # multiarch triplet comes from inside the image (arm64 Mac vs x86_64 CI).
     multiarch = sandbox.detect_multiarch()
+    runtime = sandbox.runtime_for(server_script)  # "python" or "node"
     policy = load_policy(policy_path, server_script=server_script,
-                         in_sandbox=True, multiarch=multiarch)
+                         in_sandbox=True, multiarch=multiarch, runtime=runtime)
     print_policy(policy, enforced=True)
 
     command, args = sandbox.docker_command(server_script)
@@ -157,7 +160,7 @@ def run_sandboxed(server_script: Path, policy_path: Path) -> dict:
 
     trace_text = trace_file.read_text(encoding="utf-8", errors="replace") if trace_file.exists() else ""
     events = parse_trace(trace_text, cwd=str(sandbox.CONTAINER_PROJECT))
-    result = compare(events, policy, session)
+    result = compare(events, policy, session, runtime=runtime)
 
     path_mapping = {
         str(sandbox.CONTAINER_PROJECT): f"{PROJECT_ROOT} (read-only)",
@@ -168,7 +171,8 @@ def run_sandboxed(server_script: Path, policy_path: Path) -> dict:
     }
     baseline = {
         "name": policy.baseline_name,
-        "file": str(BASELINE_FILE.relative_to(PROJECT_ROOT)),
+        "file": ", ".join(str(f.relative_to(PROJECT_ROOT)) for f in BASELINE_FILES[runtime]),
+        "runtime": runtime,
         "multiarch": multiarch,
     }
     report = build_report(server, timestamp, policy, session, result, trace_file,
@@ -190,7 +194,7 @@ def run_sandboxed(server_script: Path, policy_path: Path) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Exercise an MCP server's tools over stdio.")
-    parser.add_argument("server", type=Path, help="path to the server .py file")
+    parser.add_argument("server", type=Path, help="path to the server (.py, or .js for Node.js)")
     parser.add_argument("--policy", type=Path, help="policy YAML to load (required with --sandbox)")
     parser.add_argument("--sandbox", action="store_true",
                         help="run in Docker under strace and write a report")

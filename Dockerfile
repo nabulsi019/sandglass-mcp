@@ -8,9 +8,10 @@
 
 FROM python:3.12-slim
 
-# strace records every syscall the server makes.
+# strace records every syscall the server makes. nodejs (Debian's package)
+# runs Node.js fixtures; no npm, nothing is installed at run time.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends strace \
+    && apt-get install -y --no-install-recommends strace nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # Executable but NOT readable for the server's user. Linux marks a process

@@ -28,6 +28,7 @@ sandglass/
   policy.py          Loads + validates a policy (and the container baseline)
   baselines/
     python312_slim.yaml   System files python:3.12-slim reads at startup (reads only)
+    node_debian.yaml      Extra startup reads of Debian's Node.js, for .js servers (reads only)
 policies/
   notes_readonly.yaml
 scripts/
@@ -40,6 +41,7 @@ test_servers/        Fixture servers written for testing Sandglass. Not real tar
   aws_credentials_server.py  Same tool, but also reads ~/.aws/credentials (the sandbox's decoy)
   shell_command_server.py    Same tool, but also runs `/bin/sh -c true`
   undeclared_domain_server.py  Same tool, but also sends a GET to undeclared.example (local sink only)
+  good_notes_node_server.js  Node.js twin of good_notes_server (hand-written MCP, no npm packages)
   allowed_notes/             The only folder the notes servers are allowed to read
   decoy_home/                Fake "home" with an obviously fake credential file
 sandbox/
@@ -83,6 +85,7 @@ Expected verdicts:
 | aws_credentials_server | VIOLATIONS | 1: read of `/home/sandglass/.aws/credentials` (the decoy) |
 | shell_command_server | VIOLATIONS | 1: exec of `/bin/sh` |
 | undeclared_domain_server | VIOLATIONS | 1: domain `undeclared.example` (recorded by the local sink) |
+| good_notes_node_server.js | CLEAN | 0 (with the `node_debian` baseline) |
 | tamper_trace_server | VIOLATIONS | 3: list `/proc/1/fd`, read and write `/proc/1/fd/2` (all blocked with EACCES) |
 
 Every run must also show the isolation check failing (no route to the internet).
@@ -152,6 +155,13 @@ starts, the verdict is INCOMPLETE.
 Limitation: a server that ignores the proxy variables and resolves names
 itself shows up only as a failed `connect()` (a violation), without the
 domain name.
+
+### Node.js servers
+
+A `.js` server runs with Debian's `node` (installed in the image, no npm).
+The launcher still runs first (trace hidden, sink started), then `exec`s
+`/usr/bin/node <server.js>` in the same process. That one exec counts as part
+of the launch for `.js` servers only; any other exec is still a violation.
 
 ### Without `--sandbox`
 
@@ -255,8 +265,10 @@ uv run pytest
   filesystem is read-only apart from `/tmp`, so a server can't plant new
   symlinks in allowed folders. But a symlink that already exists inside an
   allowed folder would not be followed.
-- **The baseline is specific to `python:3.12-slim`.** Another base image or language
-  runtime (e.g. Node.js) needs its own baseline.
+- **Baselines are specific to the image.** `python312_slim` covers
+  `python:3.12-slim`; `node_debian` covers Debian's `nodejs` package in the same
+  image (`.js` servers get both, since the launcher is Python). Another base image
+  or runtime needs its own baseline.
 - **Only one call per tool, with `"hello"` as input.** Behaviour behind other
   inputs isn't exercised yet.
 

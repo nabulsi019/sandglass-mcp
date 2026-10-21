@@ -36,6 +36,12 @@ CONTAINER_REPORTS = CONTAINER_PROJECT / "reports"   # hidden from the server
 CONTAINER_PYTHON_BASE = PurePosixPath("/usr/local")
 CONTAINER_VENV = PurePosixPath("/opt/venv")
 CONTAINER_PYTHON = CONTAINER_VENV / "bin" / "python"
+CONTAINER_NODE = PurePosixPath("/usr/bin/node")  # Debian's nodejs, for .js servers
+
+
+def runtime_for(server_script: Path) -> str:
+    """Which runtime runs this server: "node" for .js files, else "python"."""
+    return "node" if server_script.suffix == ".js" else "python"
 TRACE_FILENAME = "trace.txt"
 
 # Matches the non-root user created in the Dockerfile.
