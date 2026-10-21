@@ -265,6 +265,39 @@ start, or the isolation check reached the internet.
 uv run pytest
 ```
 
+## Related work
+
+Other tools look at the same problem from different angles. The descriptions
+below are from each project's own paper or documentation.
+
+- **mcp-sec-audit**: [*Auditing MCP Servers for Over-Privileged Tool
+  Capabilities*](https://arxiv.org/abs/2603.21641) (Huang, Huang and Milani Fard).
+  It combines static pattern matching on Python MCP servers and their metadata
+  with optional dynamic fuzzing in Docker, monitored with eBPF, and reports a
+  weighted risk score with mitigation advice. The paper notes the eBPF monitor
+  needs privileged containers. *How Sandglass differs:* no risk score and no
+  static analysis. Sandglass compares observed behaviour against an explicit
+  policy, and its sandbox runs unprivileged (non-root, no `--cap-add`, no
+  `--privileged`, `--network none`), with strace inside the container.
+- **SandScope** ([repository](https://github.com/Wapiti08/SandScope), paper
+  [arXiv:2601.01241](https://arxiv.org/abs/2601.01241), first published as
+  MCP-SandboxScan). It runs WASI-compatible tools in a WebAssembly sandbox,
+  or drives unmodified MCP servers over stdio. It records execution and MCP
+  protocol evidence, and looks for source-to-sink flows: seeded canary values
+  (environment, files, tool inputs) showing up in output the LLM reads. Its
+  docs say native servers need extra OS- or VM-level isolation. *How Sandglass
+  differs:* Sandglass doesn't track data flow. It records every file, process
+  and network action of an unmodified server inside a container, and checks
+  each one against what the policy allows.
+- **OpenSSF Package Analysis** ([announcement](https://security.googleblog.com/2022/04/the-package-analysis-project-scalable.html),
+  [repository](https://github.com/ossf/package-analysis)). It dynamically
+  analyses packages uploaded to popular open-source registries, catalogues
+  the results in a public BigQuery table, and is aimed at catching malicious
+  packages, e.g. ones that act at install time. *How Sandglass differs:* it
+  targets one MCP server a team is deciding whether to approve. It exercises
+  the server's tools over MCP, and judges the result against that team's
+  policy instead of looking for signs of malware across a whole registry.
+
 ## Known limitations
 
 - **The server's own stderr is discarded in `--sandbox` mode** (it would share
