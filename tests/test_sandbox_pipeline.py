@@ -112,6 +112,17 @@ def test_parser_unescape_rebuilds_utf8_bytes(escaped, expected):
     events = parse_trace(f'8 10:00:00.1 openat(AT_FDCWD, "{escaped}", O_RDONLY) = 3')
     assert events[0].target == expected
 
+
+@pytest.mark.parametrize("path, expected", [
+    ("//etc/passwd", "/etc/passwd"),
+    ("///etc/passwd", "/etc/passwd"),
+    ("/etc//./passwd", "/etc/passwd"),
+    ("notes//hello.txt", "/project/notes/hello.txt"),  # relative: joined with the cwd
+])
+def test_parser_collapses_leading_slashes(path, expected):
+    events = parse_trace(f'8 10:00:00.1 openat(AT_FDCWD, "{path}", O_RDONLY) = 3')
+    assert events[0].target == expected
+
 # --- compare: verdicts -------------------------------------------------------
 
 def test_clean_run():
@@ -149,6 +160,18 @@ def test_failed_open_is_attempted_but_eacces_is_violation():
     ])
     assert [a["target"] for a in result["attempted"]] == ["/home/x/.ssh/id_rsa"]
     assert [v["target"] for v in result["violations"]] == ["/root/.aws/credentials"]
+
+
+def test_double_slash_paths_match_the_policy_like_the_kernel_sees_them():
+    # The kernel opens "//x" as "/x": an allowed note stays allowed, and
+    # /etc/passwd is reported under its real name.
+    result = run([
+        LAUNCH,
+        '10 10:00:00.2 openat(AT_FDCWD, "//project/test_servers/allowed_notes/hello.txt", O_RDONLY) = 8',
+        '10 10:00:00.3 openat(AT_FDCWD, "//etc/passwd", O_RDONLY) = 3',
+        EXITED,
+    ])
+    assert [v["target"] for v in result["violations"]] == ["/etc/passwd"]
 
 
 def test_failed_network_attempt_is_violation():
