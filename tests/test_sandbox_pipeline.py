@@ -5,6 +5,8 @@ These use small hand-written strace lines, so they run without Docker.
 
 from pathlib import PurePosixPath as P
 
+import pytest
+
 from sandglass import PROJECT_ROOT, sandbox
 from sandglass.compare import compare
 from sandglass.policy import load_policy
@@ -95,6 +97,20 @@ def test_parser_sendmmsg_counts_only_with_an_address():
     ]))
     assert [(e.kind, e.syscall, e.succeeded) for e in events] == [("network", "sendmmsg", False)]
     assert 'inet_addr("8.8.8.8")' in events[0].target
+
+
+@pytest.mark.parametrize("escaped, expected", [
+    (r"/tmp/caf\303\251", "/tmp/café"),        # strace's default: octal, one per byte
+    (r"/tmp/caf\xc3\xa9", "/tmp/café"),        # the same bytes with strace -x
+    (r"/tmp/\342\202\254", "/tmp/€"),          # 3-byte UTF-8 character
+    (r'/tmp/a\"b', '/tmp/a"b'),
+    (r"/tmp/a\\b", "/tmp/a\\b"),
+    (r"/tmp/a\nb", "/tmp/a\nb"),
+    (r"/tmp/bad\377", "/tmp/bad\\xff"),        # not valid UTF-8: stays visible
+])
+def test_parser_unescape_rebuilds_utf8_bytes(escaped, expected):
+    events = parse_trace(f'8 10:00:00.1 openat(AT_FDCWD, "{escaped}", O_RDONLY) = 3')
+    assert events[0].target == expected
 
 # --- compare: verdicts -------------------------------------------------------
 

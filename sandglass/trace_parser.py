@@ -74,6 +74,9 @@ UNFINISHED = "<unfinished ...>"
 EXIT_RE = re.compile(r"^\+\+\+ (exited with \d+|killed by \w+.*) \+\+\+$")
 # A double-quoted strace string, allowing escaped characters inside.
 STRING_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
+# One escape inside a strace string: \xNN (hex), \NNN (octal), or one character (\n, \", ...).
+ESCAPE_RE = re.compile(r"\\(x[0-9a-fA-F]{2}|[0-7]{1,3}|.)", re.DOTALL)
+SIMPLE_ESCAPES = {"n": b"\n", "t": b"\t", "r": b"\r", "v": b"\v", "f": b"\f"}
 # Target for an exec whose arguments strace couldn't read.
 UNREADABLE = "<unreadable>"
 
@@ -95,8 +98,26 @@ class Event:
 
 
 def _unescape(s: str) -> str:
-    """Undo strace's C-style escaping of strings (\\", \\\\, \\n, \\x41, ...)."""
-    return s.encode("latin-1", "backslashreplace").decode("unicode_escape")
+    """Undo strace's C-style escaping of strings (\\", \\\\, \\n, \\303, \\x41, ...).
+
+    strace escapes each non-ASCII BYTE, so "/tmp/café" arrives as
+    "/tmp/caf\\303\\251" (or "\\xc3\\xa9" with -x). Rebuild the bytes first, then
+    decode them as UTF-8. Bytes that aren't valid UTF-8 stay visible as "\\xff".
+    """
+    out = bytearray()
+    pos = 0
+    for match in ESCAPE_RE.finditer(s):
+        out += s[pos:match.start()].encode("utf-8")
+        code = match[1]
+        if code[0] == "x":
+            out.append(int(code[1:], 16))
+        elif code[0] in "01234567":
+            out.append(int(code, 8) & 0xFF)
+        else:
+            out += SIMPLE_ESCAPES.get(code, code.encode("utf-8"))  # \" -> ", \\ -> \
+        pos = match.end()
+    out += s[pos:].encode("utf-8")
+    return out.decode("utf-8", "backslashreplace")
 
 
 def _absolute(path: str, args: str, cwd: str) -> str:
