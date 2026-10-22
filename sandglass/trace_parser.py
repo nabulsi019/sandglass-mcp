@@ -124,7 +124,10 @@ def _absolute(path: str, args: str, cwd: str) -> str:
     """Make a path absolute. Relative paths are relative to the working
     directory only when the call uses AT_FDCWD (or has no dirfd at all)."""
     if path.startswith("/"):
-        return posixpath.normpath(path)
+        # normpath keeps exactly two leading slashes (POSIX allows "//" to mean
+        # something special), but Linux opens "//etc/passwd" as "/etc/passwd".
+        # Collapse them, or the path wouldn't match the policy's "/etc/passwd".
+        return posixpath.normpath("/" + path.lstrip("/"))
     if args.startswith("AT_FDCWD") or not re.match(r"^\d+,", args):
         return posixpath.normpath(posixpath.join(cwd, path))
     # Relative to some other open directory fd; we can't know which without
