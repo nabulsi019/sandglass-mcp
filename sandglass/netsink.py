@@ -32,11 +32,12 @@ READY_FD = 3
 
 # Hosts, methods and ports must look like this, or they're recorded as
 # "_invalid_", so a crafted request can't put ".." or "/" into the marker path.
-_HOST_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
+# "_" is allowed: real DNS names use it (_dmarc.example.com, some internal hosts).
+_HOST_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
 
 
 def clean_host(host: str) -> str:
-    """Return the host if every label is letters/digits/hyphens, else "_invalid_"."""
+    """Return the host if every label is letters/digits/hyphens/underscores, else "_invalid_"."""
     labels = host.lower().split(".")
     if len(host) > 253 or not all(labels) or any(c not in _HOST_CHARS for c in "".join(labels)):
         return "_invalid_"
