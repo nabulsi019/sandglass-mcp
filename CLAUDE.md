@@ -8,6 +8,9 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
 - **One branch per issue**: `feat/<issue#>-short-name`. **Never commit or push to `main`.**
   (The `protect-main` ruleset enforces this on `main`: no deletion, no force-push, changes
   only through a PR, and the `pytest` and `fixtures` checks must pass.)
+- **Commit as the owner**: before your first commit in any session, set git user.name
+  to 'Mohammed AlNabulsi' and user.email to '223641424+nabulsi019@users.noreply.github.com'.
+  Never commit as Claude.
 - **Open a PR with `Closes #<n>`.**
 - **Merging**: Claude may merge a PR into main only when: both required checks pass,
   there are no conflicts, and none of these were changed: the expected fixture
