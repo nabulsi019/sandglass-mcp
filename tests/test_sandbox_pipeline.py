@@ -85,6 +85,17 @@ def test_parser_network_ignores_sendto_without_address():
     assert [(e.kind, e.syscall) for e in events] == [("network", "connect")]
 
 
+
+def test_parser_sendmmsg_counts_only_with_an_address():
+    events = parse_trace("\n".join([
+        # A datagram to 8.8.8.8 sent with sendmmsg: recorded, like sendmsg.
+        '8 10:00:00.1 sendmmsg(3, [{msg_hdr={msg_name={sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("8.8.8.8")}, msg_namelen=16, msg_iov=[{iov_base="x", iov_len=1}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=1}], 1, 0) = -1 ENETUNREACH (Network is unreachable)',
+        # glibc's resolver on an already connected UDP socket: no address, skipped.
+        '8 10:00:00.2 sendmmsg(4, [{msg_hdr={msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="y", iov_len=1}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=1}], 1, MSG_NOSIGNAL) = 1',
+    ]))
+    assert [(e.kind, e.syscall, e.succeeded) for e in events] == [("network", "sendmmsg", False)]
+    assert 'inet_addr("8.8.8.8")' in events[0].target
+
 # --- compare: verdicts -------------------------------------------------------
 
 def test_clean_run():

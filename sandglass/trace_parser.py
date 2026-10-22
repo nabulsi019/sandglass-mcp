@@ -18,7 +18,7 @@ Event kinds:
            path-changing syscalls like rename/unlink (always "write")
   probe    stat/access/readlink: checks a path without reading its contents
   process  execve/execveat: a program was launched
-  network  connect/bind/listen/accept, and sendto/sendmsg WITH a destination
+  network  connect/bind/listen/accept, and sendto/sendmsg/sendmmsg WITH a destination
   exit     a traced process exited ("+++ exited with 0 +++")
 """
 
@@ -47,12 +47,14 @@ PROBE_SYSCALLS = {
 
 EXEC_SYSCALLS = {"execve", "execveat"}
 
-# connect/bind/listen/accept always count. sendto/sendmsg only count when they
-# carry a destination address: without one they're sending on an already
+# connect/bind/listen/accept always count. sendto/sendmsg/sendmmsg only count
+# when they carry a destination address: without one they're sending on an already
 # connected socket (whose connect() we already recorded) or on a local
 # socketpair, which can't reach the network. asyncio uses a socketpair
 # internally, so counting every sendto would flag every Python server.
-NETWORK_SYSCALLS = {"connect", "bind", "listen", "accept", "accept4", "sendto", "sendmsg"}
+# (glibc's DNS resolver uses sendmmsg on a connected UDP socket: no address.)
+SEND_SYSCALLS = {"sendto", "sendmsg", "sendmmsg"}
+NETWORK_SYSCALLS = {"connect", "bind", "listen", "accept", "accept4"} | SEND_SYSCALLS
 
 # Flags that mean an open() can modify the file.
 WRITE_FLAGS = ("O_WRONLY", "O_RDWR", "O_CREAT", "O_TRUNC", "O_APPEND")
@@ -151,7 +153,7 @@ def _classify(syscall: str, args: str, cwd: str) -> tuple[str, str, str | None] 
 
     if syscall in NETWORK_SYSCALLS:
         address = _network_target(args)
-        if syscall in ("sendto", "sendmsg") and address is None:
+        if syscall in SEND_SYSCALLS and address is None:
             return None  # no destination: connected socket or socketpair, see above
         return "network", address or args, None
 
