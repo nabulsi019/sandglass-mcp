@@ -47,6 +47,6 @@ def test_a_trace_cut_short_is_incomplete_never_clean(tmp_path):
 
 
 def test_the_client_never_reads_the_whole_trace_at_once():
-    source = inspect.getsource(client.run_sandboxed)
+    source = inspect.getsource(client._trace_and_report)  # used by fixtures and scans
     assert "parse_trace_file(" in source and "read_text" not in source
     assert trace_parser.MAX_TRACE_BYTES == 256 * 1024 * 1024

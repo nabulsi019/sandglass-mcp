@@ -103,12 +103,27 @@ def main() -> None:
     start_relay(relay_source)
 
     # 4. The server. Node: replace this process with node (same pid, same fds).
-    if server.endswith(".js"):
+    # (`sandglass scan npm:...` says so with SANDGLASS_RUNTIME: an npm "bin"
+    # file doesn't always end in .js.)
+    if server.endswith(".js") or os.environ.get("SANDGLASS_RUNTIME") == "node":
         os.execv(NODE, [NODE, server])
 
     # Python: packages, then the server.
     import site
     site.main()
+    # `sandglass scan pypi:...` (#19): the package was installed into this
+    # folder with pip --target. addsitedir also runs its .pth files, like a
+    # real install would. Put it right after the server's own folder, so the
+    # package's dependencies win over Sandglass's own (in /opt/venv). This is
+    # done here, after step 1, and not with PYTHONPATH: PYTHONPATH is read at
+    # interpreter startup, so a package could shadow e.g. `encodings` and run
+    # before the trace stream is hidden.
+    site_dir = os.environ.get("SANDGLASS_SITE_DIR")
+    if site_dir:
+        before = list(sys.path)
+        site.addsitedir(site_dir)
+        added = [p for p in sys.path if p not in before]
+        sys.path[:] = before[:1] + added + before[1:]
     import runpy
     try:
         runpy.run_path(server, run_name="__main__")

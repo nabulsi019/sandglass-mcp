@@ -14,9 +14,10 @@
 FROM python:3.12-slim-trixie
 
 # strace records every syscall the server makes. nodejs (Debian's package)
-# runs Node.js fixtures; no npm, nothing is installed at run time.
+# runs Node.js servers. npm installs scanned npm packages inside the sandbox
+# (`sandglass scan npm:...`, #19), offline, from files downloaded on the host.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends strace nodejs \
+    && apt-get install -y --no-install-recommends strace nodejs npm \
     && rm -rf /var/lib/apt/lists/*
 
 # Executable but NOT readable for the server's user. Linux marks a process
@@ -47,6 +48,12 @@ RUN python -m compileall -q /usr/local/lib/python3.12
 # Non-root user that runs the server. sandglass/sandbox.py passes the same uid with --user.
 RUN useradd --system --uid 10001 --home-dir /home/sandglass --no-create-home \
         --shell /usr/sbin/nologin sandglass
+
+# Where `sandglass scan` installs a package (#19). An empty folder owned by
+# that user: a new Docker volume mounted here starts as a copy of it, so the
+# install container (non-root) can write into the volume. The server's
+# container then mounts the same volume read-only.
+RUN mkdir /package && chown 10001:10001 /package
 
 # Decoy $HOME with obviously fake credentials (sandbox/decoy_home/, FAKE_ values
 # only), so a server that goes looking for secrets finds something to read and

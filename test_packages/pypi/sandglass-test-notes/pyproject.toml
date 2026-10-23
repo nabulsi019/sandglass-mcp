@@ -1,0 +1,15 @@
+# A test package for `sandglass scan` (#19): a well-behaved notes server.
+# Written for testing Sandglass only; never published to PyPI.
+# scripts/build_test_packages.py turns it into a wheel in test_packages/dist/pypi/
+# (it reads only name, version and scripts from this file).
+
+[project]
+name = "sandglass-test-notes"
+version = "1.0.0"
+description = "Sandglass test package: reads notes from its own notes/ folder"
+# No dependencies: it uses the mcp package already installed in the sandbox
+# image, so the local test registry needs nothing else.
+dependencies = []
+
+[project.scripts]
+sandglass-test-notes = "sandglass_test_notes.server:main"

@@ -22,6 +22,9 @@ def test_mixed_exec_and_file_violations_are_a_fail_not_a_crash(monkeypatch, caps
     mixed = [{"mode": None, "target": "/bin/sh", "phase": "tool-call"},
              {"mode": "read", "target": "/lib/libx.so", "phase": "tool-call"}]
     monkeypatch.setattr(check_fixtures, "run_sandboxed", lambda server, policy: fake_report(mixed))
+    # The scans (#19) too: no building, no Docker.
+    monkeypatch.setattr(check_fixtures, "build_test_packages", lambda: None)
+    monkeypatch.setattr(check_fixtures, "run_scan", lambda spec, policy, registry: fake_report(mixed))
     assert check_fixtures.main() == 1
     out = capsys.readouterr().out
     # Every fixture was still checked, and the summary was printed.
