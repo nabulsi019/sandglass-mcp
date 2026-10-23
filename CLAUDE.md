@@ -13,13 +13,27 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
   Never commit as Claude.
 - **Open a PR with `Closes #<n>`.**
 - **Merging**: Claude may merge a PR into main only when: both required checks pass,
-  there are no conflicts, and none of these were changed: the expected fixture
-  verdicts (good=0, overreach=1, listing=2), the sandbox hardening flags
-  (--network none, --read-only, non-root user, no --cap-add), the CI workflows'
-  required checks, or the ruleset. After every merge, pull main and rerun pytest
-  and check_fixtures.py. If main is red, revert the PR that caused it; if the
-  failure already existed before that PR, stop and report instead. Never
-  force-push. If a task requires changing any protected item, stop and report.
+  there are no conflicts, and none of these protected items were changed:
+  - every `EXPECTED` and `EXPECTED_DOMAINS` entry in `scripts/check_fixtures.py`
+    (the verdict and exact violations of all 8 fixtures: good_notes_server,
+    overreach_notes_server, listing_notes_server, aws_credentials_server,
+    shell_command_server, undeclared_domain_server, good_notes_node_server.js,
+    tamper_trace_server; and the sink requests undeclared_domain_server must make)
+  - the sandbox hardening flags (--network none, --read-only, non-root user,
+    no --cap-add)
+  - the strace permissions: `chmod 0711 /usr/bin/strace` in the Dockerfile
+    (executable but not readable, so the server can't reach strace's fds)
+  - the read-only tmpfs over `reports/` in sandbox.py (hides traces and reports)
+  - the launcher's fd swap: the server's stderr pointed at /dev/null and fd 3
+    closed (`os.dup2(3, 2)`, `os.close(3)`) before any server code runs
+  - the decoy HOME: `-e HOME=/home/sandglass` and the image's
+    `sandbox/decoy_home/` (fake credentials only, never the host's home)
+  - the CI workflows' required checks, or the ruleset.
+
+  After every merge, pull main and rerun pytest and check_fixtures.py. If main
+  is red, revert the PR that caused it; if the failure already existed before
+  that PR, stop and report instead. Never force-push. If a task requires
+  changing any protected item, stop and report.
 - **Before opening a PR**: tests pass locally, and the fixtures give the expected
   verdicts (see Commands below). Put the real results in the PR's "How I tested it".
 - **If CI fails or the owner leaves review comments**, fix them on the same branch.
@@ -37,7 +51,7 @@ uv run pytest                # unit tests, no Docker needed
 # Run one server (the `sandglass` command = `python -m sandglass.client`):
 uv run sandglass test_servers/good_notes_server.py --policy policies/notes_readonly.yaml --sandbox
 
-# Expected fixture verdicts (good CLEAN, overreach 1, listing 2), required before every PR:
+# Expected verdicts of all 8 fixtures (see EXPECTED in the script), required before every PR:
 docker build -t sandglass-sandbox .
 uv run python scripts/check_fixtures.py   # must print "all ... fixtures match expectations"
 ```
