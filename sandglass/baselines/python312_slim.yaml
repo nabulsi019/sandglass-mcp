@@ -31,3 +31,4 @@ read_allow:
   - /usr/lib/{multiarch}           # = /lib/{multiarch}: Debian's merged /usr makes /lib a link to usr/lib
   - /usr/share/zoneinfo/Etc/UTC    # = /etc/localtime, a link to the image's timezone (UTC)
   - /etc/ssl/openssl.cnf           # = /usr/lib/ssl/openssl.cnf, a link to Debian's OpenSSL config
+  - /etc/ssl/certs/ca-certificates.crt  # = /usr/lib/ssl/cert.pem, a link to Debian's CA bundle
