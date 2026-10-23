@@ -88,10 +88,18 @@ EXPECTED_SCANS = {
     "npm:sandglass-test-postinstall@1.0.0": ("VIOLATIONS", {
         ("read", "/home/sandglass/.aws/credentials"),
     }),
+    # Its file doesn't match the hash its registry publishes (#21).
+    "pypi:sandglass-test-tampered@1.0.0": ("INCOMPLETE", set()),
 }
 # The phase a scan's violations must be in, if not "tool-call".
 EXPECTED_SCAN_PHASES = {
     "npm:sandglass-test-postinstall@1.0.0": "install",
+}
+# Scans that must stop before anything is installed or run, and text their
+# INCOMPLETE reasons must contain.
+EXPECTED_SCAN_STOPPED = {
+    # Its local registry publishes a wrong sha256 (#21).
+    "pypi:sandglass-test-tampered@1.0.0": ["package hash mismatch", "not installed"],
 }
 # Failed attempts a scan must show: package spec -> set of (mode, path, errno).
 EXPECTED_SCAN_ATTEMPTS = {
@@ -118,7 +126,7 @@ def in_order(violations) -> list:
 
 
 def check(fixture: str, report: dict, want_verdict: str, want_violations: set,
-          want_phase: str = "tool-call") -> list[str]:
+          want_phase: str = "tool-call", server_ran: bool = True) -> list[str]:
     """Every check that applies to every fixture; returns the failures."""
     failures = []
     got = [(v["mode"], v["target"]) for v in report["violations"]]
@@ -137,8 +145,12 @@ def check(fixture: str, report: dict, want_verdict: str, want_violations: set,
         failures.append(f"{fixture}: violations outside the {want_phase} phase: {wrong_phase}")
 
     # Every run: the sandbox must have no route out (the sink reported "isolated")...
+    # (A scan stopped before its server ran, #21, must show it never ran.)
     isolation = report["network_isolation"]
-    if not isolation or not isolation["isolated"]:
+    if not server_ran:
+        if report.get("trace_file") is not None:
+            failures.append(f"{fixture}: expected the server not to run, but it has a trace")
+    elif not isolation or not isolation["isolated"]:
         failures.append(f"{fixture}: network isolation check did not report isolated: {isolation}")
     # ...and the sink logged exactly the requests we expect.
     domains = [(d["method"], d["host"], d["port"]) for d in report["domains"]]
@@ -167,9 +179,13 @@ def main() -> int:
     for package, (want_verdict, want_violations) in EXPECTED_SCANS.items():
         print(f"\n===== scan {package} =====")
         report = run_scan(parse_spec(package), SCAN_POLICY, TEST_REGISTRY)
+        stopped = EXPECTED_SCAN_STOPPED.get(package)
         failures += check(package, report, want_verdict, want_violations,
-                          EXPECTED_SCAN_PHASES.get(package, "tool-call"))
-        attempts ={(a["mode"], a["target"], a["error"]) for a in report.get("attempted", [])}
+                          EXPECTED_SCAN_PHASES.get(package, "tool-call"), server_ran=stopped is None)
+        reasons = " | ".join(report.get("incomplete_reasons", []))
+        failures += [f"{package}: INCOMPLETE reasons don't mention {text!r}: {reasons}"
+                     for text in stopped or [] if text not in reasons]
+        attempts = {(a["mode"], a["target"], a["error"]) for a in report.get("attempted", [])}
         missing = EXPECTED_SCAN_ATTEMPTS.get(package, set()) - attempts
         if missing:
             failures.append(f"{package}: expected failed attempts {sorted(missing)} are missing")

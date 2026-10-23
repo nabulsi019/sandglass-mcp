@@ -44,6 +44,7 @@ test_packages/       Packages written for testing `sandglass scan`. Never publis
   pypi/sandglass-test-peek/   Same, but also tries to read /project/guard and /project/CLAUDE.md
   npm/sandglass-test-notes/   Notes server as an npm tarball (bin)
   npm/sandglass-test-postinstall/  Clean server whose postinstall script reads ~/.aws/credentials
+  pypi/sandglass-test-tampered/    Clean server whose (test) registry publishes a wrong hash
 test_servers/        Fixture servers written for testing Sandglass. Not real targets.
   good_notes_server.py       read_note(name): reads only from allowed_notes/
   overreach_notes_server.py  Same tool, but also reads decoy_home/.fake_credentials
@@ -135,6 +136,15 @@ What happens (`sandglass/scan.py`):
      package with no wheel can't be scanned (INCOMPLETE, with pip's error).
    - npm: `npm install --ignore-scripts` in a scratch folder fills an npm
      cache with the package and its dependencies (needs `npm` on your machine).
+
+   **Package hash** (#21): every downloaded file's sha256 goes in the report,
+   and the package's own file is checked against the value its registry
+   publishes: for PyPI, the wheel's sha256 vs `digests.sha256` in
+   `https://pypi.org/pypi/<name>/<version>/json`; for npm, the tarball's
+   `sha512-…` integrity vs `dist.integrity` in
+   `https://registry.npmjs.org/<name>/<version>` (or `dist.shasum` for old
+   packages). A mismatch, or a registry that can't be reached, stops the scan
+   **before the install**: INCOMPLETE, with both values in the reason.
 2. **Install, inside the sandbox, under strace** (#16), in a separate
    container: same hardening (`--network none`, read-only, non-root, no
    capabilities), offline from the downloaded files, into a fresh Docker volume
@@ -172,8 +182,9 @@ What happens (`sandglass/scan.py`):
    absolute paths in a scan's policy: relative ones point into `/project`,
    which a scan doesn't have.
 4. **Report**, with a "Package" section: the spec, where it came from, the
-   files downloaded and the entry point. If a step fails (download, install,
-   no entry point), the report is still written, INCOMPLETE, with the reason.
+   files downloaded (with sha256), the hash check, the install and the entry
+   point. If a step fails (download, hash, install, no entry point), the
+   report is still written, INCOMPLETE, with the reason.
 
 The volume and the temporary folder are deleted afterwards.
 
@@ -187,6 +198,11 @@ builds it (`scripts/build_test_packages.py`) and scans:
 | `npm:sandglass-test-notes@1.0.0` | CLEAN |
 | `pypi:sandglass-test-peek@1.0.0` | CLEAN; its reads of `/project/guard` and `/project/CLAUDE.md` are listed as attempted (`ENOENT`): the project isn't mounted |
 | `npm:sandglass-test-postinstall@1.0.0` | VIOLATIONS: 1, its `postinstall` script reads `/home/sandglass/.aws/credentials` (the decoy), in the **install** phase; the server itself is clean |
+| `pypi:sandglass-test-tampered@1.0.0` | INCOMPLETE: `package hash mismatch` (its test registry publishes a wrong sha256); never installed or run |
+
+The local test registry also holds registry-style metadata
+(`test_packages/dist/<pypi|npm>-meta/<name>/<version>.json`) with the
+published hashes, so the hash check runs offline too.
 
 ### What the sandbox does
 

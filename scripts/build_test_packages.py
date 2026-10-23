@@ -5,6 +5,7 @@
 writes (git-ignored):
     test_packages/dist/pypi/<name>-<version>-py3-none-any.whl   one per test_packages/pypi/*/
     test_packages/dist/npm/<name>-<version>.tgz                 one per test_packages/npm/*/
+    test_packages/dist/<pypi|npm>-meta/<name>/<version>.json    the "published" hashes (#21)
 
 `sandglass scan ... --registry-dir test_packages/dist` then uses these files
 instead of PyPI or npm, so scanning our own test packages needs no network.
@@ -20,6 +21,7 @@ import gzip
 import hashlib
 import io
 import json
+import shutil
 import sys
 import tarfile
 import tomllib
@@ -100,16 +102,46 @@ def build_npm_tarball(source: Path, out_dir: Path) -> Path:
     return out
 
 
+def write_metadata(ecosystem: str, source: Path, built: Path) -> Path:
+    """The registry's metadata for one built file, the way PyPI / npm publish it
+    (only the fields `sandglass scan` reads), so its hash check (#21) runs offline.
+
+    A package whose pyproject.toml says [tool.sandglass-test]
+    wrong_published_hash = true gets a deliberately WRONG published hash: it
+    stands for a file that changed after it was published.
+    """
+    if ecosystem == "pypi":
+        project = tomllib.loads((source / "pyproject.toml").read_text(encoding="utf-8"))
+        name, version = project["project"]["name"], project["project"]["version"]
+        sha256 = hashlib.sha256(built.read_bytes()).hexdigest()
+        if project.get("tool", {}).get("sandglass-test", {}).get("wrong_published_hash"):
+            sha256 = hashlib.sha256(b"not the file that was published").hexdigest()
+        metadata = {"info": {"name": name, "version": version},
+                    "urls": [{"filename": built.name, "digests": {"sha256": sha256}}]}
+    else:
+        manifest = json.loads((source / "package.json").read_text(encoding="utf-8"))
+        name, version = manifest["name"], manifest["version"]
+        data = built.read_bytes()
+        integrity = "sha512-" + base64.b64encode(hashlib.sha512(data).digest()).decode()
+        metadata = {"name": name, "version": version,
+                    "dist": {"integrity": integrity, "shasum": hashlib.sha1(data).hexdigest()}}
+    path = DIST / f"{ecosystem}-meta" / name / f"{version}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
 def build_all() -> list[Path]:
     """Rebuild test_packages/dist/ from scratch; returns the files built."""
     built = []
     for ecosystem, build in (("pypi", build_wheel), ("npm", build_npm_tarball)):
-        out_dir = DIST / ecosystem
-        out_dir.mkdir(parents=True, exist_ok=True)
-        for old in out_dir.iterdir():
-            old.unlink()  # only what's in test_packages/ now
+        for folder in (DIST / ecosystem, DIST / f"{ecosystem}-meta"):
+            shutil.rmtree(folder, ignore_errors=True)  # only what's in test_packages/ now
+            folder.mkdir(parents=True)
         for source in sorted(p for p in (SOURCES / ecosystem).iterdir() if p.is_dir()):
-            built.append(build(source, out_dir))
+            path = build(source, DIST / ecosystem)
+            write_metadata(ecosystem, source, path)
+            built.append(path)
     return built
 
 
