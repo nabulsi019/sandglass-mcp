@@ -64,6 +64,7 @@ Verdicts:
   INCOMPLETE  the run can't be trusted: the server didn't start (or exited
               during startup, e.g. a missing API key), the session
               errored, nothing was exercised, the trace is missing/truncated,
+              the trace was bigger than MAX_TRACE_BYTES (only its start was read, #83),
               the network sink didn't start, the sandbox could reach the internet,
               the stdin relay didn't start or ended early (the server may have
               tampered with it), an io_uring call succeeded, or a file
@@ -79,7 +80,7 @@ from pathlib import Path
 
 from sandglass import launcher, netsink, sandbox, stdin_relay
 from sandglass.policy import Policy
-from sandglass.trace_parser import UNREADABLE, Event
+from sandglass.trace_parser import MAX_TRACE_BYTES, UNREADABLE, Event
 
 # Errors that mean "this exists but you're not allowed": a real access attempt.
 BLOCKED_ERRORS = {"EACCES", "EPERM"}
@@ -243,11 +244,14 @@ def _bucket_for_failure_or_success(event: Event) -> str:
     return "attempted"
 
 
-def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "python") -> dict:
+def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "python",
+            trace_cut_short: bool = False) -> dict:
     """Apply the rules above. Returns a plain dict (ready for JSON).
 
     `runtime` is "node" for a .js server: the launcher's exec of node is then
     part of the launch, not a violation.
+    `trace_cut_short` means only the first MAX_TRACE_BYTES of the trace were
+    read (#83), so events are missing: INCOMPLETE.
     """
     violations: list[dict] = []
     attempted: list[dict] = []
@@ -387,6 +391,10 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
     startup_exit = _startup_exit_reason(events, server_launch, relay_pid, session, server_errors)
     if startup_exit:
         incomplete.append(startup_exit)
+    if trace_cut_short:
+        limit = MAX_TRACE_BYTES // (1024 * 1024)
+        incomplete.append(f"the trace is larger than {limit} MiB; only the first {limit} MiB were "
+                          "checked, so later events are missing")
     if events and sink_pid is None:
         incomplete.append("the network sink did not start, so contacted domains can't be recorded")
     elif events and isolation is None:

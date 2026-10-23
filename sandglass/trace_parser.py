@@ -1,7 +1,7 @@
 """Turn strace output into a list of simple Event objects.
 
-Expected input: a file produced by `strace -f -tt -o trace.txt`. Each line
-looks like:
+Expected input: a file produced by `strace -f -tt -o trace.txt`, read one
+line at a time and at most MAX_TRACE_BYTES of it (#83). Each line looks like:
 
     17  18:04:49.654027 openat(AT_FDCWD, "/etc/hostname", O_RDONLY|O_CLOEXEC) = 3
     ^pid ^timestamp     ^syscall(arguments)                                    ^result
@@ -29,7 +29,13 @@ Event kinds:
 
 import posixpath
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, asdict
+
+# The most of a trace file that is read (#83). A server making a huge number
+# of syscalls could otherwise use up the host's memory. Past this, the run is
+# INCOMPLETE: the part we didn't read could hold anything.
+MAX_TRACE_BYTES = 256 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # Which syscalls we care about, grouped by what they mean.
@@ -229,16 +235,44 @@ def _classify(syscall: str, args: str, cwd: str) -> tuple[str, str, str | None] 
     return None
 
 
-def parse_trace(text: str, cwd: str = "/project") -> list[Event]:
-    """Parse a whole strace file into events, in the order they happened.
+def parse_trace_file(path, cwd: str = "/project",
+                     max_bytes: int = MAX_TRACE_BYTES) -> tuple[list[Event], bool]:
+    """Parse a trace file one line at a time, never reading it whole (#83).
 
+    Stops after `max_bytes`. Returns (events, cut_short): cut_short is True
+    if the file was bigger than that, so the events are only its beginning
+    (compare.py then makes the run INCOMPLETE). A missing file gives no events.
+    """
+    state = {"read": 0, "cut_short": False}
+
+    def lines(f):
+        for line in f:
+            state["read"] += len(line.encode("utf-8", "replace"))
+            if state["read"] > max_bytes:
+                state["cut_short"] = True
+                return  # stop reading: the rest of the file is never loaded
+            yield line.rstrip("\r\n")
+
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            events = parse_trace(lines(f), cwd)
+    except FileNotFoundError:
+        return [], False
+    return events, state["cut_short"]
+
+
+def parse_trace(text: str | Iterable[str], cwd: str = "/project") -> list[Event]:
+    """Parse strace output into events, in the order they happened.
+
+    `text` is the whole trace as one string, or any iterable of its lines
+    (e.g. an open file, read line by line by parse_trace_file).
     `cwd` is the server's working directory, used to make relative paths
     absolute (the sandbox runs with -w /project).
     """
     events: list[Event] = []
     pending: dict[int, tuple[str, str]] = {}  # pid -> (first line, its body), unfinished
 
-    for line in text.splitlines():
+    for line in (text.splitlines() if isinstance(text, str) else text):
         match = LINE_RE.match(line)
         if not match:
             continue

@@ -359,6 +359,11 @@ below are from each project's own paper or documentation.
   can read `sandglass/`, `policies/` and the other fixtures. That is acceptable for
   our own fixtures. For real packages, only the package itself should be mounted
   (planned for v0.4).
+- **Trace size** (#83). The trace is read one line at a time and at most
+  256 MiB of it (`MAX_TRACE_BYTES` in `sandglass/trace_parser.py`); a bigger
+  trace makes the run INCOMPLETE, since the unread part could hold anything.
+  The parsed events are still kept in memory (bounded by that limit), and the
+  trace file on disk isn't capped: Docker writes it straight to the file.
 - **Paths are compared as text.** strace shows the path the server asked for, not
   where a symlink leads. The project mount is read-only and the container
   filesystem is read-only apart from `/tmp`, so a server can't plant new
