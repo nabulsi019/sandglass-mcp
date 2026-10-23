@@ -76,13 +76,14 @@ Verdicts:
 """
 
 import json
+import posixpath
 import re
 from dataclasses import asdict
 from pathlib import Path
 
 from sandglass import launcher, netsink, sandbox, stdin_relay
 from sandglass.policy import InstallBaseline, Policy
-from sandglass.trace_parser import MAX_TRACE_BYTES, UNREADABLE, Event
+from sandglass.trace_parser import MAX_TRACE_BYTES, UNREADABLE, Event, exec_argv
 
 # Errors that mean "this exists but you're not allowed": a real access attempt.
 BLOCKED_ERRORS = {"EACCES", "EPERM"}
@@ -246,6 +247,14 @@ def _bucket_for_failure_or_success(event: Event) -> str:
     return "attempted"
 
 
+def _program(event: Event, phase: str, note: str | None = None) -> dict:
+    """One successful exec for the report's "Programs run" section (#120).
+    Listed whether it was allowed or not: this is visibility, not a verdict."""
+    return {"pid": event.pid, "timestamp": event.timestamp, "phase": phase,
+            "path": event.target, "argv": exec_argv(event.raw), "note": note,
+            "evidence": event.raw}
+
+
 def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "python",
             trace_cut_short: bool = False) -> dict:
     """Apply the rules above. Returns a plain dict (ready for JSON).
@@ -277,8 +286,19 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
     io_uring_used: list[Event] = []  # io_uring calls that succeeded (#75)
     unreadable: list[Event] = []     # file/stat events whose path strace couldn't read (#98)
     server_errors: list[str] = []    # the server's own error messages, via the launcher (#24)
+    programs: list[dict] = []        # every successful exec, allowed or not (#120)
 
     for index, event in enumerate(events):
+        if event.kind == "process" and event.succeeded:
+            note = None
+            if server_launch is None:
+                note = "Sandglass's launcher, which then starts the server"
+            elif event is sink_exec:
+                note = "Sandglass's network sink"
+            elif event is relay_exec:
+                note = "Sandglass's stdin relay"
+            programs.append(_program(event, phase_of(index), note))
+
         if event.kind in ("file", "probe") and event.target == UNREADABLE:
             # Fail closed: we can't tell what was touched, so we can't judge
             # it against any allow-list. From any pid; INCOMPLETE below.
@@ -430,6 +450,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
         "domains": domains,
         "network_isolation": isolation,
         "phase_note": phase_note,
+        "programs": programs,
         "event_counts": {
             kind: sum(1 for e in events if e.kind == kind)
             for kind in ("file", "probe", "process", "network", "io_uring", "exit")
@@ -514,7 +535,7 @@ def compare_install(events: list[Event], policy: Policy, baseline: InstallBaseli
     write_ok = policy.write_allow + baseline.write_allow
     exec_ok = policy.exec_allow + baseline.exec_allow
     violations, attempted, probes, incomplete = [], [], {}, []
-    unreadable, io_uring_used = [], []
+    unreadable, io_uring_used, programs = [], [], []
     launch: Event | None = None
 
     def record(event: Event, reason: str, bucket: str, target: str | None = None) -> None:
@@ -549,10 +570,15 @@ def compare_install(events: list[Event], policy: Policy, baseline: InstallBaseli
                 entry["count"] += 1
                 entry["syscalls"][event.syscall] = entry["syscalls"].get(event.syscall, 0) + 1
         elif event.kind == "process":
+            if event.succeeded:  # "Programs run" (#120): every successful exec
+                programs.append(_program(event, "install",
+                                         "the installer's shell" if launch is None else None))
             if launch is None and event.succeeded:
                 launch = event  # strace starting the installer's shell
             elif not _is_under(event.target, exec_ok):
-                record(event, "install ran a program not in the install baseline or exec_allow",
+                # A failed exec didn't run anything (#120): "tried to run".
+                did = "ran" if event.succeeded else "tried to run"
+                record(event, f"install {did} a program not in the install baseline or exec_allow",
                        _bucket_for_failure_or_success(event))
         elif event.kind == "network":
             family = re.search(r"sa_family=(\w+)", event.target)
@@ -595,6 +621,7 @@ def compare_install(events: list[Event], policy: Policy, baseline: InstallBaseli
         "violations": violations,
         "attempted": attempted,
         "probes": sorted(probes.values(), key=lambda p: p["first_timestamp"]),
+        "programs": programs,
         "event_counts": {kind: sum(1 for e in events if e.kind == kind)
                          for kind in ("file", "probe", "process", "network", "io_uring", "exit")},
     }
@@ -608,8 +635,8 @@ def with_install(result: dict, install: dict) -> dict:
     has one, else CLEAN.
     """
     merged = dict(result)
-    for key in ("incomplete_reasons", "violations", "attempted", "probes"):
-        merged[key] = install[key] + result[key]
+    for key in ("incomplete_reasons", "violations", "attempted", "probes", "programs"):
+        merged[key] = install.get(key, []) + result.get(key, [])
     if merged["incomplete_reasons"]:
         merged["verdict"] = "INCOMPLETE"
     elif merged["violations"]:
@@ -674,6 +701,11 @@ def coverage(session: dict) -> dict:
 TRACING_NOTE = ("the server could detect it was traced (strace shows in /proc/self/status, "
                 "TracerPid); a CLEAN verdict only covers what it did while traced (#82).")
 
+# In every scan report's "Not tested" section (#120): only the package's own
+# file is checked against its registry (#21); its dependencies are not.
+DEPENDENCY_HASH_NOTE = ("Dependency hashes were recorded but not compared to the registry; "
+                        "only the package's own file was verified.")
+
 
 def not_run(reason: str | None) -> dict:
     """compare()'s result for a scan whose server never ran (#19): the
@@ -682,7 +714,7 @@ def not_run(reason: str | None) -> dict:
     return {
         "verdict": "INCOMPLETE", "incomplete_reasons": [reason] if reason else [],
         "violations": [], "attempted": [], "probes": [], "domains": [],
-        "network_isolation": None, "phase_note": "the server was not run",
+        "network_isolation": None, "phase_note": "the server was not run", "programs": [],
         "event_counts": {kind: 0 for kind in ("file", "probe", "process", "network", "io_uring", "exit")},
     }
 
@@ -715,7 +747,10 @@ def build_report(server: str, timestamp: str, policy: Policy, session: dict,
         "domains": result["domains"],
         "network_isolation": result["network_isolation"],
         "phase_note": result["phase_note"],
+        "programs": result.get("programs", []),  # every successful exec (#120)
         "tracing_note": TRACING_NOTE,  # a known limitation, in every report (#82)
+        # What a scan did not check (#120). Fixture runs have no package.
+        "not_tested": [DEPENDENCY_HASH_NOTE] if package else [],
         "event_counts": result["event_counts"],
     }
 
@@ -762,9 +797,12 @@ def _markdown(r: dict) -> str:
         out.append("None.")
 
     out += _coverage_section(r)
+    if r.get("not_tested"):
+        out += ["", "## Not tested", ""] + [f"- {line}" for line in r["not_tested"]]
     out += _network_section(r)
     out += _phase_sections(r)
-    out += _event_section("Attempted (failed, not violations)", r["attempted"])
+    out += _programs_section(r)
+    out += _attempted_section(r)
 
     out += ["", "## Probes (stat/access, informational only)", ""]
     if r["probes"]:
@@ -874,6 +912,142 @@ def _phase_sections(r: dict) -> list[str]:
             section[-1:] = ["Nothing is installed in a fixture run; `sandglass scan` traces "
                             "the install of a package (see #16)."]
         lines += section
+    return lines
+
+
+def _command_line(argv: list[str] | None) -> str:
+    """argv as one readable line: sh -c "node postinstall.js"."""
+    if argv is None:
+        return "(arguments not readable)"
+    # json.dumps quotes an argument (and escapes its quotes) when it needs it.
+    return " ".join(a if a and not any(c.isspace() or c in "\"'\\" for c in a) else json.dumps(a)
+                    for a in argv)
+
+
+def _programs_section(r: dict) -> list[str]:
+    """Every successful exec, by phase (#120). Allowed or not: violations are
+    listed in their own section; this shows what actually ran."""
+    titles = {"install": "Install", "startup": "Startup", "tool-call": "Tool calls",
+              "unknown": "Phase unknown"}
+    lines = ["", "## Programs run", "",
+             "Every program that was started successfully, allowed or not "
+             "(violations are listed above)."]
+    programs = r.get("programs", [])
+    for phase in PHASES:
+        rows = [p for p in programs if p["phase"] == phase]
+        if phase == "unknown" and not rows:
+            continue
+        lines += ["", f"### {titles[phase]}", ""]
+        if phase == "install" and not rows and not r.get("package"):
+            lines.append("Nothing is installed in a fixture run.")
+        elif not rows:
+            lines.append("None.")
+        for p in rows:
+            note = f" ({p['note']})" if p.get("note") else ""
+            lines.append(f"- pid {p['pid']} at {p['timestamp']}: `{p['path']}`{note}:"
+                         f" `{_command_line(p['argv'])}`")
+    return lines
+
+
+# A failed exec with one of these errors may be part of a PATH search (#120).
+PATH_SEARCH_ERRORS = {"ENOENT", "EACCES"}
+
+
+def _path_searches(attempted: list[dict], programs: list[dict]) -> dict[int, dict]:
+    """Find PATH searches in the Attempted list (#120): {id(record): search}.
+
+    A shell or npm looking for "node" tries every folder in PATH in turn, so
+    one `node` command leaves a run of failed execs (ENOENT, or EACCES)
+    from the same pid, with the same argv, whose paths share the basename
+    "node". That run is one PATH search, not N programs. Records of other
+    pids in between don't end a run; any other record of the same pid does.
+    A run counts as a search if it has 2+ places, or if the same pid then
+    successfully runs that basename ("found at"). Never "ran a program".
+    """
+    runs, current = [], {}  # current: pid -> the run being built for it
+    for record in attempted:
+        pid = record["pid"]
+        if record["syscall"] not in ("execve", "execveat") or record["error"] not in PATH_SEARCH_ERRORS:
+            current.pop(pid, None)  # anything else from this pid ends its run
+            continue
+        argv, name = exec_argv(record["evidence"]), posixpath.basename(record["target"])
+        run = current.get(pid)
+        if run is None or (run["argv"], run["basename"], run["phase"]) != (argv, name, record["phase"]):
+            run = {"pid": pid, "argv": argv, "basename": name, "phase": record["phase"], "records": []}
+            current[pid] = run
+            runs.append(run)
+        run["records"].append(record)
+
+    searches = {}
+    for run in runs:
+        last = run["records"][-1]["timestamp"]
+        found = next((p["path"] for p in programs if p["pid"] == run["pid"] and p["phase"] == run["phase"]
+                      and posixpath.basename(p["path"]) == run["basename"] and p["timestamp"] >= last), None)
+        if len(run["records"]) >= 2 or found:
+            run["found_at"] = found
+            for record in run["records"]:
+                searches[id(record)] = run
+    return searches
+
+
+def group_attempted(attempted: list[dict], programs: list[dict]) -> list[dict]:
+    """The Attempted list grouped for the Markdown report (#120). The JSON
+    keeps every event; this only shortens what a person has to read.
+
+    Each group: "label", "target", "error", "phase", "count", "first" (the
+    first record, for its time, pid and evidence), and for a PATH search
+    "found_at". Groups are in the order of their first record.
+      - a PATH search (see _path_searches) is one group, labelled
+        "looked for <basename> in PATH (N places)"
+      - everything else: one group per (category, path, errno, phase)
+    """
+    searches = _path_searches(attempted, programs)
+    groups, by_key = [], {}
+    for record in attempted:
+        search = searches.get(id(record))
+        if search is not None:
+            key = ("PATH search", id(search))
+            label = f"looked for {search['basename']} in PATH ({len(search['records'])} places)"
+        else:
+            key = (record["reason"], record["target"], record["error"], record["phase"])
+            label = record["reason"]
+        group = by_key.get(key)
+        if group is None:
+            group = {"label": label, "target": record["target"], "error": record["error"],
+                     "phase": record["phase"], "count": 0, "first": record,
+                     "found_at": search.get("found_at") if search else None,
+                     "path_search": search is not None}
+            by_key[key] = group
+            groups.append(group)
+        group["count"] += 1
+    return groups
+
+
+def _attempted_section(r: dict) -> list[str]:
+    """Attempted (failed, not violations), grouped like the Probes section (#120)."""
+    lines = ["", "## Attempted (failed, not violations)", ""]
+    groups = group_attempted(r["attempted"], r.get("programs", []))
+    if not groups:
+        return lines + ["None."]
+    lines += [f"{len(r['attempted'])} failed attempt(s) in {len(groups)} group(s); "
+              "the JSON report lists each one.", ""]
+    for i, g in enumerate(groups, 1):
+        first = g["first"]
+        if g["path_search"]:
+            found = f", found at `{g['found_at']}`" if g["found_at"] else ", not found"
+            title = f"{i}. **{g['label']}**{found}: `{_command_line(exec_argv(first['evidence']))}`"
+        else:
+            title = f"{i}. **{g['label']}**: `{g['target']}`"
+        lines += [
+            title,
+            f"   - syscall `{first['syscall']}`, failed ({g['error']}), x{g['count']},"
+            f" first at {first['timestamp']}, pid {first['pid']} ({g['phase']})",
+            "   - evidence (first occurrence):",
+            "",
+            "     ```",
+            f"     {first['evidence']}",
+            "     ```",
+        ]
     return lines
 
 
