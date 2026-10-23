@@ -41,6 +41,10 @@ def policy_with_domains(tmp_path, domains):
     (b"GET http://../etc/x HTTP/1.1\r\n\r\n", ("GET", "_invalid_", 80)),      # no ".." in the marker
     (b"GET http://a/b/c HTTP/1.1\r\n\r\n", ("GET", "a", 80)),
     (b"GET http://evil.com%2F..%2F HTTP/1.1\r\n\r\n", ("GET", "_invalid_", 80)),
+    (b"GET http://_dmarc.Example.com/ HTTP/1.1\r\n\r\n", ("GET", "_dmarc.example.com", 80)),
+    (b"CONNECT my_host.internal:8443 HTTP/1.1\r\n\r\n", ("CONNECT", "my_host.internal", 8443)),
+    (b"GET http://a..b/ HTTP/1.1\r\n\r\n", ("GET", "_invalid_", 80)),       # empty label
+    (b"GET http://_..%2F/ HTTP/1.1\r\n\r\n", ("GET", "_invalid_", 80)),
     (b"garbage", ("_invalid_", "_invalid_", 0)),
     (b"", ("_invalid_", "_invalid_", 0)),
 ])
@@ -74,6 +78,12 @@ def test_allowed_domains_exact_and_wildcard(tmp_path):
     result = run(lines, policy=policy)
     assert [d["allowed"] for d in result["domains"]] == [True, True, False, False]
     assert sorted(v["target"] for v in result["violations"]) == ["eviltrusted.org", "trusted.org"]
+
+
+def test_underscore_host_is_recorded_by_name():
+    result = run([LAUNCH, SERVER_TO_SINK, sink_request("GET", "_dmarc.example.com", 80), EXITED])
+    assert [d["host"] for d in result["domains"]] == ["_dmarc.example.com"]
+    assert [v["target"] for v in result["violations"]] == ["_dmarc.example.com"]
 
 
 def test_bad_allow_domains_entry(tmp_path):
