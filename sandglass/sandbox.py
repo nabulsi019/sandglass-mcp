@@ -64,7 +64,10 @@ STDIN_RELAY = (PROJECT_ROOT / "sandglass" / "stdin_relay.py").read_text(encoding
 # classes, plus:
 #   memfd_create  an anonymous in-memory file (#77). Code written there can be
 #                 run with execveat() without ever touching the disk.
-TRACED_SYSCALLS = "file,process,network,memfd_create"
+#   io_uring_*    (#75) the kernel does io_uring's reads and opens itself, so
+#                 strace can't see them; we can only see that a ring was used.
+TRACED_SYSCALLS = ("file,process,network,memfd_create,"
+                   "io_uring_setup,io_uring_enter,io_uring_register")
 
 
 def to_container_path(host_path: Path) -> PurePosixPath:
