@@ -60,6 +60,12 @@ NETSINK = (PROJECT_ROOT / "sandglass" / "netsink.py").read_text(encoding="utf-8"
 # The stdin relay the launcher starts (see sandglass/stdin_relay.py).
 STDIN_RELAY = (PROJECT_ROOT / "sandglass" / "stdin_relay.py").read_text(encoding="utf-8")
 
+# What strace records (-e trace=...): strace's file, process and network
+# classes, plus:
+#   memfd_create  an anonymous in-memory file (#77). Code written there can be
+#                 run with execveat() without ever touching the disk.
+TRACED_SYSCALLS = "file,process,network,memfd_create"
+
 
 def to_container_path(host_path: Path) -> PurePosixPath:
     """Map a file inside the project on the host to its path inside the container."""
@@ -105,11 +111,11 @@ def docker_command(server_script: Path) -> tuple[str, list[str]]:
     # strace flags:
     #   -f               follow child processes and threads
     #   -tt              timestamp every line (microseconds)
-    #   -e               only the syscall classes we care about
+    #   -e               only the syscalls we care about (TRACED_SYSCALLS)
     #   --kill-on-exit   if strace dies, the server dies too (no untraced tail)
     #   -o /proc/self/fd/2   write to strace's own stderr; strace opens it
     #                    close-on-exec, so the server doesn't inherit that copy
-    strace = ("exec strace -f -tt -e trace=file,process,network --kill-on-exit"
+    strace = (f"exec strace -f -tt -e trace={TRACED_SYSCALLS} --kill-on-exit"
               f" -o /proc/self/fd/2 {CONTAINER_PYTHON} -S -c \"$1\" \"$2\" \"$3\" \"$4\" 3>/dev/null")
     args = [
         "run",

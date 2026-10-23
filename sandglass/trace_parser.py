@@ -15,7 +15,8 @@ credentials file still shows intent. compare.py decides what each one means.
 Event kinds:
   file     open/openat/... with mode "read", "write", or "list" (a directory
            opened with O_DIRECTORY, i.e. listing its contents), plus
-           path-changing syscalls like rename/unlink (always "write")
+           path-changing syscalls like rename/unlink (always "write"), and
+           memfd_create as a "write" to "memfd:<name>"
   probe    stat/access/readlink: checks a path without reading its contents
   process  execve/execveat: a program was launched
   network  connect/bind/listen/accept, and sendto/sendmsg/sendmmsg WITH a destination
@@ -46,6 +47,11 @@ PROBE_SYSCALLS = {
 }
 
 EXEC_SYSCALLS = {"execve", "execveat"}
+
+# memfd_create(name, flags) makes an anonymous file that lives only in memory
+# (#77). It's recorded as a WRITE to "memfd:<name>", which no write_allow entry
+# covers, so creating one is a violation, like writing any file outside policy.
+MEMFD_PREFIX = "memfd:"
 
 # connect/bind/listen/accept always count. sendto/sendmsg/sendmmsg only count
 # when they carry a destination address: without one they're sending on an already
@@ -156,6 +162,9 @@ def _classify(syscall: str, args: str, cwd: str) -> tuple[str, str, str | None] 
         else:
             mode = "read"
         return "file", _absolute(strings[0], args, cwd), mode
+
+    if syscall == "memfd_create":
+        return "file", MEMFD_PREFIX + (strings[0] if strings else ""), "write"
 
     if syscall in WRITE_SYSCALLS and strings:
         # rename(old, new): the destination is the interesting path.

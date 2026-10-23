@@ -108,7 +108,7 @@ The client runs:
 docker run -i --rm --network none --read-only --tmpfs /tmp --user 10001:10001 \
   -e HOME=/home/sandglass -v <project>:/project:ro --mount type=tmpfs,destination=/project/reports,tmpfs-mode=0555 \
   -w /project sandglass-sandbox \
-  sh -c 'exec strace -f -tt -e trace=file,process,network --kill-on-exit -o /proc/self/fd/2 \
+  sh -c 'exec strace -f -tt -e trace=file,process,network,memfd_create --kill-on-exit -o /proc/self/fd/2 \
          /opt/venv/bin/python -S -c "<launcher.py>" <server> "<netsink.py>" "<stdin_relay.py>" 3>/dev/null'
 ```
 
@@ -234,6 +234,7 @@ library in `/opt/venv` or `/lib` is a violation.
 | File read / listing / write that **succeeded** | VIOLATION |
 | File open that failed with `EACCES`/`EPERM` (exists, access blocked) | VIOLATION |
 | File open that failed otherwise (e.g. `ENOENT`) | listed under "attempted", verdict unchanged |
+| `memfd_create` (a file that lives only in memory; code in it can run without touching disk) | recorded as a write to `memfd:<name>`, so the same rules as a file write: VIOLATION if it succeeded |
 | `stat` / `access` / `readlink` (looking, not reading) | listed under "probes", grouped by path with a count per syscall; informational |
 | Any network attempt, even a failed one | VIOLATION |
 | A successful connect to the local network sink | not counted itself; the sink records the domain |
