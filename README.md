@@ -28,7 +28,7 @@ sandglass/
   compare.py         Events vs policy -> verdict, violations, report files
   policy.py          Loads + validates a policy (and the container baseline)
   baselines/
-    python312_slim.yaml   System files python:3.12-slim reads at startup (reads only)
+    python312_slim.yaml   System files python:3.12-slim-trixie reads at startup (reads only)
     node_debian.yaml      Extra startup reads of Debian's Node.js, for .js servers (reads only)
 policies/
   notes_readonly.yaml
@@ -315,9 +315,11 @@ below are from each project's own paper or documentation.
 
 ## Known limitations
 
-- **The server's own stderr is discarded in `--sandbox` mode** (it would share
-  a stream with the trace). To see a server's tracebacks, run it without
-  `--sandbox`.
+- **The server's own stderr is discarded in `--sandbox` mode, to protect the
+  trace** (#47). strace writes the trace to the container's stderr, so the
+  launcher points the server's stderr at `/dev/null` before any server code
+  runs; otherwise the server could write fake lines into its own trace. To see
+  a server's tracebacks, run it without `--sandbox`.
 
 - **The whole project is mounted read-only into the container**, so a server
   can read `sandglass/`, `policies/` and the other fixtures. That is acceptable for
@@ -329,9 +331,11 @@ below are from each project's own paper or documentation.
   symlinks in allowed folders. But a symlink that already exists inside an
   allowed folder would not be followed.
 - **Baselines are specific to the image.** `python312_slim` covers
-  `python:3.12-slim`; `node_debian` covers Debian's `nodejs` package in the same
+  `python:3.12-slim-trixie`; `node_debian` covers Debian's `nodejs` package in the same
   image (`.js` servers get both, since the launcher is Python). Another base image
-  or runtime needs its own baseline.
+  or runtime needs its own baseline. The Dockerfile pins the Debian release
+  (13, "trixie": strace 6.13, Node.js 20), so a rebuild can't silently switch
+  release; moving to a new one means re-checking the baselines and the trace parser.
 - **Only one call per tool, with `"hello"` as input.** Behaviour behind other
   inputs isn't exercised yet.
 

@@ -6,7 +6,12 @@
 # /project at run time (see sandglass/sandbox.py), so editing a server never
 # requires a rebuild. The host's macOS .venv is never used.
 
-FROM python:3.12-slim
+# Pinned to a Debian release (13, "trixie"), so a rebuild can't quietly move to
+# a new release with a different strace (the trace parser depends on its
+# output format) or different system files (the baselines list them).
+# trixie gives strace 6.13 and Node.js 20. Tag, not digest: security updates
+# within the release still arrive on rebuild.
+FROM python:3.12-slim-trixie
 
 # strace records every syscall the server makes. nodejs (Debian's package)
 # runs Node.js fixtures; no npm, nothing is installed at run time.
