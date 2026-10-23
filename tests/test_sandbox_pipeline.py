@@ -264,6 +264,52 @@ def test_memfd_create_is_a_violation_and_a_failed_one_is_attempted():
     assert [a["target"] for a in result["attempted"]] == ["memfd:other"]
 
 
+# --- io_uring (#75) ------------------------------------------------------------
+
+# As Node's libuv does at every startup (seen in the sandbox image); blocked by
+# Docker's default seccomp profile.
+IO_URING_BLOCKED = ('8 10:00:00.2 io_uring_setup(256, {flags=IORING_SETUP_NO_SQARRAY, sq_thread_cpu=0, '
+                    'sq_thread_idle=0}) = -1 EPERM (Operation not permitted)')
+IO_URING_WORKS = ('8 10:00:00.3 io_uring_setup(4, {flags=0, sq_thread_cpu=0, sq_thread_idle=0, '
+                  'sq_entries=4, cq_entries=8, features=IORING_FEAT_SINGLE_MMAP}) = 5')
+
+
+def test_parser_io_uring_events():
+    events = parse_trace("\n".join([
+        IO_URING_BLOCKED,
+        IO_URING_WORKS,
+        '8 10:00:00.4 io_uring_enter(5, 1, 1, IORING_ENTER_GETEVENTS, NULL, 8) = 1',
+        '8 10:00:00.5 io_uring_register(5, IORING_REGISTER_BUFFERS, 0x7f, 1) = 0',
+    ]))
+    assert [(e.kind, e.target, e.succeeded, e.error) for e in events] == [
+        ("io_uring", "io_uring_setup", False, "EPERM"),
+        ("io_uring", "io_uring_setup", True, None),
+        ("io_uring", "io_uring_enter", True, None),
+        ("io_uring", "io_uring_register", True, None),
+    ]
+
+
+def test_blocked_io_uring_is_attempted_and_the_run_stays_clean():
+    # Not a violation even though EPERM: the file rule's EPERM -> VIOLATION would
+    # turn every Node server into a violator.
+    other_thread = IO_URING_BLOCKED.replace("8 ", "11 ", 1)
+    result = run([LAUNCH, IO_URING_BLOCKED, other_thread, EXITED])
+    assert result["verdict"] == "CLEAN"
+    assert [a["syscall"] for a in result["attempted"]] == ["io_uring_setup", "io_uring_setup"]
+    assert "invisible to strace" in result["attempted"][0]["reason"]
+
+
+def test_working_io_uring_makes_the_run_incomplete():
+    result = run([LAUNCH, IO_URING_WORKS,
+                  '8 10:00:00.4 io_uring_enter(5, 1, 1, IORING_ENTER_GETEVENTS, NULL, 8) = 1', EXITED])
+    assert result["verdict"] == "INCOMPLETE"
+    [reason] = [r for r in result["incomplete_reasons"] if "io_uring" in r]
+    assert reason.startswith("io_uring was available, file access may be missing from the trace; "
+                             "rerun on Docker 25+ or with a seccomp profile that blocks io_uring")
+    assert "2 successful io_uring call(s)" in reason and "io_uring_setup(4," in reason
+    assert result["violations"] == [] and result["attempted"] == []
+
+
 # --- policy in sandbox mode ------------------------------------------------
 
 def test_sandbox_placeholders_and_multiarch():
@@ -277,9 +323,10 @@ def test_sandbox_placeholders_and_multiarch():
     assert P("/lib/x86_64-linux-gnu") in policy.baseline_read_allow
 
 
-def test_strace_records_memfd_create():
+def test_strace_records_memfd_create_and_io_uring():
     _, args = sandbox.docker_command(SERVER)
-    assert "-e trace=file,process,network,memfd_create " in " ".join(args)
+    assert ("-e trace=file,process,network,memfd_create,"
+            "io_uring_setup,io_uring_enter,io_uring_register ") in " ".join(args)
 
 
 def test_docker_command_is_least_privilege():

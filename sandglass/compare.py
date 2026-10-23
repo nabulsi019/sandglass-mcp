@@ -30,6 +30,11 @@ Rules (one place, so they're easy to explain):
     (Node servers: the launcher then execs node in that same process; that
     one exec is part of the launch too, but only when runtime is "node")
     anything else not in exec_allow: same rules as files
+  io_uring (#75): file access through a ring is invisible to strace, so
+    failed (e.g. EPERM: seccomp blocked it) -> "attempted" (Node's libuv tries
+                                               this at every startup)
+    succeeded                               -> INCOMPLETE: the trace may be
+                                               missing file access
 
 Phases (#18): every reported event gets a phase:
   install    nothing is installed at run time yet (see #16), so always empty
@@ -44,8 +49,8 @@ Verdicts:
   INCOMPLETE  the run can't be trusted: the server didn't start, the session
               errored, nothing was exercised, the trace is missing/truncated,
               the network sink didn't start, the sandbox could reach the internet,
-              or the stdin relay didn't start or ended early (the server may have
-              tampered with it).
+              the stdin relay didn't start or ended early (the server may have
+              tampered with it), or an io_uring call succeeded.
               Never treated as clean, even when no violations were seen.
   VIOLATIONS  at least one violation.
   CLEAN       a complete run with zero violations.
@@ -61,6 +66,9 @@ from sandglass.trace_parser import Event
 
 # Errors that mean "this exists but you're not allowed": a real access attempt.
 BLOCKED_ERRORS = {"EACCES", "EPERM"}
+
+IO_URING_INCOMPLETE = ("io_uring was available, file access may be missing from the trace; "
+                       "rerun on Docker 25+ or with a seccomp profile that blocks io_uring")
 
 
 def _is_under(path: str, roots: list) -> bool:
@@ -171,6 +179,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
     phase_of, phase_note = _phase_of(events, session, relay_pid)
     domains: list[dict] = []       # every request the sink recorded
     isolation: dict | None = None  # the sink's connect-to-a-public-IP check
+    io_uring_used: list[Event] = []  # io_uring calls that succeeded (#75)
 
     for index, event in enumerate(events):
         if relay_pid is not None and event.pid == relay_pid and event.kind != "exit":
@@ -252,6 +261,14 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
             reason = "network activity while network.allow is false"
             bucket = "violation"  # attempts count, even failed ones
 
+        elif event.kind == "io_uring":
+            if event.succeeded:
+                # A working ring means file access we can't see: INCOMPLETE below.
+                io_uring_used.append(event)
+                continue
+            reason = "io_uring blocked (file access through it would be invisible to strace)"
+            bucket = "attempted"
+
         else:
             continue  # exit events are only used for the completeness check
 
@@ -279,6 +296,9 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
     relay_problem = _relay_problem(events, relay_pid) if events else None
     if relay_problem:
         incomplete.append(relay_problem)
+    if io_uring_used:
+        incomplete.append(f"{IO_URING_INCOMPLETE} ({len(io_uring_used)} successful io_uring "
+                          f"call(s), first: {io_uring_used[0].raw})")
     if incomplete:
         verdict = "INCOMPLETE"
     elif violations:
@@ -297,7 +317,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
         "phase_note": phase_note,
         "event_counts": {
             kind: sum(1 for e in events if e.kind == kind)
-            for kind in ("file", "probe", "process", "network", "exit")
+            for kind in ("file", "probe", "process", "network", "io_uring", "exit")
         },
     }
 

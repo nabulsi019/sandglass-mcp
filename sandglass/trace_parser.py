@@ -20,6 +20,7 @@ Event kinds:
   probe    stat/access/readlink: checks a path without reading its contents
   process  execve/execveat: a program was launched
   network  connect/bind/listen/accept, and sendto/sendmsg/sendmmsg WITH a destination
+  io_uring io_uring_setup/enter/register: file access strace can't see (#75)
   exit     a traced process exited ("+++ exited with 0 +++")
 """
 
@@ -52,6 +53,11 @@ EXEC_SYSCALLS = {"execve", "execveat"}
 # (#77). It's recorded as a WRITE to "memfd:<name>", which no write_allow entry
 # covers, so creating one is a violation, like writing any file outside policy.
 MEMFD_PREFIX = "memfd:"
+
+# io_uring (#75): a process hands file opens/reads to the kernel through a
+# shared ring, so they never show up as openat/read syscalls. All we can see
+# is the ring being set up and used. compare.py decides what that means.
+IO_URING_SYSCALLS = {"io_uring_setup", "io_uring_enter", "io_uring_register"}
 
 # connect/bind/listen/accept always count. sendto/sendmsg/sendmmsg only count
 # when they carry a destination address: without one they're sending on an already
@@ -89,7 +95,7 @@ UNREADABLE = "<unreadable>"
 
 @dataclass
 class Event:
-    kind: str           # file | probe | process | network | exit
+    kind: str           # file | probe | process | network | io_uring | exit
     syscall: str        # e.g. "openat"
     pid: int
     timestamp: str      # HH:MM:SS.micro, from strace -tt
@@ -165,6 +171,9 @@ def _classify(syscall: str, args: str, cwd: str) -> tuple[str, str, str | None] 
 
     if syscall == "memfd_create":
         return "file", MEMFD_PREFIX + (strings[0] if strings else ""), "write"
+
+    if syscall in IO_URING_SYSCALLS:
+        return "io_uring", syscall, None
 
     if syscall in WRITE_SYSCALLS and strings:
         # rename(old, new): the destination is the interesting path.
