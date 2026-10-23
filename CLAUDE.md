@@ -19,6 +19,16 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
     overreach_notes_server, listing_notes_server, aws_credentials_server,
     shell_command_server, undeclared_domain_server, good_notes_node_server.js,
     tamper_trace_server; and the sink requests undeclared_domain_server must make)
+  - every `EXPECTED_V04`, `EXPECTED_SCANS`, `EXPECTED_SCAN_PHASES`,
+    `EXPECTED_SCAN_STOPPED` and `EXPECTED_SCAN_ATTEMPTS` entry in
+    `scripts/check_fixtures.py` (the verdict, exact violations and INCOMPLETE
+    reasons of missing_api_key_server; the verdict and exact violations of all
+    5 scans: pypi:sandglass-test-notes, npm:sandglass-test-notes,
+    pypi:sandglass-test-peek, npm:sandglass-test-postinstall,
+    pypi:sandglass-test-tampered; the install phase of
+    npm:sandglass-test-postinstall's violation; the stop reasons of
+    pypi:sandglass-test-tampered; and the failed attempts
+    pypi:sandglass-test-peek must show)
   - the sandbox hardening flags (--network none, --read-only, non-root user,
     no --cap-add)
   - the strace permissions: `chmod 0711 /usr/bin/strace` in the Dockerfile

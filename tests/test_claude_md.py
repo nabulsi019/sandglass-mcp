@@ -24,6 +24,25 @@ def test_every_fixture_expectation_is_protected():
         assert name in PROTECTED, f"{fixture} is not in CLAUDE.md's protected items"
 
 
+def test_every_v04_expectation_is_protected():
+    # The v0.4 dicts (#119): every one named, and every entry in them.
+    dicts = ("EXPECTED_V04", "EXPECTED_SCANS", "EXPECTED_SCAN_PHASES",
+             "EXPECTED_SCAN_STOPPED", "EXPECTED_SCAN_ATTEMPTS")
+    for name in dicts:
+        assert f"`{name}`" in PROTECTED, f"{name} is not in CLAUDE.md's protected items"
+        for fixture in getattr(check_fixtures, name):
+            # "pypi:sandglass-test-notes@1.0.0" is named without its version.
+            short = fixture.removesuffix(".py").split("@")[0]
+            assert short in PROTECTED, f"{name} entry {fixture} is not in CLAUDE.md's protected items"
+
+
+def test_every_expectation_dict_is_protected():
+    # A new EXPECTED_* dict must be added to the protected list too.
+    for name in dir(check_fixtures):
+        if name.startswith("EXPECTED"):
+            assert f"`{name}`" in PROTECTED, f"{name} is not in CLAUDE.md's protected items"
+
+
 def test_trace_integrity_hardening_is_protected():
     for item in ("--network none", "--read-only", "non-root", "--cap-add",
                  "chmod 0711 /usr/bin/strace", "read-only tmpfs over `reports/`",
