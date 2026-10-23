@@ -12,6 +12,9 @@ Failed syscalls are KEPT, with succeeded=False and the error name. They matter:
 under --network none every connect() fails, and a failed attempt to open a
 credentials file still shows intent. compare.py decides what each one means.
 
+Paths strace couldn't read (printed as a bare address) are KEPT too, with
+target "<unreadable>" (#98): compare.py makes the run INCOMPLETE.
+
 Event kinds:
   file     open/openat/... with mode "read", "write", or "list" (a directory
            opened with O_DIRECTORY, i.e. listing its contents), plus
@@ -48,6 +51,9 @@ PROBE_SYSCALLS = {
 }
 
 EXEC_SYSCALLS = {"execve", "execveat"}
+
+# Path syscalls that take two paths (old, new). Both must be readable.
+TWO_PATH_SYSCALLS = {"rename", "renameat", "renameat2", "link", "linkat", "symlink", "symlinkat"}
 
 # memfd_create(name, flags) makes an anonymous file that lives only in memory
 # (#77). It's recorded as a WRITE to "memfd:<name>", which no write_allow entry
@@ -89,8 +95,10 @@ STRING_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
 # One escape inside a strace string: \xNN (hex), \NNN (octal), or one character (\n, \", ...).
 ESCAPE_RE = re.compile(r"\\(x[0-9a-fA-F]{2}|[0-7]{1,3}|.)", re.DOTALL)
 SIMPLE_ESCAPES = {"n": b"\n", "t": b"\t", "r": b"\r", "v": b"\v", "f": b"\f"}
-# Target for an exec whose arguments strace couldn't read.
+# Target for an exec, open, write or stat whose path strace couldn't read.
 UNREADABLE = "<unreadable>"
+# A bare address as one argument (how strace shows memory it couldn't read).
+ADDRESS_RE = re.compile(r"(?:^|, )0x[0-9a-f]+(?=,|$)")
 
 
 @dataclass
@@ -154,19 +162,32 @@ def _network_target(args: str) -> str | None:
     return match.group(0) if match else None
 
 
+def _path_unreadable(syscall: str, args: str, strings: list[str]) -> bool:
+    """Did strace fail to read a path argument (#98)?
+
+    strace prints a path it can't read from the process's memory as a bare
+    address (openat(AT_FDCWD, 0xffff83995370, ...)). So: fewer readable
+    paths than the call takes, and an address in the arguments. (A NULL path
+    is printed as NULL: nothing is hidden, the call just fails.) Such an event
+    must never be dropped; compare.py makes the run INCOMPLETE.
+    """
+    needed = 2 if syscall in TWO_PATH_SYSCALLS else 1
+    return len(strings) < needed and ADDRESS_RE.search(args) is not None
+
+
 def _classify(syscall: str, args: str, cwd: str) -> tuple[str, str, str | None] | None:
     """Return (kind, target, mode) for a syscall we care about, else None."""
     strings = [_unescape(s) for s in STRING_RE.findall(args)]
 
     if syscall in OPEN_SYSCALLS:
-        if not strings:
-            return None
         if syscall == "creat" or any(flag in args for flag in WRITE_FLAGS):
             mode = "write"
         elif "O_DIRECTORY" in args:
             mode = "list"  # opening a directory to read its entries (os.listdir)
         else:
             mode = "read"
+        if not strings:
+            return ("file", UNREADABLE, mode) if _path_unreadable(syscall, args, strings) else None
         return "file", _absolute(strings[0], args, cwd), mode
 
     if syscall == "memfd_create":
@@ -175,14 +196,20 @@ def _classify(syscall: str, args: str, cwd: str) -> tuple[str, str, str | None] 
     if syscall in IO_URING_SYSCALLS:
         return "io_uring", syscall, None
 
-    if syscall in WRITE_SYSCALLS and strings:
-        # rename(old, new): the destination is the interesting path.
-        return "file", _absolute(strings[-1], args, cwd), "write"
+    if syscall in WRITE_SYSCALLS:
+        if _path_unreadable(syscall, args, strings):
+            return "file", UNREADABLE, "write"
+        if strings:
+            # rename(old, new): the destination is the interesting path.
+            return "file", _absolute(strings[-1], args, cwd), "write"
 
-    if syscall in PROBE_SYSCALLS and strings and strings[0]:
-        # An empty path (e.g. newfstatat(3, "", AT_EMPTY_PATH)) inspects an
-        # already-open fd, not a new path, so it's skipped.
-        return "probe", _absolute(strings[0], args, cwd), None
+    if syscall in PROBE_SYSCALLS:
+        if _path_unreadable(syscall, args, strings):
+            return "probe", UNREADABLE, None
+        if strings and strings[0]:
+            # An empty path (e.g. newfstatat(3, "", AT_EMPTY_PATH)) inspects an
+            # already-open fd, not a new path, so it's skipped.
+            return "probe", _absolute(strings[0], args, cwd), None
 
     if syscall in EXEC_SYSCALLS:
         if not strings:
