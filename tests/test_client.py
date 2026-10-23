@@ -24,6 +24,18 @@ def test_host_mode_says_not_enforced(capsys):
     assert first_line(capsys) == "Policy: notes_readonly (not enforced (host mode))"
 
 
+def test_client_builds_inputs_from_the_schema():
+    # #22: an enum and a nested object, which the old "hello"-for-everything
+    # inputs got wrong.
+    from mcp.types import Tool
+
+    from sandglass.client import build_safe_arguments
+    tool = Tool(name="t", input_schema={"type": "object", "required": ["mode", "opts"], "properties": {
+        "mode": {"type": "string", "enum": ["fast", "slow"]},
+        "opts": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 10}}}}})
+    assert build_safe_arguments(tool) == {"mode": "fast", "opts": {"limit": 10}}
+
+
 def test_old_label_is_gone():
     for path in (PROJECT_ROOT / "sandglass").rglob("*.py"):
         assert "NOT enforced yet" not in path.read_text(), path

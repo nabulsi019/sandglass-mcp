@@ -356,8 +356,13 @@ below are from each project's own paper or documentation.
   or runtime needs its own baseline. The Dockerfile pins the Debian release
   (13, "trixie": strace 6.13, Node.js 20), so a rebuild can't silently switch
   release; moving to a new one means re-checking the baselines and the trace parser.
-- **Only one call per tool, with `"hello"` as input.** Behaviour behind other
-  inputs isn't exercised yet.
+- **Only one call per tool, with one example input.** The input is built
+  from the tool's JSON schema (`sandglass/inputs.py`, #22): the schema's own
+  `const`/`enum`/`default`/`examples` first, otherwise a simple value per type
+  (`"hello"` for strings, `1` for numbers, inside any min/max), nested objects
+  and arrays filled in, local `$ref`s followed. A tool whose schema we can't
+  satisfy (e.g. a string `pattern`) is skipped, not guessed. Behaviour behind
+  other inputs isn't exercised.
 
 ## Safety rules
 
