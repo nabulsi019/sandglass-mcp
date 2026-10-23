@@ -101,6 +101,7 @@ Expected verdicts:
 | good_notes_node_server.js | CLEAN | 0 (with the `node_debian` baseline) |
 | tamper_trace_server | VIOLATIONS | 3: list `/proc/1/fd`, read and write `/proc/1/fd/2` (all blocked with EACCES) |
 | missing_api_key_server | INCOMPLETE | 0; reason: exited during startup, `RuntimeError: NOTES_API_KEY is not set` |
+| aws_credentials_server under `policies/templates/no_network.v1.yaml` | VIOLATIONS | 1: read of `/home/sandglass/.aws/credentials` (`read_deny: /home`, #121) |
 
 Every run must also show the sink reporting the isolation check as isolated (no route to the internet).
 
