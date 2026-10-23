@@ -54,6 +54,12 @@ EXPECTED = {
 }
 
 
+def in_order(violations) -> list:
+    """(mode, target) pairs in a fixed order. An exec's mode is None, which
+    Python can't compare with a string mode, so it sorts as "" (#101)."""
+    return sorted(violations, key=lambda v: (v[0] or "", v[1]))
+
+
 def main() -> int:
     failures = []
     for fixture, (want_verdict, want_violations) in EXPECTED.items():
@@ -61,10 +67,10 @@ def main() -> int:
         report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, POLICY)
         got = [(v["mode"], v["target"]) for v in report["violations"]]
         # Compare as a list too, so a duplicate violation (same read twice) fails.
-        ok = report["verdict"] == want_verdict and sorted(got) == sorted(want_violations)
+        ok = report["verdict"] == want_verdict and in_order(got) == in_order(want_violations)
         if not ok:
-            failures.append(f"{fixture}: expected {want_verdict} {sorted(want_violations)}, "
-                            f"got {report['verdict']} {sorted(got)}")
+            failures.append(f"{fixture}: expected {want_verdict} {in_order(want_violations)}, "
+                            f"got {report['verdict']} {in_order(got)}")
 
         # Every fixture misbehaves only inside read_note, so every violation
         # must be in the tool-call phase (#18), e.g. overreach's decoy read.
