@@ -129,6 +129,13 @@ versions are refused with a usage error, so a report always names exactly
 what was scanned. Exit code: `0` CLEAN, `1` VIOLATIONS, `2` INCOMPLETE or a
 usage error.
 
+The policy's `read_allow`, `write_allow` and `read_deny` paths must be
+absolute (or placeholders like `{venv}`) for a scan (#123): a relative path
+means "inside the project", and a scan doesn't mount the project. A relative
+path stops the scan before anything is downloaded, with exit code `2` and
+`policy path '<path>' is relative; scans have no project folder, use an
+absolute path`. Normal runs still accept relative paths.
+
 What happens (`sandglass/scan.py`):
 
 1. **Download, on your machine**, into a temporary folder. No package code
