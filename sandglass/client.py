@@ -16,7 +16,7 @@ Usage:
 the sandbox and runs it the same way (see sandglass/scan.py).
 
 With --sandbox (and for scan) the exit code is the verdict: 0 CLEAN,
-1 VIOLATIONS, 2 INCOMPLETE.
+1 VIOLATIONS, 3 INCOMPLETE. 2 is a usage error (argparse's own code).
 """
 
 import argparse
@@ -47,8 +47,10 @@ SESSION_TIMEOUT_SECONDS = 120
 # FAILED and the next tool is still called (#23).
 CALL_TIMEOUT_SECONDS = 30
 
-# --sandbox exit codes, so scripts and CI can check the verdict.
-EXIT_CODES = {"CLEAN": 0, "VIOLATIONS": 1, "INCOMPLETE": 2}
+# --sandbox exit codes, so scripts and CI can check the verdict. INCOMPLETE
+# is 3, not 2: argparse exits with 2 on a usage error, and a script must be
+# able to tell "you called it wrong" from "the run can't be trusted" (#124).
+EXIT_CODES = {"CLEAN": 0, "VIOLATIONS": 1, "INCOMPLETE": 3}
 
 
 def build_safe_arguments(tool: Tool) -> dict:
@@ -375,7 +377,7 @@ def scan_main(argv: list[str]) -> None:
         prog="sandglass scan",
         description="Download a package on the host, install it in the sandbox (offline), "
                     "run its MCP server under strace and compare with a policy. "
-                    "Exit code: 0 CLEAN, 1 VIOLATIONS, 2 INCOMPLETE (or a usage error).")
+                    "Exit code: 0 CLEAN, 1 VIOLATIONS, 2 usage error, 3 INCOMPLETE.")
     parser.add_argument("package", help="<pypi|npm>:<package>@<exact-version>, "
                                         "e.g. pypi:mcp-server-fetch@2025.4.7")
     parser.add_argument("--policy", type=Path, required=True, help="policy YAML to compare against")
@@ -416,7 +418,9 @@ def main() -> None:
         scan_main(sys.argv[2:])  # sandglass scan <pypi|npm>:<package>@<version> ...
         return
     parser = argparse.ArgumentParser(description="Exercise an MCP server's tools over stdio. "
-                                                 "(To scan a published package: sandglass scan -h)")
+                                                 "(To scan a published package: sandglass scan -h) "
+                                                 "With --sandbox, exit code: 0 CLEAN, 1 VIOLATIONS, "
+                                                 "2 usage error, 3 INCOMPLETE.")
     parser.add_argument("server", type=Path, help="path to the server (.py, or .js for Node.js)")
     parser.add_argument("--policy", type=Path, help="policy YAML to load (required with --sandbox)")
     parser.add_argument("--sandbox", action="store_true",

@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 from sandglass import PROJECT_ROOT
-from sandglass.client import run_sandboxed, run_scan
+from sandglass.client import EXIT_CODES, run_sandboxed, run_scan
 from sandglass.scan import parse_spec
 
 POLICY = PROJECT_ROOT / "policies" / "notes_readonly.yaml"
@@ -121,6 +121,11 @@ EXPECTED_SCAN_ATTEMPTS = {
 }
 
 
+# The exit code of `sandglass ... --sandbox` and `sandglass scan` per verdict
+# (#124). 2 is not a verdict: it's argparse's usage error.
+EXPECTED_EXIT_CODES = {"CLEAN": 0, "VIOLATIONS": 1, "INCOMPLETE": 3}
+
+
 def build_test_packages() -> None:
     """Build test_packages/dist/ (scripts/build_test_packages.py) before the scans."""
     path = Path(__file__).with_name("build_test_packages.py")
@@ -140,6 +145,7 @@ def check(fixture: str, report: dict, want_verdict: str, want_violations: set,
           want_phase: str = "tool-call", server_ran: bool = True) -> list[str]:
     """Every check that applies to every fixture; returns the failures."""
     failures = []
+    print(f"{fixture}: {report['verdict']}, exit code {EXIT_CODES.get(report['verdict'])}")
     got = [(v["mode"], v["target"]) for v in report["violations"]]
     # Compare as a list too, so a duplicate violation (same read twice) fails.
     ok = report["verdict"] == want_verdict and in_order(got) == in_order(want_violations)
@@ -173,6 +179,9 @@ def check(fixture: str, report: dict, want_verdict: str, want_violations: set,
 
 def main() -> int:
     failures = []
+    # The exit code each verdict gives (#124); 2 stays argparse's usage error.
+    if EXIT_CODES != EXPECTED_EXIT_CODES:
+        failures.append(f"exit codes: expected {EXPECTED_EXIT_CODES}, got {EXIT_CODES}")
     for fixture, (want_verdict, want_violations) in EXPECTED.items():
         print(f"\n===== {fixture} =====")
         report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, POLICY)

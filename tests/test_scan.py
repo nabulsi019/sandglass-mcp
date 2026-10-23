@@ -85,12 +85,48 @@ def test_usage_errors_exit_2_before_anything_runs(argv, monkeypatch, capsys):
     assert "usage: sandglass scan" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("verdict, code", [("CLEAN", 0), ("VIOLATIONS", 1), ("INCOMPLETE", 2)])
+@pytest.mark.parametrize("verdict, code", [("CLEAN", 0), ("VIOLATIONS", 1), ("INCOMPLETE", 3)])
 def test_exit_code_is_the_verdict(verdict, code, monkeypatch):
+    # INCOMPLETE is 3, so it can't be mistaken for a usage error (2, #124).
     monkeypatch.setattr(client, "run_scan", lambda *a: {"verdict": verdict})
     with pytest.raises(SystemExit) as exit_info:
         client.scan_main(["pypi:pkg@1.0.0", "--policy", str(POLICY)])
     assert exit_info.value.code == code
+
+
+@pytest.mark.parametrize("verdict, code", [("CLEAN", 0), ("VIOLATIONS", 1), ("INCOMPLETE", 3)])
+def test_a_normal_sandbox_run_exits_with_the_same_codes(verdict, code, monkeypatch):
+    monkeypatch.setattr(client, "run_sandboxed", lambda *a: {"verdict": verdict})
+    monkeypatch.setattr("sys.argv", ["sandglass", "test_servers/good_notes_server.py",
+                                     "--policy", "policies/notes_readonly.yaml", "--sandbox"])
+    monkeypatch.chdir(PROJECT_ROOT)
+    with pytest.raises(SystemExit) as exit_info:
+        client.main()
+    assert exit_info.value.code == code
+
+
+def test_no_sandbox_is_incomplete_3_in_both_commands(monkeypatch):
+    def no_docker(*a):
+        raise sandbox.SandboxError("docker is not running")
+    monkeypatch.setattr(client, "run_scan", no_docker)
+    monkeypatch.setattr(client, "run_sandboxed", no_docker)
+    with pytest.raises(SystemExit) as scan_exit:
+        client.scan_main(["pypi:pkg@1.0.0", "--policy", str(POLICY)])
+    monkeypatch.setattr("sys.argv", ["sandglass", str(PROJECT_ROOT / "test_servers" / "good_notes_server.py"),
+                                     "--policy", str(POLICY), "--sandbox"])
+    with pytest.raises(SystemExit) as run_exit:
+        client.main()
+    assert scan_exit.value.code == run_exit.value.code == 3
+
+
+def test_a_normal_run_usage_error_is_2(monkeypatch, capsys):
+    # --sandbox without --policy: argparse's usage error, never a verdict.
+    monkeypatch.setattr(client, "run_sandboxed", lambda *a: pytest.fail("must not run"))
+    monkeypatch.setattr("sys.argv", ["sandglass", str(PROJECT_ROOT / "test_servers" / "good_notes_server.py"),
+                                     "--sandbox"])
+    with pytest.raises(SystemExit) as exit_info:
+        client.main()
+    assert exit_info.value.code == 2 and "usage:" in capsys.readouterr().err
 
 
 def relative_policy(tmp_path, key, entry="data"):
