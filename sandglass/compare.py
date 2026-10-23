@@ -669,6 +669,12 @@ def coverage(session: dict) -> dict:
 # Report writing
 # ---------------------------------------------------------------------------
 
+# Known limitation (#82), stated in every report: Sandglass doesn't hide
+# strace, and doesn't try to.
+TRACING_NOTE = ("the server could detect it was traced (strace shows in /proc/self/status, "
+                "TracerPid); a CLEAN verdict only covers what it did while traced (#82).")
+
+
 def not_run(reason: str | None) -> dict:
     """compare()'s result for a scan whose server never ran (#19): the
     download or the install failed. INCOMPLETE, with nothing observed.
@@ -709,6 +715,7 @@ def build_report(server: str, timestamp: str, policy: Policy, session: dict,
         "domains": result["domains"],
         "network_isolation": result["network_isolation"],
         "phase_note": result["phase_note"],
+        "tracing_note": TRACING_NOTE,  # a known limitation, in every report (#82)
         "event_counts": result["event_counts"],
     }
 
@@ -738,6 +745,7 @@ def _markdown(r: dict) -> str:
         f"- Trace: `{r['trace_file']}`" if r["trace_file"] else "- Trace: none (the server was not run)",
         f"- Violations: {len(r['violations'])} · Attempted: {len(r['attempted'])}"
         f" · Probes: {len(r['probes'])}",
+        f"- Note: {r.get('tracing_note', TRACING_NOTE)}",
     ]
     if r["incomplete_reasons"]:
         out += ["", "## Why INCOMPLETE", ""]

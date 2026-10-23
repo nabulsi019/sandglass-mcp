@@ -478,6 +478,17 @@ below are from each project's own paper or documentation.
 
 ## Known limitations
 
+- **A server can tell it's being traced** (#82). Under strace, a process's
+  `/proc/self/status` shows a non-zero `TracerPid`, so a server (or an install
+  script) can notice it's being watched and behave well only then. Sandglass
+  doesn't hide strace and doesn't try to: hiding it reliably would take tricks
+  a determined package could still detect. So a **CLEAN verdict means
+  "nothing outside the policy was seen while traced"**, not "this package
+  never does anything else". Every report says so in one line (`tracing_note`
+  in the JSON). A read of `/proc/self/status` isn't flagged by itself: many
+  runtimes read it for ordinary reasons, and the policy decides, like for any
+  other file.
+
 - **The server's own stderr is discarded in `--sandbox` mode, to protect the
   trace** (#47). strace writes the trace to the container's stderr, so the
   launcher points the server's stderr at `/dev/null` before any server code
