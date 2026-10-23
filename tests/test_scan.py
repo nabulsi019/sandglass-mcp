@@ -224,6 +224,19 @@ def test_run_container_mounts_the_package_read_only():
     assert args[-3] == "/package/site/bin/x"
 
 
+def test_scan_mounts_only_the_package_never_the_project():
+    # #20: the package volume, read-only, is the ONLY mount; no /project.
+    _, args = sandbox.scan_run_command("vol1", "/package/site/bin/x", "python")
+    volumes = [args[i + 1] for i, a in enumerate(args) if a == "-v"]
+    mounts = [args[i + 1] for i, a in enumerate(args) if a == "--mount"]
+    assert volumes == ["vol1:/package:ro"] and mounts == []
+    assert str(PROJECT_ROOT) not in " ".join(args[:args.index(sandbox.IMAGE)])
+    assert args[args.index("-w") + 1] == "/package"
+    # Fixture runs are unchanged: the project, read-only, with reports/ hidden.
+    _, fixture_args = sandbox.docker_command(PROJECT_ROOT / "test_servers" / "good_notes_server.py")
+    assert f"{PROJECT_ROOT}:/project:ro" in fixture_args
+
+
 def test_npm_runs_with_node_and_no_site_dir():
     _, args = sandbox.scan_run_command("vol1", "/package/node_modules/x/cli", "node")
     assert env_of(args) == ["HOME=/home/sandglass", "SANDGLASS_RUNTIME=node"]

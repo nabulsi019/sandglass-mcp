@@ -186,10 +186,12 @@ def run_sandboxed(server_script: Path, policy_path: Path) -> dict:
 
 def _trace_and_report(server: str, timestamp: str, command: str, args: list[str], policy: Policy,
                       runtime: str, multiarch: str, path_mapping: dict,
-                      package: dict | None = None) -> dict:
+                      package: dict | None = None,
+                      cwd: str = str(sandbox.CONTAINER_PROJECT)) -> dict:
     """Run the docker command under strace, compare, write and return the report.
 
-    Shared by fixture mode (run_sandboxed) and scan mode (run_scan).
+    Shared by fixture mode (run_sandboxed) and scan mode (run_scan). `cwd` is
+    the container's working directory, for the trace's relative paths.
     """
     trace_dir = REPORTS_DIR / "trace" / f"{server}_{timestamp}"
     trace_dir.mkdir(parents=True)
@@ -213,7 +215,7 @@ def _trace_and_report(server: str, timestamp: str, command: str, args: list[str]
             print(f"Session failed: {session['error']}")
 
     # Line by line, up to MAX_TRACE_BYTES: a huge trace can't use up memory (#83).
-    events, cut_short = parse_trace_file(trace_file, cwd=str(sandbox.CONTAINER_PROJECT))
+    events, cut_short = parse_trace_file(trace_file, cwd=cwd)
     result = compare(events, policy, session, runtime=runtime, trace_cut_short=cut_short)
 
     path_mapping = {**path_mapping,
@@ -305,13 +307,13 @@ def run_scan(spec: scan.PackageSpec, policy_path: Path, registry_dir: Path | Non
                 command, args = sandbox.scan_run_command(volume, server_path, runtime)
                 path_mapping = {
                     str(sandbox.CONTAINER_PACKAGE): "the installed package (a Docker volume, read-only)",
-                    str(sandbox.CONTAINER_PROJECT): f"{PROJECT_ROOT} (read-only)",
-                    str(sandbox.CONTAINER_REPORTS): "hidden (empty read-only tmpfs)",
+                    str(sandbox.CONTAINER_PROJECT): "not mounted: the project is never visible to a scan (#20)",
                     str(sandbox.CONTAINER_VENV): "Sandglass's dependencies, baked into the image",
                     str(sandbox.CONTAINER_PYTHON_BASE): "Python from python:3.12-slim",
                 }
                 return _trace_and_report(spec.slug, timestamp, command, args, policy, runtime,
-                                         multiarch, path_mapping, package)
+                                         multiarch, path_mapping, package,
+                                         cwd=str(sandbox.CONTAINER_PACKAGE))
             finally:
                 sandbox.remove_volume(volume)
         except scan.ScanError as exc:
