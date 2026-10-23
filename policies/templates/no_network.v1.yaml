@@ -1,0 +1,37 @@
+# Sandglass policy template: no_network, version 1.
+#
+# The server may not use the network at all: no connections and no domains
+# through the local sink. Files: it may READ anywhere (including the decoy
+# home folder with its fake credentials) and WRITE only under /tmp. No other
+# programs. A good start for servers that work offline (formatters,
+# calculators, local file tools) where the question is "does it phone home?".
+#
+# Reads aren't restricted: if you care which files it reads, start from
+# read_only_folder.v1.yaml instead.
+#
+# To use it: copy this file and give the copy its own name. Don't edit this
+# file in place: a changed template becomes a new file (no_network.v2.yaml),
+# so old reports stay reproducible.
+
+name: no_network_v1
+description: No network at all; reads anywhere, writes only /tmp, no other programs.
+
+filesystem:
+  read_allow:
+    - /                # anywhere
+  write_allow:
+    - /tmp             # the sandbox's scratch space (an in-memory tmpfs)
+
+network:
+  allow: false         # no connections; attempts count even when they fail
+  allow_domains: []    # and no domains through the local sink
+
+process:
+  exec_allow: []       # no programs besides the server itself
+
+# What the interpreter needs just to start (reads only, never writes).
+runtime_allow:
+  - "{python_base}"
+  - "{venv}"
+  - "{server_script}"
+  - "={server_dir}"

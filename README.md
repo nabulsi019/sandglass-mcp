@@ -32,6 +32,7 @@ sandglass/
     node_debian.yaml      Extra startup reads of Debian's Node.js, for .js servers (reads only)
 policies/
   notes_readonly.yaml
+  templates/         Standard, versioned policy templates to copy (see "Policy templates")
 scripts/
   check_fixtures.py  Runs all fixtures in the sandbox and checks the expected verdicts
 test_servers/        Fixture servers written for testing Sandglass. Not real targets.
@@ -241,6 +242,32 @@ report names it.
 **Reads only.** `runtime_allow` and the baseline allow reads and listings,
 **never writes**. Only `write_allow` permits writes, so a server rewriting a
 library in `/opt/venv` or `/lib` is a violation.
+
+## Policy templates
+
+Instead of writing a policy from scratch, copy one of the standard templates
+in `policies/templates/` (#112) and edit the lines marked `EDIT`:
+
+| Template | Files | Network | Programs |
+|---|---|---|---|
+| `policies/templates/read_only_folder.v1.yaml` | read only inside one folder (`/data`, EDIT); no writes | none | none |
+| `policies/templates/no_network.v1.yaml` | read anywhere; write only `/tmp` | none, not even through the sink | none |
+| `policies/templates/listed_domains_only.v1.yaml` | read anywhere; write only `/tmp` | only the listed domains (`api.example.com`, EDIT), through the local sink | none |
+
+All three have the same `runtime_allow` as `notes_readonly.yaml`, so they work
+for `.py` and `.js` servers without other changes. "Read anywhere" includes
+the decoy home with its fake credentials: if it matters which files a server
+reads, start from `read_only_folder`.
+
+**Versions.** The version is in the file name and in `name` (`no_network_v1`),
+so every report says exactly which template it was judged against. A
+template is never edited in place: a change becomes a new file
+(`no_network.v2.yaml`) and the old one stays, so old reports stay
+reproducible. Give your edited copy its own name.
+
+```bash
+cp policies/templates/read_only_folder.v1.yaml policies/my_notes_server.yaml   # then edit it
+```
 
 ## How behaviour is judged
 
