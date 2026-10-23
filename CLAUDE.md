@@ -17,7 +17,8 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
   verdicts (good=0, overreach=1, listing=2), the sandbox hardening flags
   (--network none, --read-only, non-root user, no --cap-add), the CI workflows'
   required checks, or the ruleset. After every merge, pull main and rerun pytest
-  and check_fixtures.py; if main is red, revert that PR and stop. Never
+  and check_fixtures.py. If main is red, revert the PR that caused it; if the
+  failure already existed before that PR, stop and report instead. Never
   force-push. If a task requires changing any protected item, stop and report.
 - **Before opening a PR**: tests pass locally, and the fixtures give the expected
   verdicts (see Commands below). Put the real results in the PR's "How I tested it".
