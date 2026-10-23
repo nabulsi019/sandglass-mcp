@@ -1,0 +1,37 @@
+# Sandglass policy template: listed_domains_only, version 1.
+#
+# The server may contact ONLY the domains listed below. In the sandbox nothing
+# ever leaves: requests go to Sandglass's local network sink, which records
+# the domain and answers locally, and any domain not on the list is a
+# violation. Direct connections that bypass the sink are violations too.
+# Files: read anywhere, write only under /tmp. No other programs. A good
+# start for servers that wrap one online API.
+#
+# To use it: copy this file, replace the domain marked EDIT, and give the
+# copy its own name. Don't edit this file in place: a changed template
+# becomes a new file (listed_domains_only.v2.yaml), so old reports stay
+# reproducible.
+
+name: listed_domains_only_v1
+description: Only the listed domains (through the local sink); reads anywhere, writes only /tmp, no other programs.
+
+filesystem:
+  read_allow:
+    - /                # anywhere
+  write_allow:
+    - /tmp             # the sandbox's scratch space (an in-memory tmpfs)
+
+network:
+  allow: false         # no direct connections; only the sink, which records domains
+  allow_domains:
+    - api.example.com  # EDIT: the domains the server may contact ("*.example.com" = subdomains)
+
+process:
+  exec_allow: []       # no programs besides the server itself
+
+# What the interpreter needs just to start (reads only, never writes).
+runtime_allow:
+  - "{python_base}"
+  - "{venv}"
+  - "{server_script}"
+  - "={server_dir}"

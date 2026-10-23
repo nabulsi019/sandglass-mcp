@@ -1,0 +1,35 @@
+# Sandglass policy template: read_only_folder, version 1.
+#
+# The server may READ files inside ONE folder and nothing else: no writes,
+# no network, no other programs. A good start for "notes", "docs" or "files"
+# servers that should only look at the folder you point them at.
+#
+# To use it: copy this file, change the folder marked EDIT, and give the copy
+# its own name. Don't edit this file in place: a changed template becomes a
+# new file (read_only_folder.v2.yaml), so old reports stay reproducible.
+#
+# Paths: relative ones are resolved against the project root (/project in
+# the sandbox); absolute ones are used as-is. Placeholders are explained in
+# policies/notes_readonly.yaml and the README.
+
+name: read_only_folder_v1
+description: Reads only inside one folder; no writes, no network, no other programs.
+
+filesystem:
+  read_allow:
+    - /data            # EDIT: the one folder the server may read
+  write_allow: []      # no writes anywhere
+
+network:
+  allow: false         # no connections; attempts count even when they fail
+  allow_domains: []    # and no domains through the local sink
+
+process:
+  exec_allow: []       # no programs besides the server itself
+
+# What the interpreter needs just to start (reads only, never writes).
+runtime_allow:
+  - "{python_base}"
+  - "{venv}"
+  - "{server_script}"
+  - "={server_dir}"    # exact: only the listing of the server's own folder
