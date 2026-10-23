@@ -28,7 +28,7 @@ from sandglass import PROJECT_ROOT, sandbox
 from sandglass.compare import build_report, compare, write_reports
 from sandglass.inputs import InputError, build_arguments
 from sandglass.policy import BASELINE_FILES, Policy, load_policy
-from sandglass.trace_parser import parse_trace
+from sandglass.trace_parser import parse_trace_file
 
 REPORTS_DIR = PROJECT_ROOT / "reports"
 
@@ -188,9 +188,9 @@ def run_sandboxed(server_script: Path, policy_path: Path) -> dict:
             session["error"] = describe_error(exc)
             print(f"Session failed: {session['error']}")
 
-    trace_text = trace_file.read_text(encoding="utf-8", errors="replace") if trace_file.exists() else ""
-    events = parse_trace(trace_text, cwd=str(sandbox.CONTAINER_PROJECT))
-    result = compare(events, policy, session, runtime=runtime)
+    # Line by line, up to MAX_TRACE_BYTES: a huge trace can't use up memory (#83).
+    events, cut_short = parse_trace_file(trace_file, cwd=str(sandbox.CONTAINER_PROJECT))
+    result = compare(events, policy, session, runtime=runtime, trace_cut_short=cut_short)
 
     path_mapping = {
         str(sandbox.CONTAINER_PROJECT): f"{PROJECT_ROOT} (read-only)",
