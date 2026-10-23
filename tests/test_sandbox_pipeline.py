@@ -323,6 +323,14 @@ def test_sandbox_placeholders_and_multiarch():
     assert P("/lib/x86_64-linux-gnu") in policy.baseline_read_allow
 
 
+def test_base_image_is_pinned_to_a_debian_release():
+    # "python:3.12-slim" alone follows whatever Debian release is newest, which
+    # can change strace's output format and the files the baselines list (#81).
+    from_lines = [line for line in (PROJECT_ROOT / "Dockerfile").read_text().splitlines()
+                  if line.startswith("FROM ")]
+    assert from_lines == ["FROM python:3.12-slim-trixie"]
+
+
 def test_strace_records_memfd_create_and_io_uring():
     _, args = sandbox.docker_command(SERVER)
     assert ("-e trace=file,process,network,memfd_create,"
