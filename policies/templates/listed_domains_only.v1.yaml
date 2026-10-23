@@ -4,7 +4,8 @@
 # ever leaves: requests go to Sandglass's local network sink, which records
 # the domain and answers locally, and any domain not on the list is a
 # violation. Direct connections that bypass the sink are violations too.
-# Files: read anywhere, write only under /tmp. No other programs. A good
+# Files: read anywhere except home folders (/home, /root: read_deny, #121),
+# write only under /tmp. No other programs. A good
 # start for servers that wrap one online API.
 #
 # To use it: copy this file, replace the domain marked EDIT, and give the
@@ -13,11 +14,14 @@
 # reproducible.
 
 name: listed_domains_only_v1
-description: Only the listed domains (through the local sink); reads anywhere, writes only /tmp, no other programs.
+description: Only the listed domains (through the local sink); reads anywhere but /home and /root, writes only /tmp, no other programs.
 
 filesystem:
   read_allow:
-    - /                # anywhere
+    - /                # anywhere...
+  read_deny:           # ...except home folders (credentials live there). Deny wins.
+    - /home
+    - /root
   write_allow:
     - /tmp             # the sandbox's scratch space (an in-memory tmpfs)
 

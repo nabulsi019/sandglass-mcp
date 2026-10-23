@@ -6,6 +6,8 @@ Rules (one place, so they're easy to explain):
     read  -> read_allow, runtime_allow, baseline
     list  -> the same as read, plus exact "=" entries (that directory only)
     write -> write_allow ONLY. runtime_allow and the baseline never allow writes.
+    read_deny (#121) wins over all of them: a read or listing under it is
+    never allowed (and a probe under it is always listed).
 
   Files (open/rename/unlink/...) that are not allowed:
     succeeded                 -> VIOLATION
@@ -99,6 +101,14 @@ def _is_under(path: str, roots: list) -> bool:
         if path == root or path.startswith(root.rstrip("/") + "/"):
             return True
     return False
+
+
+def _file_reason(mode: str, path: str, read_deny: list, prefix: str = "") -> str:
+    """Why a file event is a violation. read_deny wins over every allow-list
+    (#121), so say so when that's the reason."""
+    if mode != "write" and _is_under(path, read_deny):
+        return f"{prefix}{mode} matches read_deny"
+    return f"{prefix}{mode} outside allowed paths"
 
 
 def _is_address(target: str, host: str, port: int) -> bool:
@@ -337,16 +347,17 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
                 allowed = _is_under(event.target, write_ok)
             elif event.mode == "list":
                 # Exact entries match only the directory itself, never its children.
-                allowed = _is_under(event.target, read_ok) or event.target in map(str, policy.list_exact)
+                allowed = ((_is_under(event.target, read_ok) or event.target in map(str, policy.list_exact))
+                           and not _is_under(event.target, policy.read_deny))
             else:
-                allowed = _is_under(event.target, read_ok)
+                allowed = _is_under(event.target, read_ok) and not _is_under(event.target, policy.read_deny)
             if allowed:
                 continue
-            reason = f"{event.mode} outside allowed paths"
+            reason = _file_reason(event.mode, event.target, policy.read_deny)
             bucket = _bucket_for_failure_or_success(event)
 
         elif event.kind == "probe":
-            if _is_under(event.target, read_ok):
+            if _is_under(event.target, read_ok) and not _is_under(event.target, policy.read_deny):
                 continue
             # One entry per path, counting calls per syscall, e.g.
             # /project/test_servers -> {"newfstatat": 150, "readlinkat": 7}
@@ -538,6 +549,10 @@ def compare_install(events: list[Event], policy: Policy, baseline: InstallBaseli
     unreadable, io_uring_used, programs = [], [], []
     launch: Event | None = None
 
+    def readable(path: str) -> bool:
+        """Allowed to read: under read_ok and not in read_deny (deny wins, #121)."""
+        return _is_under(path, read_ok) and not _is_under(path, policy.read_deny)
+
     def record(event: Event, reason: str, bucket: str, target: str | None = None) -> None:
         (violations if bucket == "violation" else attempted).append({
             "reason": reason, "syscall": event.syscall, "target": target or event.target,
@@ -554,16 +569,17 @@ def compare_install(events: list[Event], policy: Policy, baseline: InstallBaseli
                 if not _is_under(event.target, write_ok):
                     record(event, "install wrote outside /package and /tmp",
                            _bucket_for_failure_or_success(event))
-                if event.link_target and not _is_under(event.link_target, read_ok):
+                if event.link_target and not readable(event.link_target):
                     record(event, "install linked to a path outside allowed reads",
                            _bucket_for_failure_or_success(event), target=event.link_target)
-            elif event.mode == "list" and event.target in map(str, baseline.list_exact):
+            elif (event.mode == "list" and event.target in map(str, baseline.list_exact)
+                  and not _is_under(event.target, policy.read_deny)):
                 continue  # e.g. pip listing /etc: that folder only, nothing inside it
-            elif not _is_under(event.target, read_ok):
-                record(event, f"install {event.mode} outside allowed paths",
+            elif not readable(event.target):
+                record(event, _file_reason(event.mode, event.target, policy.read_deny, "install "),
                        _bucket_for_failure_or_success(event))
         elif event.kind == "probe":
-            if not _is_under(event.target, read_ok):
+            if not readable(event.target):
                 entry = probes.setdefault(event.target, {
                     "path": event.target, "count": 0, "syscalls": {},
                     "first_timestamp": event.timestamp, "phase": "install"})

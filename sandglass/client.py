@@ -79,6 +79,8 @@ def print_policy(policy: Policy, enforced: bool) -> None:
     print(f"Policy: {policy.name} ({status})")
     print(f"  {policy.description}")
     print(f"  read_allow:    {[str(p) for p in policy.read_allow]}")
+    if policy.read_deny:
+        print(f"  read_deny:     {[str(p) for p in policy.read_deny]}  (wins over every allow-list)")
     print(f"  write_allow:   {[str(p) for p in policy.write_allow]}")
     print(f"  network_allow: {policy.network_allow}")
     print("  runtime_allow (reads only, excluded from violations):")
