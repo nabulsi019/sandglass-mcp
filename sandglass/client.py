@@ -32,9 +32,10 @@ from mcp import ClientSession, StdioServerParameters, stdio_client
 from mcp.types import CallToolResult, TextContent, Tool
 
 from sandglass import PROJECT_ROOT, sandbox, scan
-from sandglass.compare import build_report, compare, not_run, write_reports
+from sandglass.compare import (build_report, compare, compare_install, not_run, with_install,
+                               write_reports)
 from sandglass.inputs import InputError, build_arguments
-from sandglass.policy import BASELINE_FILES, Policy, PolicyError, load_policy
+from sandglass.policy import BASELINE_FILES, Policy, PolicyError, load_install_baseline, load_policy
 from sandglass.trace_parser import parse_trace_file
 
 REPORTS_DIR = PROJECT_ROOT / "reports"
@@ -187,17 +188,17 @@ def run_sandboxed(server_script: Path, policy_path: Path) -> dict:
 def _trace_and_report(server: str, timestamp: str, command: str, args: list[str], policy: Policy,
                       runtime: str, multiarch: str, path_mapping: dict,
                       package: dict | None = None,
-                      cwd: str = str(sandbox.CONTAINER_PROJECT)) -> dict:
+                      cwd: str = str(sandbox.CONTAINER_PROJECT),
+                      install: dict | None = None) -> dict:
     """Run the docker command under strace, compare, write and return the report.
 
     Shared by fixture mode (run_sandboxed) and scan mode (run_scan). `cwd` is
     the container's working directory, for the trace's relative paths.
+    `install` (scan mode, #16) is compare_install()'s result, added in front.
     """
-    trace_dir = REPORTS_DIR / "trace" / f"{server}_{timestamp}"
-    trace_dir.mkdir(parents=True)
     # Written on the HOST from the container's stderr (strace's output). The
     # container never sees this file: reports/ is hidden inside it.
-    trace_file = trace_dir / sandbox.TRACE_FILENAME
+    trace_file = _trace_dir(server, timestamp) / sandbox.TRACE_FILENAME
     params = StdioServerParameters(command=command, args=args)
 
     # Any failure (image missing, server crash, timeout) is recorded, not
@@ -217,12 +218,21 @@ def _trace_and_report(server: str, timestamp: str, command: str, args: list[str]
     # Line by line, up to MAX_TRACE_BYTES: a huge trace can't use up memory (#83).
     events, cut_short = parse_trace_file(trace_file, cwd=cwd)
     result = compare(events, policy, session, runtime=runtime, trace_cut_short=cut_short)
+    if install is not None:
+        result = with_install(result, install)
 
     path_mapping = {**path_mapping,
                     "(container stderr)": f"strace output, saved on the host as {trace_file}"}
     report = build_report(server, timestamp, policy, session, result, trace_file,
                           path_mapping, _baseline(policy, runtime, multiarch), package)
     return _write_and_print(report)
+
+
+def _trace_dir(server: str, timestamp: str) -> Path:
+    """reports/trace/<server>_<timestamp>/, for this run's trace files."""
+    trace_dir = REPORTS_DIR / "trace" / f"{server}_{timestamp}"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    return trace_dir
 
 
 def _baseline(policy: Policy, runtime: str, multiarch: str) -> dict:
@@ -283,7 +293,7 @@ def run_scan(spec: scan.PackageSpec, policy_path: Path, registry_dir: Path | Non
         "source": (f"local test registry {registry_dir}" if registry_dir else
                    "PyPI" if spec.ecosystem == "pypi" else "the npm registry"),
         "files": [], "entry": None,
-        "install": "inside the sandbox, offline; not traced yet (#16)", "install_log": None,
+        "install": None,  # filled in once the install has run (#16)
     }
     print(f"Scanning {spec} (from {package['source']})")
 
@@ -299,11 +309,34 @@ def run_scan(spec: scan.PackageSpec, policy_path: Path, registry_dir: Path | Non
             package["entry"] = {"name": entry_name, "path": server_path}
             print(f"Entry point: {entry_name} -> {server_path}")
 
+            policy = _scan_policy(policy_path, server_path, multiarch, runtime)
+            print_policy(policy, enforced=True)
             sandbox.create_volume(volume)
             try:
-                package["install_log"] = scan.install(prepared, volume)
-                policy = _scan_policy(policy_path, server_path, multiarch, runtime)
-                print_policy(policy, enforced=True)
+                # The install, traced (#16). Judged even if it failed: a
+                # failing install may still have misbehaved first.
+                trace_dir = _trace_dir(spec.slug, timestamp)
+                install_trace = trace_dir / scan.INSTALL_TRACE_FILENAME
+                install_log = trace_dir / scan.INSTALL_LOG_FILENAME
+                print("Installing inside the sandbox (offline, traced)...")
+                exit_code = scan.install(prepared, volume, install_trace, install_log)
+                baseline = load_install_baseline(multiarch)
+                install_events, cut_short = parse_trace_file(install_trace,
+                                                             cwd=str(sandbox.CONTAINER_PACKAGE))
+                install = compare_install(install_events, policy, baseline, exit_code,
+                                          scan.log_tail(install_log), cut_short)
+                package["install"] = {
+                    "trace_file": str(install_trace), "log_file": str(install_log),
+                    "exit_code": exit_code, "baseline": baseline.name,
+                    "violations": len(install["violations"]), "event_counts": install["event_counts"],
+                }
+                print(f"Install: exit {exit_code}, {len(install['violations'])} violation(s)")
+                if exit_code != 0:  # failed or timed out: nothing to run
+                    report = build_report(spec.slug, timestamp, policy, new_session_record(),
+                                          with_install(not_run(None), install), None, {},
+                                          _baseline(policy, runtime, multiarch), package)
+                    return _write_and_print(report)
+
                 command, args = sandbox.scan_run_command(volume, server_path, runtime)
                 path_mapping = {
                     str(sandbox.CONTAINER_PACKAGE): "the installed package (a Docker volume, read-only)",
@@ -313,7 +346,7 @@ def run_scan(spec: scan.PackageSpec, policy_path: Path, registry_dir: Path | Non
                 }
                 return _trace_and_report(spec.slug, timestamp, command, args, policy, runtime,
                                          multiarch, path_mapping, package,
-                                         cwd=str(sandbox.CONTAINER_PACKAGE))
+                                         cwd=str(sandbox.CONTAINER_PACKAGE), install=install)
             finally:
                 sandbox.remove_volume(volume)
         except scan.ScanError as exc:

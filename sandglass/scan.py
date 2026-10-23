@@ -299,16 +299,20 @@ def choose_entry(prepared: Prepared, wanted: str | None) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 # Fixed scripts: the package spec only ever reaches them as "$@" arguments.
+# (Their output goes to the install log: sandbox.scan_install_command runs
+# them after `exec 2>&1`.)
 PIP_INSTALL_SCRIPT = (
     f'exec {sandbox.CONTAINER_SYSTEM_PYTHON} -m pip install --no-index'
     f' --find-links {sandbox.CONTAINER_DOWNLOAD} --target {sandbox.CONTAINER_SITE}'
-    ' --no-cache-dir --disable-pip-version-check --no-input --no-warn-script-location "$@" 2>&1'
+    ' --no-cache-dir --disable-pip-version-check --no-input --no-warn-script-location "$@"'
 )
 NPM_INSTALL_SCRIPT = (
     f'cp {sandbox.CONTAINER_DOWNLOAD}/project/package*.json {sandbox.CONTAINER_PACKAGE}/'
     f' && cp -R {sandbox.CONTAINER_DOWNLOAD}/npm-cache /tmp/npm-cache'
-    ' && exec npm install --offline --no-audit --no-fund 2>&1'
+    ' && exec npm install --offline --no-audit --no-fund'
 )
+INSTALL_TRACE_FILENAME = "install-trace.txt"  # next to the server's trace.txt
+INSTALL_LOG_FILENAME = "install-log.txt"      # pip's / npm's own output
 # npm settings for the install: cache and logs in /tmp (HOME is read-only),
 # no update check, nothing fetched.
 NPM_ENV = {
@@ -319,25 +323,41 @@ NPM_ENV = {
 }
 
 
-def install(prepared: Prepared, volume: str) -> str:
-    """Install the downloaded files into the volume, inside the sandbox.
+def install(prepared: Prepared, volume: str, trace_file: Path, log_file: Path) -> int | None:
+    """Install the downloaded files into the volume, inside the sandbox, under strace (#16).
 
-    Returns the installer's output (for the report); ScanError if it fails.
+    The trace (the container's stderr) goes to `trace_file` and the
+    installer's output to `log_file`, both straight to disk on the host.
+    Returns the install's exit code, or None if it took longer than
+    INSTALL_TIMEOUT_SECONDS (the container is then removed). Either way the
+    caller judges the trace: an install that fails may still have misbehaved.
     """
     spec = prepared.spec
+    container = f"{volume}-install"
     if spec.ecosystem == "pypi":
         command, args = sandbox.scan_install_command(volume, prepared.folder, PIP_INSTALL_SCRIPT,
-                                                     [f"{spec.name}=={spec.version}"])
+                                                     [f"{spec.name}=={spec.version}"], name=container)
     else:
         command, args = sandbox.scan_install_command(volume, prepared.folder, NPM_INSTALL_SCRIPT,
-                                                     [], env=NPM_ENV)
+                                                     [], env=NPM_ENV, name=container)
+    with open(trace_file, "wb") as trace, open(log_file, "wb") as log:
+        try:
+            out = subprocess.run([command, *args], stdin=subprocess.DEVNULL, stdout=log, stderr=trace,
+                                 timeout=INSTALL_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            sandbox.remove_container(container)  # killing `docker run` doesn't stop the container
+            return None
+        except OSError as exc:
+            raise ScanError(f"could not start the install container: {exc}") from None
+    return out.returncode
+
+
+def log_tail(log_file: Path, chars: int = INSTALL_LOG_CHARS) -> str:
+    """The end of the install log, without reading a huge log whole."""
     try:
-        out = subprocess.run([command, *args], capture_output=True, text=True,
-                             timeout=INSTALL_TIMEOUT_SECONDS)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ScanError(f"the install in the sandbox failed: {exc}") from None
-    log = (out.stdout + out.stderr).strip()
-    if out.returncode != 0:
-        raise ScanError(f"the install in the sandbox failed (exit {out.returncode}): "
-                        f"{log[-INSTALL_LOG_CHARS:]}")
-    return log[-INSTALL_LOG_CHARS:]
+        with open(log_file, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - chars * 4))  # up to 4 bytes per UTF-8 character
+            return f.read().decode("utf-8", "replace")[-chars:].strip()
+    except FileNotFoundError:
+        return ""

@@ -1,0 +1,13 @@
+{
+  "name": "sandglass-test-postinstall",
+  "version": "1.0.0",
+  "description": "Sandglass test package: a clean notes server whose postinstall script reads ~/.aws/credentials. Never published.",
+  "license": "Apache-2.0",
+  "private": true,
+  "bin": {
+    "sandglass-test-postinstall": "server.js"
+  },
+  "scripts": {
+    "postinstall": "node postinstall.js"
+  }
+}

@@ -32,6 +32,7 @@ sandglass/
   baselines/
     python312_slim.yaml   System files python:3.12-slim-trixie reads at startup (reads only)
     node_debian.yaml      Extra startup reads of Debian's Node.js, for .js servers (reads only)
+    install.yaml          What pip and npm themselves do during a scan's install phase
 policies/
   notes_readonly.yaml
   templates/         Standard, versioned policy templates to copy (see "Policy templates")
@@ -42,6 +43,7 @@ test_packages/       Packages written for testing `sandglass scan`. Never publis
   pypi/sandglass-test-notes/  Notes server as a Python wheel (console script)
   pypi/sandglass-test-peek/   Same, but also tries to read /project/guard and /project/CLAUDE.md
   npm/sandglass-test-notes/   Notes server as an npm tarball (bin)
+  npm/sandglass-test-postinstall/  Clean server whose postinstall script reads ~/.aws/credentials
 test_servers/        Fixture servers written for testing Sandglass. Not real targets.
   good_notes_server.py       read_note(name): reads only from allowed_notes/
   overreach_notes_server.py  Same tool, but also reads decoy_home/.fake_credentials
@@ -133,10 +135,31 @@ What happens (`sandglass/scan.py`):
      package with no wheel can't be scanned (INCOMPLETE, with pip's error).
    - npm: `npm install --ignore-scripts` in a scratch folder fills an npm
      cache with the package and its dependencies (needs `npm` on your machine).
-2. **Install, inside the sandbox**, in a separate container: same hardening
-   (`--network none`, read-only, non-root, no capabilities), offline from the
-   downloaded files, into a fresh Docker volume at `/package`. That volume and
-   `/tmp` are the only writable places. (Not traced yet: #16.)
+2. **Install, inside the sandbox, under strace** (#16), in a separate
+   container: same hardening (`--network none`, read-only, non-root, no
+   capabilities), offline from the downloaded files, into a fresh Docker volume
+   at `/package`. That volume and `/tmp` are the only writable places. The
+   install never gets network access. This is where npm runs a package's
+   `preinstall`/`postinstall` scripts, so misbehaviour at install time shows up
+   here. strace writes the install trace to the container's stderr (saved as
+   `install-trace.txt` next to the server's trace); the traced shell's first
+   act is `exec 2>&1`, so pip, npm and every install script write to the
+   install log (`install-log.txt`) and never hold the trace stream. strace
+   runs with `-y` here, so pip's and npm's folder-relative calls get full paths.
+
+   The install is judged against the policy plus an **install baseline**
+   (`sandglass/baselines/install.yaml`): what pip and npm themselves read (the
+   image's Python and Node.js files, `/download`, `/package`, `/tmp`, a few
+   `/etc` and `/proc` files), writes only under `/package` and `/tmp`, the
+   programs they run (`sh`, `cp`, `env`, `node`, `npm`, Python, `uname`: npm
+   runs every install script through `sh` and `node`), and netlink sockets
+   (Node.js listing network interfaces; they can't reach another host).
+   Anything else is judged like the server's behaviour: reading
+   `~/.aws/credentials`, running another program or any network attempt is a
+   violation in the **install** phase. A new symlink or hard link counts as a
+   read of where it points, so a link in `/tmp` to a secret is caught. A
+   failed or timed-out install is INCOMPLETE (with the end of its log) and the
+   server isn't run; its trace is still judged.
 3. **Run** the package's server from that volume, mounted **read-only**, under
    strace, with the same hardening and trace protection as a fixture. That
    volume is the container's **only** mount (#20): the Sandglass project is
@@ -163,6 +186,7 @@ builds it (`scripts/build_test_packages.py`) and scans:
 | `pypi:sandglass-test-notes@1.0.0` | CLEAN |
 | `npm:sandglass-test-notes@1.0.0` | CLEAN |
 | `pypi:sandglass-test-peek@1.0.0` | CLEAN; its reads of `/project/guard` and `/project/CLAUDE.md` are listed as attempted (`ENOENT`): the project isn't mounted |
+| `npm:sandglass-test-postinstall@1.0.0` | VIOLATIONS: 1, its `postinstall` script reads `/home/sandglass/.aws/credentials` (the decoy), in the **install** phase; the server itself is clean |
 
 ### What the sandbox does
 
@@ -350,8 +374,9 @@ cp policies/templates/read_only_folder.v1.yaml policies/my_notes_server.yaml   #
 **Phases.** Every reported event has a phase, and the Markdown report
 groups violations under three headings:
 
-- **Install**: not captured yet. Nothing is installed at run time (see #16),
-  so this section says so.
+- **Install**: `sandglass scan` only: the package's install, from its own
+  trace (#16, see "Scanning a published package"). Fixture runs install
+  nothing, and their report says so.
 - **Startup**: before the first tool call reached the server (imports, the
   server setting itself up).
 - **Tool calls**: from the first tool call on. A server that only
