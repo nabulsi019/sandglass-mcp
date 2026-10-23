@@ -142,6 +142,18 @@ def test_parser_collapses_leading_slashes(path, expected):
     events = parse_trace(f'8 10:00:00.1 openat(AT_FDCWD, "{path}", O_RDONLY) = 3')
     assert events[0].target == expected
 
+
+def test_parser_memfd_create_is_a_write_to_memfd_name():
+    events = parse_trace("\n".join([
+        '8 10:00:00.1 memfd_create("payload", MFD_CLOEXEC) = 5',
+        '8 10:00:00.2 memfd_create("", 0) = -1 EMFILE (Too many open files)',
+    ]))
+    assert [(e.kind, e.target, e.mode, e.succeeded) for e in events] == [
+        ("file", "memfd:payload", "write", True),
+        ("file", "memfd:", "write", False),
+    ]
+
+
 # --- compare: verdicts -------------------------------------------------------
 
 def test_clean_run():
@@ -240,6 +252,18 @@ def test_second_exec_is_violation():
     assert [v["target"] for v in result["violations"]] == ["/bin/sh"]
 
 
+def test_memfd_create_is_a_violation_and_a_failed_one_is_attempted():
+    # A file in memory only: code written there can be exec'd without touching disk.
+    result = run([
+        LAUNCH,
+        '8 10:00:00.2 memfd_create("payload", MFD_CLOEXEC) = 5',
+        '8 10:00:00.3 memfd_create("other", 0) = -1 EMFILE (Too many open files)',
+        EXITED,
+    ])
+    assert [(v["mode"], v["target"]) for v in result["violations"]] == [("write", "memfd:payload")]
+    assert [a["target"] for a in result["attempted"]] == ["memfd:other"]
+
+
 # --- policy in sandbox mode ------------------------------------------------
 
 def test_sandbox_placeholders_and_multiarch():
@@ -251,6 +275,11 @@ def test_sandbox_placeholders_and_multiarch():
     assert policy.read_allow == [P("/project/test_servers/allowed_notes")]
     assert policy.baseline_name == "python312_slim"
     assert P("/lib/x86_64-linux-gnu") in policy.baseline_read_allow
+
+
+def test_strace_records_memfd_create():
+    _, args = sandbox.docker_command(SERVER)
+    assert "-e trace=file,process,network,memfd_create " in " ".join(args)
 
 
 def test_docker_command_is_least_privilege():
