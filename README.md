@@ -89,7 +89,7 @@ Expected verdicts:
 | good_notes_node_server.js | CLEAN | 0 (with the `node_debian` baseline) |
 | tamper_trace_server | VIOLATIONS | 3: list `/proc/1/fd`, read and write `/proc/1/fd/2` (all blocked with EACCES) |
 
-Every run must also show the isolation check failing (no route to the internet).
+Every run must also show the sink reporting the isolation check as isolated (no route to the internet).
 
 Check all of them at once (also what CI runs):
 
@@ -157,8 +157,14 @@ and for the sink its proxy socket and the isolation check). Anything else
 from those processes is judged like the server's (#99).
 
 At startup the sink also tries to `connect()` to `1.1.1.1:443` (the
-**isolation check**). It must fail. If it ever succeeds, or the sink never
-starts, the verdict is INCOMPLETE.
+**isolation check**). The sink itself decides the outcome once the connect
+has finished, and reports it in the trace by `stat()`ing
+`/sandglass-isolation/<isolated|not-isolated>/<outcome>` before it marks itself
+ready (#100). The connect's first errno can't be trusted: with a timeout it's
+`EINPROGRESS` even when the connect then succeeds. Only `ENETUNREACH` (no route
+at all, which is what `--network none` gives) counts as isolated. If the sink
+reports anything else (connected, a timeout, a refusal...), reports nothing, or
+never starts, the verdict is INCOMPLETE.
 
 Limitation: a server that ignores the proxy variables and resolves names
 itself shows up only as a failed `connect()` (a violation), without the
@@ -275,7 +281,7 @@ report), never guessed.
 The verdict is **INCOMPLETE**, and never clean, if the server didn't start, the MCP
 session failed, no tool was exercised, the trace is missing or has no
 `+++ exited` line for the server (a truncated trace), the network sink didn't
-start, the isolation check reached the internet, or the stdin relay didn't
+start, the sink didn't report the isolation check as isolated, or the stdin relay didn't
 start or ended before the client closed stdin (killed, crashed, or no exit
 record: the server may have tampered with it), an io_uring call succeeded
 (Docker 25+ blocks io_uring by default; see #84 for a seccomp profile that

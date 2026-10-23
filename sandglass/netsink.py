@@ -25,8 +25,13 @@ SINK_URL = f"http://{SINK_HOST}:{SINK_PORT}"
 SINK_MARKER_DIR = "/sandglass-netsink"
 SINK_READY = f"{SINK_MARKER_DIR}/ready"
 # A public address the sink tries to reach once at startup. The connect must
-# fail, which shows the sandbox has no route to the internet.
+# fail with "network unreachable", which shows the sandbox has no route out.
 ISOLATION_CHECK = ("1.1.1.1", 443)
+ISOLATION_TIMEOUT = 2  # seconds
+# The sink reports the check's outcome itself (#100), after the connect has
+# finished, by stat()ing <this>/<isolated|not-isolated>/<outcome>, before it
+# marks itself ready. compare.py reads only that, never the connect's errno.
+ISOLATION_MARKER_DIR = "/sandglass-isolation"
 # The launcher hands the sink this fd; the sink writes one byte when listening.
 READY_FD = 3
 
@@ -71,6 +76,31 @@ def _record(path: str) -> None:
         pass
 
 
+def isolation_result(connect=None) -> tuple[str, str]:
+    """("isolated" or "not-isolated", outcome) of a connect to ISOLATION_CHECK.
+
+    Decided after the connect has FINISHED. With a timeout, the connect
+    doesn't block, so its first errno (EINPROGRESS) says nothing; the
+    exception (or the lack of one) at the end does. Only ENETUNREACH (no route
+    at all, what --network none gives) counts as isolated. Success, a timeout,
+    a refusal or any other error means packets may have left the container.
+    `connect` is replaceable for tests.
+    """
+    import errno
+    import socket
+
+    if connect is None:
+        connect = lambda: socket.create_connection(ISOLATION_CHECK, timeout=ISOLATION_TIMEOUT).close()
+    try:
+        connect()
+    except TimeoutError:  # socket.timeout is TimeoutError
+        return "not-isolated", "timeout"
+    except OSError as exc:
+        outcome = errno.errorcode.get(exc.errno, "unknown-error")
+        return ("isolated" if exc.errno == errno.ENETUNREACH else "not-isolated"), outcome
+    return "not-isolated", "connected"
+
+
 def serve() -> None:
     """Answer proxy requests locally and record each one, until the server exits."""
     import socket
@@ -81,11 +111,10 @@ def serve() -> None:
     server.listen(16)
     server.settimeout(0.5)
 
-    # Isolation check: this must fail under --network none.
-    try:
-        socket.create_connection(ISOLATION_CHECK, timeout=2).close()
-    except OSError:
-        pass
+    # Isolation check (#100): decided once the connect has finished, and
+    # reported in the trace before "ready", so before any server code runs.
+    result, outcome = isolation_result()
+    _record(f"{ISOLATION_MARKER_DIR}/{result}/{outcome}")
 
     _record(SINK_READY)
     os.write(READY_FD, b"1")  # tell the launcher the sink is listening

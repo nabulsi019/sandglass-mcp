@@ -25,8 +25,10 @@ Rules (one place, so they're easy to explain):
   way, from its own "ready" marker) are Sandglass's helpers. Only an exact
   list of their known events is skipped (#99):
     sink   its own exec, its ready marker, bind/listen/accept on the proxy
-           port, and the isolation check (its connect to a public IP; if
-           that ever succeeds -> INCOMPLETE)
+           port, and the isolation check: its connect to a public IP and
+           the marker where it reports the outcome (#100). The outcome comes
+           only from that marker, before "ready": anything but isolated, or
+           no marker at all -> INCOMPLETE
     relay  its own exec and its ready / tool-call / eof markers
   Everything else from those pids is judged like the server's, by the rules
   here: they run as the same user, so it may not be the helper's own code.
@@ -147,11 +149,13 @@ def _is_relay_own(event: Event, relay_exec: Event | None) -> bool:
 
 def _is_sink_own(event: Event, sink_exec: Event | None) -> bool:
     """The sink's known events, apart from its request records (handled in compare()):
-    its launch, its ready marker, its proxy socket, and the isolation check."""
+    its launch, its ready marker, its proxy socket, and the isolation check
+    (its connect, and the marker reporting the outcome, read by _isolation)."""
     if event is sink_exec:
         return True
     if event.kind == "probe":
-        return event.target == netsink.SINK_READY
+        return (event.target == netsink.SINK_READY
+                or event.target.startswith(netsink.ISOLATION_MARKER_DIR + "/"))
     if event.kind != "network":
         return False
     if event.syscall == "bind":
@@ -164,6 +168,26 @@ def _is_sink_own(event: Event, sink_exec: Event | None) -> bool:
     if event.syscall == "connect":
         return _is_address(event.target, *netsink.ISOLATION_CHECK)
     return False
+
+
+def _isolation(events: list[Event], sink_pid: int | None) -> dict | None:
+    """The sink's own report of the isolation check (#100), or None if missing.
+
+    Only the sink's FIRST isolation marker counts, and only if it comes before
+    the sink's ready marker (so before any server code ran). The connect's
+    errno isn't used: with a timeout it's EINPROGRESS even when the connect
+    then succeeds, so only the sink, after the connect finished, can tell.
+    """
+    for event in events:
+        if event.pid != sink_pid or event.kind != "probe":
+            continue
+        if event.target == netsink.SINK_READY:
+            return None  # ready without having reported the check
+        if event.target.startswith(netsink.ISOLATION_MARKER_DIR + "/"):
+            result, _, outcome = event.target[len(netsink.ISOLATION_MARKER_DIR) + 1:].partition("/")
+            return {"target": "%s:%d" % netsink.ISOLATION_CHECK, "isolated": result == "isolated",
+                    "outcome": outcome, "evidence": event.raw}
+    return None
 
 
 def _phase_of(events: list[Event], session: dict, relay_pid: int | None):
@@ -231,7 +255,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
     sink_exec, relay_exec = _helper_exec(events, sink_pid), _helper_exec(events, relay_pid)
     phase_of, phase_note = _phase_of(events, session, relay_pid)
     domains: list[dict] = []       # every request the sink recorded
-    isolation: dict | None = None  # the sink's connect-to-a-public-IP check
+    isolation = _isolation(events, sink_pid)  # the sink's own report of its check (#100)
     io_uring_used: list[Event] = []  # io_uring calls that succeeded (#75)
     unreadable: list[Event] = []     # file/stat events whose path strace couldn't read (#98)
 
@@ -246,10 +270,6 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
             continue  # the relay's launch and markers; anything else it does is judged (#99)
 
         if event.pid == sink_pid and _is_sink_own(event, sink_exec):
-            if event.kind == "network" and event.syscall == "connect":
-                isolation = {"target": "%s:%d" % netsink.ISOLATION_CHECK,
-                             "succeeded": event.succeeded, "error": event.error,
-                             "evidence": event.raw}
             continue  # the sink's launch, ready marker, proxy socket, isolation check (#99)
 
         request = _sink_request(event.target) if event.pid == sink_pid and event.kind == "probe" else None
@@ -348,9 +368,10 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
     if events and sink_pid is None:
         incomplete.append("the network sink did not start, so contacted domains can't be recorded")
     elif events and isolation is None:
-        incomplete.append("the network isolation check is missing from the trace")
-    elif isolation and isolation["succeeded"]:
-        incomplete.append(f"the sandbox reached the internet: connect to {isolation['target']} succeeded")
+        incomplete.append("the network isolation result is missing from the trace")
+    elif isolation and not isolation["isolated"]:
+        incomplete.append("the sandbox may reach the internet: isolation check "
+                          f"(connect to {isolation['target']}) outcome {isolation['outcome']}")
     relay_problem = _relay_problem(events, relay_pid) if events else None
     if relay_problem:
         incomplete.append(relay_problem)
@@ -497,11 +518,13 @@ def _network_section(r: dict) -> list[str]:
     lines = ["", "## Network", ""]
     iso = r.get("network_isolation")
     if iso is None:
-        lines.append("- Isolation check: **not in the trace**")
-    elif iso["succeeded"]:
-        lines.append(f"- Isolation check: connect to `{iso['target']}` **SUCCEEDED** (the sandbox can reach the internet)")
+        lines.append("- Isolation check: **result not in the trace**")
+    elif not iso["isolated"]:
+        lines.append(f"- Isolation check: connect to `{iso['target']}`: **NOT isolated ({iso['outcome']})**"
+                     " (the sandbox may reach the internet)")
     else:
-        lines.append(f"- Isolation check: connect to `{iso['target']}` failed ({iso['error']}): no route to the internet")
+        lines.append(f"- Isolation check: connect to `{iso['target']}`: isolated ({iso['outcome']}):"
+                     " no route to the internet")
     lines += ["", "Domains the server asked the local sink for (nothing was sent anywhere):", ""]
     if not r.get("domains"):
         return lines + ["None."]
