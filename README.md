@@ -114,7 +114,9 @@ uv run python scripts/check_fixtures.py
 ```
 
 With `--sandbox` the exit code is the verdict: `0` CLEAN, `1` VIOLATIONS,
-`2` INCOMPLETE (including "the sandbox couldn't start").
+`3` INCOMPLETE (including "the sandbox couldn't start"). `2` is a usage
+error (a wrong argument, a missing file; argparse's own code), so a script
+can tell "called wrong" from "the run can't be trusted" (#124).
 
 ## Scanning a published package
 
@@ -126,8 +128,8 @@ uv run sandglass scan npm:<package>@<exact-version>  --policy <policy.yaml>
 **Only scan packages you may test** (see Safety rules). The version must be
 exact: `latest`, ranges (`^1.2.3`, `~1.2`, `>=1`, `1.*`, `1.x`) and local
 versions are refused with a usage error, so a report always names exactly
-what was scanned. Exit code: `0` CLEAN, `1` VIOLATIONS, `2` INCOMPLETE or a
-usage error.
+what was scanned. Exit code: `0` CLEAN, `1` VIOLATIONS, `2` usage error,
+`3` INCOMPLETE.
 
 The policy's `read_allow`, `write_allow` and `read_deny` paths must be
 absolute (or placeholders like `{venv}`) for a scan (#123): a relative path

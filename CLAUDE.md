@@ -33,6 +33,8 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
     policy, verdict and exact violations of aws_credentials_server and
     symlink_escape_server under policies/templates/no_network.v1.yaml), and the `read_deny: [/home, /root]`
     of the no_network.v1 and listed_domains_only.v1 templates
+  - `EXPECTED_EXIT_CODES` in `scripts/check_fixtures.py` (the exit code of
+    every verdict: 0 CLEAN, 1 VIOLATIONS, 3 INCOMPLETE; 2 is a usage error)
   - the sandbox hardening flags (--network none, --read-only, non-root user,
     no --cap-add)
   - the strace permissions: `chmod 0711 /usr/bin/strace` in the Dockerfile
