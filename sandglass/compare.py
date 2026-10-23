@@ -20,13 +20,18 @@ Rules (one place, so they're easy to explain):
     except a SUCCESSFUL connect to the local network sink (sandglass/netsink.py):
       the sink then records the domain the server asked for, and
     a domain not in network.allow_domains -> VIOLATION naming the domain
-  The sink itself (the first process to stat its "ready" marker, which the
-  launcher waits for before any server code runs) is Sandglass, not the
-  server: its own exec and sockets are not violations. Its startup connect to
-  a public IP is the isolation check; if that ever succeeds -> INCOMPLETE.
-  The stdin relay (sandglass/stdin_relay.py) is found the same way, from its
-  own "ready" marker; none of its own events are reported. If it ends before
-  the client closed stdin (no "eof" marker, or not a clean exit) -> INCOMPLETE.
+  The sink (the first process to stat its "ready" marker, which the launcher
+  waits for before any server code runs) and the stdin relay (found the same
+  way, from its own "ready" marker) are Sandglass's helpers. Only an exact
+  list of their known events is skipped (#99):
+    sink   its own exec, its ready marker, bind/listen/accept on the proxy
+           port, and the isolation check (its connect to a public IP; if
+           that ever succeeds -> INCOMPLETE)
+    relay  its own exec and its ready / tool-call / eof markers
+  Everything else from those pids is judged like the server's, by the rules
+  here: they run as the same user, so it may not be the helper's own code.
+  If the relay ends before the client closed stdin (no "eof" marker, or not
+  a clean exit) -> INCOMPLETE.
   Process exec:
     the first exec in the trace is the server itself -> allowed
     (Node servers: the launcher then execs node in that same process; that
@@ -117,6 +122,50 @@ def _first_pid_to_stat(events: list[Event], path: str) -> int | None:
     return None
 
 
+# Sandglass's helpers (the network sink and the stdin relay) run as the same
+# user as the server, so an event in a helper's pid isn't proof the helper's
+# own code did it (#99). Only an exact list of each helper's known events is
+# skipped; everything else from those pids is judged like the server's.
+
+def _helper_exec(events: list[Event], pid: int | None) -> Event | None:
+    """A helper's own launch: the FIRST event of its pid, if that is a
+    successful exec of the venv Python (the launcher posix_spawns it)."""
+    first = next((e for e in events if e.pid == pid), None)
+    if (first is not None and first.kind == "process" and first.succeeded
+            and first.target == str(sandbox.CONTAINER_PYTHON)):
+        return first
+    return None
+
+
+RELAY_MARKERS = {stdin_relay.RELAY_READY, stdin_relay.TOOL_CALL_MARKER, stdin_relay.EOF_MARKER}
+
+
+def _is_relay_own(event: Event, relay_exec: Event | None) -> bool:
+    """The relay's known events: its launch and its three marker stats."""
+    return event is relay_exec or (event.kind == "probe" and event.target in RELAY_MARKERS)
+
+
+def _is_sink_own(event: Event, sink_exec: Event | None) -> bool:
+    """The sink's known events, apart from its request records (handled in compare()):
+    its launch, its ready marker, its proxy socket, and the isolation check."""
+    if event is sink_exec:
+        return True
+    if event.kind == "probe":
+        return event.target == netsink.SINK_READY
+    if event.kind != "network":
+        return False
+    if event.syscall == "bind":
+        return _is_address(event.target, netsink.SINK_HOST, netsink.SINK_PORT)
+    if event.syscall == "listen":
+        return True
+    if event.syscall in ("accept", "accept4"):
+        # A client of the proxy, which only listens on loopback (or no client yet).
+        return not event.succeeded or f'inet_addr("{netsink.SINK_HOST}")' in event.target
+    if event.syscall == "connect":
+        return _is_address(event.target, *netsink.ISOLATION_CHECK)
+    return False
+
+
 def _phase_of(events: list[Event], session: dict, relay_pid: int | None):
     """Return (function: event index -> phase, note explaining "unknown" or None).
 
@@ -179,6 +228,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
     node_launch: Event | None = None  # runtime "node" only
     sink_pid = _first_pid_to_stat(events, netsink.SINK_READY)
     relay_pid = _first_pid_to_stat(events, stdin_relay.RELAY_READY)
+    sink_exec, relay_exec = _helper_exec(events, sink_pid), _helper_exec(events, relay_pid)
     phase_of, phase_note = _phase_of(events, session, relay_pid)
     domains: list[dict] = []       # every request the sink recorded
     isolation: dict | None = None  # the sink's connect-to-a-public-IP check
@@ -192,21 +242,19 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
             unreadable.append(event)
             continue
 
-        if relay_pid is not None and event.pid == relay_pid and event.kind != "exit":
-            # Sandglass's own stdin relay: its exec, its Python startup and its
-            # markers. The server can't make it open anything. (Its exit is
-            # checked below: dying early makes the run INCOMPLETE.)
-            continue
+        if event.pid == relay_pid and _is_relay_own(event, relay_exec):
+            continue  # the relay's launch and markers; anything else it does is judged (#99)
 
-        if sink_pid is not None and event.pid == sink_pid and event.kind in ("process", "network", "probe"):
-            # Sandglass's own sink: its exec and sockets are ours, not the server's.
-            if event.kind == "network" and _is_address(event.target, *netsink.ISOLATION_CHECK):
+        if event.pid == sink_pid and _is_sink_own(event, sink_exec):
+            if event.kind == "network" and event.syscall == "connect":
                 isolation = {"target": "%s:%d" % netsink.ISOLATION_CHECK,
                              "succeeded": event.succeeded, "error": event.error,
                              "evidence": event.raw}
-            request = _sink_request(event.target) if event.kind == "probe" else None
-            if request is None:
-                continue  # its own exec/bind/listen/accept, or the ready marker
+            continue  # the sink's launch, ready marker, proxy socket, isolation check (#99)
+
+        request = _sink_request(event.target) if event.pid == sink_pid and event.kind == "probe" else None
+        if request is not None:
+            # A request the sink recorded: the domain the server asked for.
             method, host, port = request
             allowed = _domain_allowed(host, policy)
             domains.append({"method": method, "host": host, "port": port,
