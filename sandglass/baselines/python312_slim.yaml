@@ -26,3 +26,9 @@ read_allow:
   - /sys/fs/cgroup/cpu/cpu.cfs_quota_us   # cgroup v1 hosts: CPU quota (v1 version of cpu.max)
   - /sys/fs/cgroup/cpu/cpu.cfs_period_us  # cgroup v1 hosts: CPU quota period (same)
   - /dev/null                      # opened read-only during asyncio/anyio startup
+  # The same files as above, where strace -y shows they really are (#122):
+  # a read is judged by the requested AND the opened path.
+  - /usr/lib/{multiarch}           # = /lib/{multiarch}: Debian's merged /usr makes /lib a link to usr/lib
+  - /usr/share/zoneinfo/Etc/UTC    # = /etc/localtime, a link to the image's timezone (UTC)
+  - /etc/ssl/openssl.cnf           # = /usr/lib/ssl/openssl.cnf, a link to Debian's OpenSSL config
+  - /etc/ssl/certs/ca-certificates.crt  # = /usr/lib/ssl/cert.pem, a link to Debian's CA bundle

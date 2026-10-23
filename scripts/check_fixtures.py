@@ -81,6 +81,15 @@ EXPECTED_POLICY_RUNS = {
                                   "VIOLATIONS", {
                                       ("read", "/home/sandglass/.aws/credentials"),
                                   }),
+    # Reads the credentials through a symlink it makes in /tmp (#122). Two
+    # violations: making the link counts as a read of its target (the
+    # syscall is a write, hence "write"), and the open is judged by the file
+    # it really opened (strace -y).
+    "symlink_escape_server.py": (PROJECT_ROOT / "policies" / "templates" / "no_network.v1.yaml",
+                                 "VIOLATIONS", {
+                                     ("write", "/home/sandglass/.aws/credentials"),
+                                     ("read", "/home/sandglass/.aws/credentials"),
+                                 }),
 }
 
 

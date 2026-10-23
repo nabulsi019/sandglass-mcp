@@ -122,6 +122,10 @@ class Event:
     # link inside a writable folder to a secret would otherwise make reading
     # the secret look like reading the allowed folder.
     link_target: str | None = None
+    # A successful open only (#122): the file actually opened, as strace -y
+    # prints it after the returned fd. Differs from `target` when the path
+    # went through a symlink. None without -y.
+    opened: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -186,8 +190,31 @@ def _dirfd_before(args: str, position: int) -> str | None:
 # that skips quoted strings) before the strings are read.
 FD_PATH_RE = re.compile(r"(\d+|AT_FDCWD)<((?:[^<>\\]|\\.)*)>")
 # -y also prints the path of a RETURNED fd: "= 17</home/x>". Removed before
-# the call is parsed, so a ")" in such a path can't change the result.
-RESULT_FD_PATH_RE = re.compile(r"(=\s+\d+)<(?:[^<>\\]|\\.)*>$")
+# the call is parsed, so a ")" in such a path can't change the result. For
+# an open, that path is the file actually opened (#122): through a symlink,
+# it's where the link led, e.g. openat(.., "/tmp/x/link", ..) = 3</home/sandglass/.aws/credentials>.
+RESULT_FD_PATH_RE = re.compile(r"(=\s+\d+)<((?:[^<>\\]|\\.)*)>$")
+
+
+# /proc/<pid>/<rest>, as strace -y prints a file opened through /proc/self.
+PROC_PID_RE = re.compile(r"^/proc/\d+(/.*)$")
+
+
+def _proc_self(requested: str, opened: str) -> str:
+    """The opened path, except that /proc/self is kept as it was asked for (#122).
+
+    /proc/self (and /proc/mounts, which links to self/mounts) always leads to
+    the process's OWN /proc/<pid> folder, so strace -y shows
+    openat(.., "/proc/self/cgroup", ..) = 3</proc/42/cgroup>. That's the same
+    file, not an escape: the opened path is then reported as the requested one.
+    Only when the rest of the path is identical, so /proc/self/fd/3 or
+    /proc/self/root/... (which lead elsewhere) are still judged by where they
+    really lead.
+    """
+    match = PROC_PID_RE.match(opened)
+    if match and requested in ("/proc/self" + match[1], "/proc" + match[1]):
+        return requested
+    return opened
 
 
 def _strip_fd_paths(args: str) -> tuple[str, dict[str, str]]:
@@ -417,7 +444,8 @@ def parse_trace(text: str | Iterable[str], cwd: str = "/project") -> list[Event]
             # uninterrupted: the first half's line plus the resumed ending.
             line = first_line + resumed[2]
 
-        call = CALL_RE.match(RESULT_FD_PATH_RE.sub(r"\1", body))  # strace -y: "= 3</x>" -> "= 3"
+        returned = RESULT_FD_PATH_RE.search(body)  # strace -y: "= 3</x>"
+        call = CALL_RE.match(RESULT_FD_PATH_RE.sub(r"\1", body))  # -> "= 3"
         if not call:
             continue  # signals ("--- SIGCHLD ---") and anything unrecognised
         syscall, args, result, errno = call[1], call[2], call[3], call[4]
@@ -430,7 +458,13 @@ def parse_trace(text: str | Iterable[str], cwd: str = "/project") -> list[Event]
         # strace reports failure as a negative return plus an errno name.
         succeeded = errno is None and not result.startswith("-")
         link_target = _link_target(syscall, args, cwd, target) if syscall in LINK_SYSCALLS else None
+        # The file a successful open really opened (#122), as an absolute path.
+        # (Not a path, e.g. "pipe:[123]" for a reopened pipe: not a file, skipped.)
+        opened = None
+        if (syscall in OPEN_SYSCALLS and succeeded and returned and target != UNREADABLE
+                and returned[2].startswith("/")):
+            opened = _proc_self(target, _absolute(_unescape(returned[2]), cwd))
         events.append(Event(kind, syscall, pid, timestamp, target, mode,
-                            succeeded, errno, line, link_target))
+                            succeeded, errno, line, link_target, opened))
 
     return events

@@ -51,6 +51,7 @@ test_servers/        Fixture servers written for testing Sandglass. Not real tar
   listing_notes_server.py    Same tool, but also reads /etc/passwd and lists decoy_home/
   tamper_trace_server.py     Same tool, but also tries to read, overwrite and delete its trace
   aws_credentials_server.py  Same tool, but also reads ~/.aws/credentials (the sandbox's decoy)
+  symlink_escape_server.py   Same tool, but reads ~/.aws/credentials through a symlink it makes in /tmp
   shell_command_server.py    Same tool, but also runs `/bin/sh -c true`
   undeclared_domain_server.py  Same tool, but also sends a GET to undeclared.example (local sink only)
   good_notes_node_server.js  Node.js twin of good_notes_server (hand-written MCP, no npm packages)
@@ -102,6 +103,7 @@ Expected verdicts:
 | tamper_trace_server | VIOLATIONS | 3: list `/proc/1/fd`, read and write `/proc/1/fd/2` (all blocked with EACCES) |
 | missing_api_key_server | INCOMPLETE | 0; reason: exited during startup, `RuntimeError: NOTES_API_KEY is not set` |
 | aws_credentials_server under `policies/templates/no_network.v1.yaml` | VIOLATIONS | 1: read of `/home/sandglass/.aws/credentials` (`read_deny: /home`, #121) |
+| symlink_escape_server under `policies/templates/no_network.v1.yaml` | VIOLATIONS | 2, both on `/home/sandglass/.aws/credentials`: the symlink to it made in `/tmp` (a link counts as a read of its target), and the read through that link (judged by the file really opened, #122) |
 
 Every run must also show the sink reporting the isolation check as isolated (no route to the internet).
 
@@ -544,11 +546,17 @@ below are from each project's own paper or documentation.
   trace makes the run INCOMPLETE, since the unread part could hold anything.
   The parsed events are still kept in memory (bounded by that limit), and the
   trace file on disk isn't capped: Docker writes it straight to the file.
-- **Paths are compared as text.** strace shows the path the server asked for, not
-  where a symlink leads. The project mount is read-only and the container
-  filesystem is read-only apart from `/tmp`, so a server can't plant new
-  symlinks in allowed folders. But a symlink that already exists inside an
-  allowed folder would not be followed.
+- **Symlinks and links** (#122). A successful open is judged by both the
+  path the server asked for and the file it really opened (strace `-y`
+  prints it after the returned fd): a violation if either one isn't
+  allowed, and the report shows both ("requested X, opened Y"). Making a
+  symlink or hard link, in any phase, counts as a read of where it points.
+  So reading `~/.aws/credentials` through a link in `/tmp` is caught
+  (`test_servers/symlink_escape_server.py`). Opening `/proc/self/...` is
+  the exception: strace shows it as `/proc/<pid>/...`, the process's own
+  folder, so that path is judged as asked for. Failed opens and probes
+  (`stat`) are still judged by the requested path only: strace can't show
+  where they would have led.
 - **Baselines are specific to the image.** `python312_slim` covers
   `python:3.12-slim-trixie`; `node_debian` covers Debian's `nodejs` package in the same
   image (`.js` servers get both, since the launcher is Python). Another base image
