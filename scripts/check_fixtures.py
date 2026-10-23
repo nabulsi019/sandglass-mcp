@@ -81,6 +81,15 @@ TEST_REGISTRY = PROJECT_ROOT / "test_packages" / "dist"
 EXPECTED_SCANS = {
     "pypi:sandglass-test-notes@1.0.0": ("CLEAN", set()),
     "npm:sandglass-test-notes@1.0.0": ("CLEAN", set()),
+    # Tries to read Sandglass's project files; a scan doesn't mount them (#20).
+    "pypi:sandglass-test-peek@1.0.0": ("CLEAN", set()),
+}
+# Failed attempts a scan must show: package spec -> set of (mode, path, errno).
+EXPECTED_SCAN_ATTEMPTS = {
+    "pypi:sandglass-test-peek@1.0.0": {
+        ("read", "/project/guard", "ENOENT"),
+        ("read", "/project/CLAUDE.md", "ENOENT"),
+    },
 }
 
 
@@ -148,6 +157,10 @@ def main() -> int:
         print(f"\n===== scan {package} =====")
         report = run_scan(parse_spec(package), SCAN_POLICY, TEST_REGISTRY)
         failures += check(package, report, want_verdict, want_violations)
+        attempts = {(a["mode"], a["target"], a["error"]) for a in report.get("attempted", [])}
+        missing = EXPECTED_SCAN_ATTEMPTS.get(package, set()) - attempts
+        if missing:
+            failures.append(f"{package}: expected failed attempts {sorted(missing)} are missing")
 
     print("\n===== summary =====")
     for line in failures:

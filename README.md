@@ -40,6 +40,7 @@ scripts/
   build_test_packages.py  Builds test_packages/ into a local test registry (test_packages/dist/)
 test_packages/       Packages written for testing `sandglass scan`. Never published.
   pypi/sandglass-test-notes/  Notes server as a Python wheel (console script)
+  pypi/sandglass-test-peek/   Same, but also tries to read /project/guard and /project/CLAUDE.md
   npm/sandglass-test-notes/   Notes server as an npm tarball (bin)
 test_servers/        Fixture servers written for testing Sandglass. Not real targets.
   good_notes_server.py       read_note(name): reads only from allowed_notes/
@@ -137,10 +138,16 @@ What happens (`sandglass/scan.py`):
    downloaded files, into a fresh Docker volume at `/package`. That volume and
    `/tmp` are the only writable places. (Not traced yet: #16.)
 3. **Run** the package's server from that volume, mounted **read-only**, under
-   strace, exactly like a fixture. The server is the package's console script
-   (PyPI) or `bin` (npm); `--entry NAME` picks one if there are several.
+   strace, with the same hardening and trace protection as a fixture. That
+   volume is the container's **only** mount (#20): the Sandglass project is
+   not mounted, so the package can't read Sandglass's code, policies or
+   reports (`/project/...` gives `ENOENT`). The working directory is
+   `/package`. The server is the package's console script (PyPI) or `bin`
+   (npm); `--entry NAME` picks one if there are several.
    Reads inside `/package` (the package and its dependencies) are allowed
-   automatically, like `{venv}` for fixtures; writes there are not.
+   automatically, like `{venv}` for fixtures; writes there are not. Use
+   absolute paths in a scan's policy: relative ones point into `/project`,
+   which a scan doesn't have.
 4. **Report**, with a "Package" section: the spec, where it came from, the
    files downloaded and the entry point. If a step fails (download, install,
    no entry point), the report is still written, INCOMPLETE, with the reason.
@@ -155,6 +162,7 @@ builds it (`scripts/build_test_packages.py`) and scans:
 |---|---|
 | `pypi:sandglass-test-notes@1.0.0` | CLEAN |
 | `npm:sandglass-test-notes@1.0.0` | CLEAN |
+| `pypi:sandglass-test-peek@1.0.0` | CLEAN; its reads of `/project/guard` and `/project/CLAUDE.md` are listed as attempted (`ENOENT`): the project isn't mounted |
 
 ### What the sandbox does
 
@@ -435,10 +443,10 @@ below are from each project's own paper or documentation.
   runs; otherwise the server could write fake lines into its own trace. To see
   a server's tracebacks, run it without `--sandbox`.
 
-- **The whole project is mounted read-only into the container**, so a server
+- **Fixture runs mount the whole project read-only**, so a fixture server
   can read `sandglass/`, `policies/` and the other fixtures. That is acceptable for
-  our own fixtures. For real packages, only the package itself should be mounted
-  (planned for v0.4).
+  our own fixtures. `sandglass scan` mounts **only the installed package**
+  (#20): the project isn't in its container at all.
 - **Trace size** (#83). The trace is read one line at a time and at most
   256 MiB of it (`MAX_TRACE_BYTES` in `sandglass/trace_parser.py`); a bigger
   trace makes the run INCOMPLETE, since the unread part could hold anything.

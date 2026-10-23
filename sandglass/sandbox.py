@@ -126,11 +126,13 @@ def docker_command(server_script: Path) -> tuple[str, list[str]]:
     return docker, _traced_run_args(str(to_container_path(server_script)), mounts)
 
 
-def _traced_run_args(server_path: str, mounts: list[str], env: dict | None = None) -> list[str]:
+def _traced_run_args(server_path: str, mounts: list[str], env: dict | None = None,
+                     workdir: PurePosixPath = CONTAINER_PROJECT) -> list[str]:
     """`docker run` arguments that run one server under strace, hardened.
 
     Shared by the fixture mode (docker_command) and scan mode
-    (scan_run_command); only the mounts and a few environment variables differ.
+    (scan_run_command); only the mounts, the working directory and a few
+    environment variables differ.
     """
     strace = (f"exec strace -f -tt -e trace={TRACED_SYSCALLS} --kill-on-exit"
               f" -o /proc/self/fd/2 {CONTAINER_PYTHON} -S -c \"$1\" \"$2\" \"$3\" \"$4\" 3>/dev/null")
@@ -146,7 +148,7 @@ def _traced_run_args(server_path: str, mounts: list[str], env: dict | None = Non
         "-e", f"HOME={CONTAINER_HOME}",  # the decoy home, never the host's
         *env_args,
         *mounts,
-        "-w", str(CONTAINER_PROJECT),
+        "-w", str(workdir),
         IMAGE,
         # sh runs before strace, so it isn't traced. "$1".."$4" are the launcher
         # code, the server path, the sink code and the relay code, as separate arguments.
@@ -224,17 +226,15 @@ def scan_install_command(volume: str, download_dir: Path, script: str, script_ar
 def scan_run_command(volume: str, server_path: str, runtime: str) -> tuple[str, list[str]]:
     """`docker run` that runs the installed package's server under strace.
 
-    The volume is mounted READ-ONLY at /package. (The project is still
-    mounted too, like for fixtures; #20 removes it.)
+    The ONLY mount is the package's volume, READ-ONLY at /package (#20). The
+    project is NOT mounted: a scanned package can't read Sandglass's code,
+    policies, fixtures or reports (its launcher, sink and relay arrive as
+    arguments). The working directory is /package.
     """
     docker = shutil.which("docker") or "docker"
-    mounts = [
-        "-v", f"{PROJECT_ROOT}:{CONTAINER_PROJECT}:ro",
-        "--mount", f"type=tmpfs,destination={CONTAINER_REPORTS},tmpfs-mode=0555",
-        "-v", f"{volume}:{CONTAINER_PACKAGE}:ro",
-    ]
+    mounts = ["-v", f"{volume}:{CONTAINER_PACKAGE}:ro"]
     # Read by the launcher after the fd swap (sandglass/launcher.py, step 4).
     env = {"SANDGLASS_RUNTIME": runtime}
     if runtime == "python":
         env["SANDGLASS_SITE_DIR"] = str(CONTAINER_SITE)
-    return docker, _traced_run_args(server_path, mounts, env)
+    return docker, _traced_run_args(server_path, mounts, env, workdir=CONTAINER_PACKAGE)

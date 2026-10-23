@@ -1,0 +1,12 @@
+# A test package for `sandglass scan` (#20): a notes server that also tries
+# to read Sandglass's own project files. Written for testing Sandglass only;
+# never published. Built by scripts/build_test_packages.py.
+
+[project]
+name = "sandglass-test-peek"
+version = "1.0.0"
+description = "Sandglass test package: also tries to read /project (which a scan never mounts)"
+dependencies = []
+
+[project.scripts]
+sandglass-test-peek = "sandglass_test_peek.server:main"
