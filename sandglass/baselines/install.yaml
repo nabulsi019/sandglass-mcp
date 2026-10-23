@@ -1,0 +1,76 @@
+# Install baseline for `sandglass scan` (#16): what pip and npm THEMSELVES do
+# while installing a package inside the sandbox.
+#
+# Found in real traces of installing our own test packages (test_packages/)
+# in the sandglass-sandbox image. Used only for the install phase, together
+# with python312_slim.yaml and node_debian.yaml (both installers start like
+# any Python / Node.js program) and the policy's own allow-lists.
+#
+# The install container is read-only except /package and /tmp, so this is
+# mostly about READS (and programs): an install script reading
+# ~/.aws/credentials, running another program, or touching the network
+# still shows up as a violation.
+#
+# {multiarch} is the Debian multiarch triplet, asked from the image.
+
+name: install
+description: What pip and npm themselves read, write and run while installing offline.
+
+read_allow:
+  - /download                       # the files downloaded on the host (read-only mount)
+  - /package                        # what is being installed
+  - /tmp                            # scratch: pip's build folders, npm's cache and logs
+  - /usr/local                      # the image's Python, with pip (pip install)
+  - /usr/share/nodejs               # Debian's npm and its JS dependencies
+  - /usr/share/node_modules         # same (Debian links some of them here)
+  - /usr/lib/{multiarch}/nodejs     # same
+  - /etc/os-release                 # pip and npm: which OS this is (user agent, platform tags)
+  - /etc/debian_version             # same
+  - /etc/mime.types                 # pip: Python's mimetypes module
+  - /etc/npmrc                      # npm's global config (none in the image)
+  - /etc/resolv.conf                # Node.js's DNS library initialises at startup (no lookup is made)
+  - /etc/nsswitch.conf              # same
+  - /etc/netsvc.conf                # same (absent)
+  - /etc/svc.conf                   # same (absent)
+  - /proc/self                      # Node.js: its own memory map and cgroup
+  - /proc/meminfo                   # V8 sizes its heap from total memory
+  - /proc/cpuinfo                   # npm/Node.js: CPU count
+  - /proc/stat                      # same
+  - /proc/filesystems               # libselinux, loaded by cp
+  - /proc/mounts                    # same
+  - /proc/version_signature         # libuv: kernel version (Ubuntu kernels)
+  - /sys/devices/system/cpu         # CPU count and frequency
+  - /sys/fs/cgroup                  # memory and CPU limits (cgroup v1 or v2)
+
+# Folders the installers LIST (see which files are in them) but never read
+# into: exact matches, nothing inside them.
+list_exact:
+  - /etc                            # pip: Python's platform/distro code looks for *-release files
+
+write_allow:
+  - /package                        # the install target (the only writable mount)
+  - /tmp                            # scratch
+  - /dev/null                       # output thrown away
+
+# Programs the installers run. npm runs every lifecycle script (preinstall,
+# postinstall, ...) through sh, and node for the script itself; what such a
+# script then reads or runs is judged like anything else.
+exec_allow:
+  - /usr/bin/sh
+  - /bin/sh
+  - /usr/bin/cp                     # copies the downloaded files into place
+  - /usr/bin/env                    # npm's "#!/usr/bin/env node"
+  - /usr/bin/node
+  - /usr/bin/npm
+  - /usr/local/bin/python           # pip
+  - /usr/bin/uname                  # pip: platform module (OS and CPU)
+
+# Socket families that never leave the machine. Node.js opens a netlink
+# socket to list the network interfaces; it can't reach any other host.
+network_families_allow:
+  - AF_NETLINK
+
+# bind() to the loopback address (127.0.0.1 or ::1), never connect(): pip's
+# bundled urllib3 binds a socket to ::1, port 0, to see whether IPv6 works.
+# Binding is local; anything that connects or sends is still a violation.
+loopback_bind_allow: true

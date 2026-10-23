@@ -62,6 +62,41 @@ class Policy:
     baseline_read_allow: list[Path] = field(default_factory=list)  # sandbox only: READS only
 
 
+INSTALL_BASELINE_FILE = BASELINES_DIR / "install.yaml"
+
+
+@dataclass(frozen=True)
+class InstallBaseline:
+    """What the installers themselves may do in a scan's install phase (#16)."""
+    name: str
+    read_allow: list[PurePosixPath]     # install.yaml + python312_slim + node_debian reads
+    list_exact: list[PurePosixPath]     # folders that may be listed, nothing inside them (/etc)
+    write_allow: list[PurePosixPath]    # /package, /tmp, /dev/null
+    exec_allow: list[PurePosixPath]     # sh, cp, node, npm, the image's Python, ...
+    network_families_allow: list[str]   # e.g. AF_NETLINK: sockets that can't leave the machine
+    loopback_bind_allow: bool           # bind() to 127.0.0.1 / ::1 (pip checking for IPv6)
+
+
+def load_install_baseline(multiarch: str) -> InstallBaseline:
+    """sandglass/baselines/install.yaml, plus the startup reads of both runtimes
+    (pip is Python, npm is Node.js), with container paths."""
+    values = _placeholders(None, True, multiarch)
+    data = _read_yaml(INSTALL_BASELINE_FILE)
+    reads = _path_list(data, "read_allow", "install.", values, True)
+    for runtime_file in BASELINE_FILES["node"]:  # python312_slim + node_debian
+        reads += _path_list(_read_yaml(runtime_file), "read_allow", "baseline.", values, True)
+    names = ["install"] + [f.stem for f in BASELINE_FILES["node"]]
+    return InstallBaseline(
+        name=" + ".join(names),
+        read_allow=reads,
+        list_exact=_path_list(data, "list_exact", "install.", values, True),
+        write_allow=_path_list(data, "write_allow", "install.", values, True),
+        exec_allow=_path_list(data, "exec_allow", "install.", values, True),
+        network_families_allow=_strings(data, "network_families_allow", "install."),
+        loopback_bind_allow=_require(data, "loopback_bind_allow", bool, "install."),
+    )
+
+
 def _placeholders(server_script: Path | None, in_sandbox: bool, multiarch: str | None,
                   container_script: str | None = None) -> dict[str, str]:
     """Values for the {placeholders}, as host paths or container paths.

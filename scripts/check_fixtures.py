@@ -83,6 +83,15 @@ EXPECTED_SCANS = {
     "npm:sandglass-test-notes@1.0.0": ("CLEAN", set()),
     # Tries to read Sandglass's project files; a scan doesn't mount them (#20).
     "pypi:sandglass-test-peek@1.0.0": ("CLEAN", set()),
+    # A clean server whose npm postinstall script reads the decoy
+    # ~/.aws/credentials: caught in the install phase (#16).
+    "npm:sandglass-test-postinstall@1.0.0": ("VIOLATIONS", {
+        ("read", "/home/sandglass/.aws/credentials"),
+    }),
+}
+# The phase a scan's violations must be in, if not "tool-call".
+EXPECTED_SCAN_PHASES = {
+    "npm:sandglass-test-postinstall@1.0.0": "install",
 }
 # Failed attempts a scan must show: package spec -> set of (mode, path, errno).
 EXPECTED_SCAN_ATTEMPTS = {
@@ -108,7 +117,8 @@ def in_order(violations) -> list:
     return sorted(violations, key=lambda v: (v[0] or "", v[1]))
 
 
-def check(fixture: str, report: dict, want_verdict: str, want_violations: set) -> list[str]:
+def check(fixture: str, report: dict, want_verdict: str, want_violations: set,
+          want_phase: str = "tool-call") -> list[str]:
     """Every check that applies to every fixture; returns the failures."""
     failures = []
     got = [(v["mode"], v["target"]) for v in report["violations"]]
@@ -120,10 +130,11 @@ def check(fixture: str, report: dict, want_verdict: str, want_violations: set) -
 
     # Every fixture misbehaves only inside read_note, so every violation
     # must be in the tool-call phase (#18), e.g. overreach's decoy read.
+    # (Except a package that misbehaves while it's installed: "install", #16.)
     wrong_phase = [(v["mode"], v["target"], v["phase"]) for v in report["violations"]
-                   if v["phase"] != "tool-call"]
+                   if v["phase"] != want_phase]
     if wrong_phase:
-        failures.append(f"{fixture}: violations outside the tool-call phase: {wrong_phase}")
+        failures.append(f"{fixture}: violations outside the {want_phase} phase: {wrong_phase}")
 
     # Every run: the sandbox must have no route out (the sink reported "isolated")...
     isolation = report["network_isolation"]
@@ -156,8 +167,9 @@ def main() -> int:
     for package, (want_verdict, want_violations) in EXPECTED_SCANS.items():
         print(f"\n===== scan {package} =====")
         report = run_scan(parse_spec(package), SCAN_POLICY, TEST_REGISTRY)
-        failures += check(package, report, want_verdict, want_violations)
-        attempts = {(a["mode"], a["target"], a["error"]) for a in report.get("attempted", [])}
+        failures += check(package, report, want_verdict, want_violations,
+                          EXPECTED_SCAN_PHASES.get(package, "tool-call"))
+        attempts ={(a["mode"], a["target"], a["error"]) for a in report.get("attempted", [])}
         missing = EXPECTED_SCAN_ATTEMPTS.get(package, set()) - attempts
         if missing:
             failures.append(f"{package}: expected failed attempts {sorted(missing)} are missing")

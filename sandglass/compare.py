@@ -52,7 +52,8 @@ Rules (one place, so they're easy to explain):
                                                missing file access
 
 Phases (#18): every reported event gets a phase:
-  install    nothing is installed at run time yet (see #16), so always empty
+  install    `sandglass scan` only: the install's own trace, judged by
+             compare_install() (#16). Empty for fixture runs.
   startup    before the first tool call reached the server
   tool-call  from the first tool call on
   unknown    the boundary is missing from the trace; never guessed
@@ -75,11 +76,12 @@ Verdicts:
 """
 
 import json
+import re
 from dataclasses import asdict
 from pathlib import Path
 
 from sandglass import launcher, netsink, sandbox, stdin_relay
-from sandglass.policy import Policy
+from sandglass.policy import InstallBaseline, Policy
 from sandglass.trace_parser import MAX_TRACE_BYTES, UNREADABLE, Event
 
 # Errors that mean "this exists but you're not allowed": a real access attempt.
@@ -482,6 +484,142 @@ def _startup_exit_reason(events: list[Event], server_launch: Event | None, relay
 
 
 # ---------------------------------------------------------------------------
+# Install phase (#16): `sandglass scan` traces the install too
+# ---------------------------------------------------------------------------
+
+# How strace prints the loopback addresses in a sockaddr.
+LOOPBACK_ADDRESSES = ('inet_addr("127.0.0.1")', 'inet_pton(AF_INET6, "::1"')
+
+
+def compare_install(events: list[Event], policy: Policy, baseline: InstallBaseline,
+                    exit_code: int | None, log: str = "", trace_cut_short: bool = False) -> dict:
+    """Judge the install trace. Every reported event gets phase "install".
+
+    Allowed (beyond the policy's own read_allow / write_allow / exec_allow):
+      reads     the install baseline (sandglass/baselines/install.yaml: what
+                pip and npm read, plus both runtimes' startup reads), and
+                listing its exact folders (/etc) but nothing inside them
+      writes    /package, /tmp, /dev/null (nothing else is writable anyway)
+      programs  the first exec (the installer's shell), then the baseline's
+                sh / cp / env / node / npm / Python / uname
+      network   sockets of a family that can't leave the machine (AF_NETLINK),
+                and bind() to the loopback address (pip checking for IPv6)
+    A new symlink or hard link counts as a READ of where it points: a link in
+    /tmp to ~/.aws/credentials would otherwise make that read look allowed.
+    Everything else follows the same rules as the server's run (violation /
+    attempted / probe; unreadable path or working io_uring -> INCOMPLETE).
+    The install failing or timing out -> INCOMPLETE, with the end of its log.
+    """
+    read_ok = policy.read_allow + baseline.read_allow
+    write_ok = policy.write_allow + baseline.write_allow
+    exec_ok = policy.exec_allow + baseline.exec_allow
+    violations, attempted, probes, incomplete = [], [], {}, []
+    unreadable, io_uring_used = [], []
+    launch: Event | None = None
+
+    def record(event: Event, reason: str, bucket: str, target: str | None = None) -> None:
+        (violations if bucket == "violation" else attempted).append({
+            "reason": reason, "syscall": event.syscall, "target": target or event.target,
+            "mode": event.mode, "timestamp": event.timestamp, "phase": "install",
+            "pid": event.pid, "succeeded": event.succeeded, "error": event.error,
+            "evidence": event.raw,
+        })
+
+    for event in events:
+        if event.kind in ("file", "probe") and event.target == UNREADABLE:
+            unreadable.append(event)
+        elif event.kind == "file":
+            if event.mode == "write":
+                if not _is_under(event.target, write_ok):
+                    record(event, "install wrote outside /package and /tmp",
+                           _bucket_for_failure_or_success(event))
+                if event.link_target and not _is_under(event.link_target, read_ok):
+                    record(event, "install linked to a path outside allowed reads",
+                           _bucket_for_failure_or_success(event), target=event.link_target)
+            elif event.mode == "list" and event.target in map(str, baseline.list_exact):
+                continue  # e.g. pip listing /etc: that folder only, nothing inside it
+            elif not _is_under(event.target, read_ok):
+                record(event, f"install {event.mode} outside allowed paths",
+                       _bucket_for_failure_or_success(event))
+        elif event.kind == "probe":
+            if not _is_under(event.target, read_ok):
+                entry = probes.setdefault(event.target, {
+                    "path": event.target, "count": 0, "syscalls": {},
+                    "first_timestamp": event.timestamp, "phase": "install"})
+                entry["count"] += 1
+                entry["syscalls"][event.syscall] = entry["syscalls"].get(event.syscall, 0) + 1
+        elif event.kind == "process":
+            if launch is None and event.succeeded:
+                launch = event  # strace starting the installer's shell
+            elif not _is_under(event.target, exec_ok):
+                record(event, "install ran a program not in the install baseline or exec_allow",
+                       _bucket_for_failure_or_success(event))
+        elif event.kind == "network":
+            family = re.search(r"sa_family=(\w+)", event.target)
+            local_family = family is not None and family[1] in baseline.network_families_allow
+            loopback_bind = (baseline.loopback_bind_allow and event.syscall == "bind"
+                             and any(address in event.target for address in LOOPBACK_ADDRESSES))
+            if not policy.network_allow and not local_family and not loopback_bind:
+                record(event, "network activity during the install", "violation")
+        elif event.kind == "io_uring":
+            if event.succeeded:
+                io_uring_used.append(event)
+            else:
+                record(event, "io_uring blocked (file access through it would be invisible to strace)",
+                       "attempted")
+
+    if exit_code is None:
+        incomplete.append("the install took too long and was stopped")
+    elif exit_code != 0:
+        incomplete.append(f"the install failed (exit {exit_code}); the server was not run"
+                          + (f". End of the install log: {log}" if log else ""))
+    if not events:
+        incomplete.append("the install trace is missing or empty")
+    elif launch is None:
+        incomplete.append("the install trace does not show the installer being launched")
+    elif not any(e.kind == "exit" and e.pid == launch.pid for e in events):
+        incomplete.append("the install trace has no exit record for the installer (possibly truncated)")
+    if trace_cut_short:
+        limit = MAX_TRACE_BYTES // (1024 * 1024)
+        incomplete.append(f"the install trace is larger than {limit} MiB; only the first {limit} MiB "
+                          "were checked")
+    if unreadable:
+        incomplete.append(f"{len(unreadable)} install file event(s) with a path strace couldn't read; "
+                          f"first: {unreadable[0].raw}")
+    if io_uring_used:
+        incomplete.append(f"{IO_URING_INCOMPLETE} (during the install: {len(io_uring_used)} "
+                          f"successful io_uring call(s), first: {io_uring_used[0].raw})")
+
+    return {
+        "incomplete_reasons": incomplete,
+        "violations": violations,
+        "attempted": attempted,
+        "probes": sorted(probes.values(), key=lambda p: p["first_timestamp"]),
+        "event_counts": {kind: sum(1 for e in events if e.kind == kind)
+                         for kind in ("file", "probe", "process", "network", "io_uring", "exit")},
+    }
+
+
+def with_install(result: dict, install: dict) -> dict:
+    """The run's compare() result with the install phase added in front of it.
+
+    The install's findings come first (they happened first), and the verdict
+    covers both phases: INCOMPLETE if either is, else VIOLATIONS if either
+    has one, else CLEAN.
+    """
+    merged = dict(result)
+    for key in ("incomplete_reasons", "violations", "attempted", "probes"):
+        merged[key] = install[key] + result[key]
+    if merged["incomplete_reasons"]:
+        merged["verdict"] = "INCOMPLETE"
+    elif merged["violations"]:
+        merged["verdict"] = "VIOLATIONS"
+    else:
+        merged["verdict"] = "CLEAN"
+    return merged
+
+
+# ---------------------------------------------------------------------------
 # Coverage (#23): which tools ran, failed, or were skipped
 # ---------------------------------------------------------------------------
 
@@ -531,11 +669,12 @@ def coverage(session: dict) -> dict:
 # Report writing
 # ---------------------------------------------------------------------------
 
-def not_run(reason: str) -> dict:
+def not_run(reason: str | None) -> dict:
     """compare()'s result for a scan whose server never ran (#19): the
-    download or the install failed. INCOMPLETE, with nothing observed."""
+    download or the install failed. INCOMPLETE, with nothing observed.
+    (reason None: the install phase gives the reason, see with_install.)"""
     return {
-        "verdict": "INCOMPLETE", "incomplete_reasons": [reason],
+        "verdict": "INCOMPLETE", "incomplete_reasons": [reason] if reason else [],
         "violations": [], "attempted": [], "probes": [], "domains": [],
         "network_isolation": None, "phase_note": "the server was not run",
         "event_counts": {kind: 0 for kind in ("file", "probe", "process", "network", "io_uring", "exit")},
@@ -642,8 +781,18 @@ def _package_section(r: dict) -> list[str]:
     if not p:
         return []
     lines = ["", "## Package", "",
-             f"- Spec: `{p['spec']}` (from {p['source']})",
-             f"- Install: {p['install']}"]
+             f"- Spec: `{p['spec']}` (from {p['source']})"]
+    install = p.get("install")
+    if install:
+        exit_code = install["exit_code"]
+        status = "timed out" if exit_code is None else f"exit {exit_code}"
+        lines += [f"- Install: inside the sandbox, offline, traced ({status};"
+                  f" {install['violations']} violation(s), see \"Install\" below;"
+                  f" baseline `{install['baseline']}`)",
+                  f"  - install trace: `{install['trace_file']}`",
+                  f"  - install log: `{install['log_file']}`"]
+    else:
+        lines.append("- Install: not reached")
     if p["entry"]:
         lines.append(f"- Entry point: `{p['entry']['name']}` = `{p['entry']['path']}`")
     else:
@@ -705,8 +854,9 @@ def _phase_sections(r: dict) -> list[str]:
         if phase == "unknown" and not records:
             continue  # only shown when the boundary was missing
         section = _event_section(titles[phase], records, level="###")
-        if phase == "install" and not records:
-            section[-1:] = ["Not captured in this version: nothing is installed at run time (see #16)."]
+        if phase == "install" and not records and not r.get("package"):
+            section[-1:] = ["Nothing is installed in a fixture run; `sandglass scan` traces "
+                            "the install of a package (see #16)."]
         lines += section
     return lines
 

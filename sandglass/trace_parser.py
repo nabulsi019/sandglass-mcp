@@ -118,6 +118,10 @@ class Event:
     succeeded: bool
     error: str | None   # e.g. "ENOENT" when succeeded is False
     raw: str            # the original strace line, kept as evidence
+    # symlink/link only (#16): the path the new link points to, absolute. A
+    # link inside a writable folder to a secret would otherwise make reading
+    # the secret look like reading the allowed folder.
+    link_target: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -146,20 +150,73 @@ def _unescape(s: str) -> str:
     return out.decode("utf-8", "backslashreplace")
 
 
-def _absolute(path: str, args: str, cwd: str) -> str:
-    """Make a path absolute. Relative paths are relative to the working
-    directory only when the call uses AT_FDCWD (or has no dirfd at all)."""
+def _absolute(path: str, cwd: str, dirfd: str | None = None, fd_dirs: dict | None = None) -> str:
+    """Make a path absolute. A relative path is relative to the working
+    directory when the call has no dirfd before it, or AT_FDCWD; otherwise to
+    that dirfd's folder, if strace -y printed it (the install trace, #16)."""
     if path.startswith("/"):
         # normpath keeps exactly two leading slashes (POSIX allows "//" to mean
         # something special), but Linux opens "//etc/passwd" as "/etc/passwd".
         # Collapse them, or the path wouldn't match the policy's "/etc/passwd".
         return posixpath.normpath("/" + path.lstrip("/"))
-    if args.startswith("AT_FDCWD") or not re.match(r"^\d+,", args):
+    folder = (fd_dirs or {}).get(dirfd or "AT_FDCWD", "")
+    if dirfd is None or dirfd == "AT_FDCWD":
+        # With strace -y, AT_FDCWD<...> says the process's real working
+        # directory (npm runs install scripts inside the package's folder).
+        cwd = folder if folder.startswith("/") else cwd
         return posixpath.normpath(posixpath.join(cwd, path))
+    if folder.startswith("/"):
+        return posixpath.normpath(posixpath.join("/" + folder.lstrip("/"), path))
     # Relative to some other open directory fd; we can't know which without
     # strace -y, so mark it clearly. compare.py treats it as "not allowed".
-    dirfd = args.split(",", 1)[0]
     return f"<dirfd {dirfd}>/{path}"
+
+
+def _dirfd_before(args: str, position: int) -> str | None:
+    """The dirfd argument right before a path argument: "AT_FDCWD", "3", or None.
+    openat(3, "x") -> "3"; symlinkat("t", 3, "p") -> "3" for "p"; open("x") -> None."""
+    match = re.search(r"(?:^|[\s(,])(AT_FDCWD|\d+),\s*$", args[:position])
+    return match[1] if match else None
+
+
+# strace -y prints an fd argument with its path: 3</tmp/pip-x>, and
+# AT_FDCWD</package> (the working directory). Inside the <...>, strace
+# escapes "<", ">" and non-printable bytes, so the first plain ">" ends it.
+# A '"' is NOT escaped there, which is why these are taken out (by a scanner
+# that skips quoted strings) before the strings are read.
+FD_PATH_RE = re.compile(r"(\d+|AT_FDCWD)<((?:[^<>\\]|\\.)*)>")
+# -y also prints the path of a RETURNED fd: "= 17</home/x>". Removed before
+# the call is parsed, so a ")" in such a path can't change the result.
+RESULT_FD_PATH_RE = re.compile(r"(=\s+\d+)<(?:[^<>\\]|\\.)*>$")
+
+
+def _strip_fd_paths(args: str) -> tuple[str, dict[str, str]]:
+    """Remove strace -y fd paths from the arguments: ('3, "x"', {"3": "/tmp/a"}).
+
+    Quoted strings are copied as they are, so a file NAME that looks like
+    "3<...>" is never mistaken for an fd path. Without -y, nothing changes.
+    """
+    if "<" not in args:
+        return args, {}
+    out, paths, i = [], {}, 0
+    while i < len(args):
+        if args[i] == '"':
+            string = STRING_RE.match(args, i)
+            if string:
+                out.append(string.group(0))
+                i = string.end()
+                continue
+        elif ((args[i].isdigit() or args.startswith("AT_FDCWD<", i))
+              and (i == 0 or args[i - 1] in " ,[{(")):
+            fd_path = FD_PATH_RE.match(args, i)
+            if fd_path:
+                out.append(fd_path[1])
+                paths[fd_path[1]] = _unescape(fd_path[2])
+                i = fd_path.end()
+                continue
+        out.append(args[i])
+        i += 1
+    return "".join(out), paths
 
 
 def _network_target(args: str) -> str | None:
@@ -181,9 +238,42 @@ def _path_unreadable(syscall: str, args: str, strings: list[str]) -> bool:
     return len(strings) < needed and ADDRESS_RE.search(args) is not None
 
 
+LINK_SYSCALLS = {"symlink", "symlinkat", "link", "linkat"}
+
+
+def _link_target(syscall: str, args: str, cwd: str, link_path: str) -> str | None:
+    """Where a new symlink or hard link points, as an absolute path (#16).
+
+    symlink(target, linkpath): a relative target is relative to the link's
+    own folder. link(oldpath, newpath): oldpath is an ordinary path.
+    """
+    args, fd_dirs = _strip_fd_paths(args)
+    strings, path_of = _strings_and_paths(args, cwd, fd_dirs)
+    if syscall not in LINK_SYSCALLS or len(strings) < 2:
+        return None
+    if syscall.startswith("symlink"):
+        target = strings[0]
+        if target.startswith("/"):
+            return posixpath.normpath("/" + target.lstrip("/"))
+        return posixpath.normpath(posixpath.join(posixpath.dirname(link_path), target))
+    return path_of(0)
+
+
+def _strings_and_paths(args: str, cwd: str, fd_dirs: dict):
+    """The quoted strings of the arguments, and path_of(i): string i as an
+    absolute path, relative to the dirfd argument just before it (if any)."""
+    matches = list(STRING_RE.finditer(args))
+    strings = [_unescape(m[1]) for m in matches]
+
+    def path_of(i: int) -> str:
+        return _absolute(strings[i], cwd, _dirfd_before(args, matches[i].start()), fd_dirs)
+    return strings, path_of
+
+
 def _classify(syscall: str, args: str, cwd: str) -> tuple[str, str, str | None] | None:
     """Return (kind, target, mode) for a syscall we care about, else None."""
-    strings = [_unescape(s) for s in STRING_RE.findall(args)]
+    args, fd_dirs = _strip_fd_paths(args)  # fd folders: strace -y only (the install trace)
+    strings, path_of = _strings_and_paths(args, cwd, fd_dirs)
 
     if syscall in OPEN_SYSCALLS:
         if syscall == "creat" or any(flag in args for flag in WRITE_FLAGS):
@@ -194,7 +284,7 @@ def _classify(syscall: str, args: str, cwd: str) -> tuple[str, str, str | None] 
             mode = "read"
         if not strings:
             return ("file", UNREADABLE, mode) if _path_unreadable(syscall, args, strings) else None
-        return "file", _absolute(strings[0], args, cwd), mode
+        return "file", path_of(0), mode
 
     if syscall == "memfd_create":
         return "file", MEMFD_PREFIX + (strings[0] if strings else ""), "write"
@@ -207,7 +297,7 @@ def _classify(syscall: str, args: str, cwd: str) -> tuple[str, str, str | None] 
             return "file", UNREADABLE, "write"
         if strings:
             # rename(old, new): the destination is the interesting path.
-            return "file", _absolute(strings[-1], args, cwd), "write"
+            return "file", path_of(-1), "write"
 
     if syscall in PROBE_SYSCALLS:
         if _path_unreadable(syscall, args, strings):
@@ -215,7 +305,7 @@ def _classify(syscall: str, args: str, cwd: str) -> tuple[str, str, str | None] 
         if strings and strings[0]:
             # An empty path (e.g. newfstatat(3, "", AT_EMPTY_PATH)) inspects an
             # already-open fd, not a new path, so it's skipped.
-            return "probe", _absolute(strings[0], args, cwd), None
+            return "probe", path_of(0), None
 
     if syscall in EXEC_SYSCALLS:
         if not strings:
@@ -224,7 +314,7 @@ def _classify(syscall: str, args: str, cwd: str) -> tuple[str, str, str | None] 
             # non-dumpable (see sandbox.py). Keep it: compare.py treats only the
             # FIRST exec as the server launch; any other is still a violation.
             return "process", UNREADABLE, None
-        return "process", _absolute(strings[0], args, cwd), None
+        return "process", path_of(0), None
 
     if syscall in NETWORK_SYSCALLS:
         address = _network_target(args)
@@ -298,7 +388,7 @@ def parse_trace(text: str | Iterable[str], cwd: str = "/project") -> list[Event]
             # uninterrupted: the first half's line plus the resumed ending.
             line = first_line + resumed[2]
 
-        call = CALL_RE.match(body)
+        call = CALL_RE.match(RESULT_FD_PATH_RE.sub(r"\1", body))  # strace -y: "= 3</x>" -> "= 3"
         if not call:
             continue  # signals ("--- SIGCHLD ---") and anything unrecognised
         syscall, args, result, errno = call[1], call[2], call[3], call[4]
@@ -310,7 +400,8 @@ def parse_trace(text: str | Iterable[str], cwd: str = "/project") -> list[Event]
 
         # strace reports failure as a negative return plus an errno name.
         succeeded = errno is None and not result.startswith("-")
+        link_target = _link_target(syscall, args, cwd, target) if syscall in LINK_SYSCALLS else None
         events.append(Event(kind, syscall, pid, timestamp, target, mode,
-                            succeeded, errno, line))
+                            succeeded, errno, line, link_target))
 
     return events
