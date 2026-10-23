@@ -202,6 +202,30 @@ def _read_yaml(path: str | Path) -> dict:
     return data
 
 
+# The filesystem lists whose paths must be absolute in a scan (#123).
+SCAN_ABSOLUTE_KEYS = ("read_allow", "write_allow", "read_deny")
+
+
+def check_scan_paths(path: str | Path) -> None:
+    """Raise PolicyError if the policy has a relative filesystem path (#123).
+
+    Relative paths mean "inside the project" (/project in the sandbox), but a
+    scan doesn't mount the project (#20): "data" would silently become
+    /project/data, a folder that doesn't exist there. So `sandglass scan`
+    refuses them before anything is downloaded. Normal runs keep them.
+    Placeholders ("{venv}") are filled with absolute paths, so they're fine.
+    """
+    filesystem = _read_yaml(path).get("filesystem")
+    if not isinstance(filesystem, dict):
+        return  # load_policy reports the missing or broken section
+    for key in SCAN_ABSOLUTE_KEYS:
+        entries = filesystem.get(key)
+        for entry in entries if isinstance(entries, list) else []:
+            if isinstance(entry, str) and not entry.startswith(("/", "{")):
+                raise PolicyError(f"policy path '{entry}' is relative; scans have no project "
+                                  "folder, use an absolute path")
+
+
 def load_policy(
     path: str | Path,
     server_script: str | Path | None = None,
@@ -224,6 +248,8 @@ def load_policy(
     (/package): reads there (the package and its dependencies) are added to
     runtime_allow, like {venv} for the fixtures. Reads only, never writes.
     """
+    if container_script:
+        check_scan_paths(path)  # scan mode: no relative paths (#123)
     script = Path(server_script).resolve() if server_script else None
     values = _placeholders(script, in_sandbox, multiarch, container_script)
 

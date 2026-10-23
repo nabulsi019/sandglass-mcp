@@ -77,6 +77,7 @@ def test_read_deny_is_optional_and_must_be_a_list_of_strings(tmp_path):
 def test_deny_applies_to_the_install_phase_too(tmp_path):
     # The install baseline allows reading npm's own files; denied, they count.
     data = real_policy()
+    data["filesystem"]["read_allow"] = ["/data"]  # a scan needs absolute paths (#123)
     data["filesystem"]["read_deny"] = ["/usr/share/nodejs/npm"]
     policy = load_policy(write(tmp_path, data), in_sandbox=True, multiarch="x86_64-linux-gnu",
                          container_script="/package/x/server.js", package_dir="/package")

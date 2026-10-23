@@ -93,6 +93,54 @@ def test_exit_code_is_the_verdict(verdict, code, monkeypatch):
     assert exit_info.value.code == code
 
 
+def relative_policy(tmp_path, key, entry="data"):
+    """read_only_folder.v1 with one relative path in filesystem.<key>."""
+    import yaml
+    data = yaml.safe_load(POLICY.read_text(encoding="utf-8"))
+    data["filesystem"][key] = [entry]
+    path = tmp_path / "policy.yaml"
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    return path
+
+
+RELATIVE = "policy path 'data' is relative; scans have no project folder, use an absolute path"
+
+
+@pytest.mark.parametrize("key", ["read_allow", "write_allow", "read_deny"])
+def test_scan_rejects_relative_policy_paths_before_anything_runs(key, tmp_path, monkeypatch, capsys):
+    # (#123) No Docker, no download: the scan stops at the command line.
+    monkeypatch.setattr(client, "run_scan", lambda *a: pytest.fail("must not run"))
+    monkeypatch.setattr(sandbox, "detect_multiarch", lambda: pytest.fail("must not start Docker"))
+    with pytest.raises(SystemExit) as exit_info:
+        client.scan_main(["pypi:pkg@1.0.0", "--policy", str(relative_policy(tmp_path, key))])
+    assert exit_info.value.code == 2
+    assert RELATIVE in capsys.readouterr().err
+
+
+def test_run_scan_rejects_relative_policy_paths_before_downloading(tmp_path, monkeypatch):
+    # Called directly (like check_fixtures.py does), the policy load stops it.
+    monkeypatch.setattr(sandbox, "detect_multiarch", lambda: "x86_64-linux-gnu")
+    monkeypatch.setattr(scan, "download", lambda *a: pytest.fail("must not download"))
+    from sandglass.policy import PolicyError
+    with pytest.raises(PolicyError, match="is relative; scans have no project folder"):
+        client.run_scan(parse_spec("pypi:pkg@1.0.0"), relative_policy(tmp_path, "read_allow"))
+
+
+@pytest.mark.parametrize("entry", ["/data", "{venv}"])
+def test_scan_accepts_absolute_paths_and_placeholders(entry, tmp_path):
+    from sandglass.policy import check_scan_paths
+    check_scan_paths(relative_policy(tmp_path, "read_allow", entry))  # no error
+
+
+def test_normal_runs_still_accept_relative_paths():
+    # notes_readonly.yaml uses test_servers/allowed_notes, relative to the project.
+    from sandglass.policy import load_policy
+    policy = load_policy(PROJECT_ROOT / "policies" / "notes_readonly.yaml",
+                         server_script=PROJECT_ROOT / "test_servers" / "good_notes_server.py",
+                         in_sandbox=True, multiarch="x86_64-linux-gnu")
+    assert [str(p) for p in policy.read_allow] == ["/project/test_servers/allowed_notes"]
+
+
 def test_sandglass_scan_goes_to_the_scan_command(monkeypatch):
     seen = []
     monkeypatch.setattr(client, "scan_main", seen.append)
