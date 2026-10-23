@@ -114,6 +114,7 @@ def docker_command(server_script: Path) -> tuple[str, list[str]]:
     # strace flags:
     #   -f               follow child processes and threads
     #   -tt              timestamp every line (microseconds)
+    #   -y               print the path behind each fd (#122)
     #   -e               only the syscalls we care about (TRACED_SYSCALLS)
     #   --kill-on-exit   if strace dies, the server dies too (no untraced tail)
     #   -o /proc/self/fd/2   write to strace's own stderr; strace opens it
@@ -134,7 +135,9 @@ def _traced_run_args(server_path: str, mounts: list[str], env: dict | None = Non
     (scan_run_command); only the mounts, the working directory and a few
     environment variables differ.
     """
-    strace = (f"exec strace -f -tt -e trace={TRACED_SYSCALLS} --kill-on-exit"
+    # -y (#122): print the file behind each fd, so a successful open shows the
+    # file it really opened (= 3</home/x>), even through a symlink.
+    strace = (f"exec strace -f -tt -y -e trace={TRACED_SYSCALLS} --kill-on-exit"
               f" -o /proc/self/fd/2 {CONTAINER_PYTHON} -S -c \"$1\" \"$2\" \"$3\" \"$4\" 3>/dev/null")
     env_args = [arg for name, value in (env or {}).items() for arg in ("-e", f"{name}={value}")]
     return [

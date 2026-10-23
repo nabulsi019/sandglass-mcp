@@ -257,6 +257,55 @@ def _bucket_for_failure_or_success(event: Event) -> str:
     return "attempted"
 
 
+def _record(event: Event, reason: str, phase: str, target: str | None = None) -> dict:
+    """One reported event (a violation or an attempt). `target` overrides the
+    event's path, e.g. a link's target or the file an open really opened."""
+    record = {
+        "reason": reason,
+        "syscall": event.syscall,
+        "target": target or event.target,
+        "mode": event.mode,
+        "timestamp": event.timestamp,
+        "phase": phase,
+        "pid": event.pid,
+        "succeeded": event.succeeded,
+        "error": event.error,
+        "evidence": event.raw,
+    }
+    if event.opened and event.opened != event.target:
+        # Both paths of an open through a symlink (#122).
+        record["requested"], record["opened"] = event.target, event.opened
+    return record
+
+
+def _file_problems(event: Event, allowed, readable, reason_for, link_reason: str) -> list[tuple[str, str]]:
+    """What's wrong with one file event: (reason, target) pairs, [] if nothing.
+
+    Shared by the server's run and the install (#122), so links are judged
+    the same way in every phase:
+      - the requested path AND, for a successful open, the file really opened
+        (strace -y): a violation if EITHER is not allowed (or in read_deny).
+        One record per open, naming the first bad path, with both paths in
+        its reason ("requested X, opened Y").
+      - a new symlink or hard link counts as a READ of where it points (#16):
+        a link in /tmp to ~/.aws/credentials would otherwise make reading the
+        credentials look like reading /tmp.
+    `allowed(path)` judges the event's own mode, `readable(path)` a read,
+    `reason_for(path)` words the first kind of problem.
+    """
+    problems = []
+    for path in dict.fromkeys(p for p in (event.target, event.opened) if p):  # requested, then opened
+        if not allowed(path):
+            reason = reason_for(path)
+            if event.opened and event.opened != event.target:
+                reason += f" (requested {event.target}, opened {event.opened})"
+            problems.append((reason, path))
+            break
+    if event.link_target and not readable(event.link_target):
+        problems.append((link_reason, event.link_target))
+    return problems
+
+
 def _program(event: Event, phase: str, note: str | None = None) -> dict:
     """One successful exec for the report's "Programs run" section (#120).
     Listed whether it was allowed or not: this is visibility, not a verdict."""
@@ -343,18 +392,27 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
                           "domain", True, None, event.raw)
 
         elif event.kind == "file":
-            if event.mode == "write":
-                allowed = _is_under(event.target, write_ok)
-            elif event.mode == "list":
-                # Exact entries match only the directory itself, never its children.
-                allowed = ((_is_under(event.target, read_ok) or event.target in map(str, policy.list_exact))
-                           and not _is_under(event.target, policy.read_deny))
-            else:
-                allowed = _is_under(event.target, read_ok) and not _is_under(event.target, policy.read_deny)
-            if allowed:
-                continue
-            reason = _file_reason(event.mode, event.target, policy.read_deny)
-            bucket = _bucket_for_failure_or_success(event)
+            def readable(path: str) -> bool:
+                return _is_under(path, read_ok) and not _is_under(path, policy.read_deny)
+
+            def allowed(path: str, mode=event.mode) -> bool:
+                if mode == "write":
+                    return _is_under(path, write_ok)
+                if mode == "list":
+                    # Exact entries match only the directory itself, never its children.
+                    return readable(path) or (path in map(str, policy.list_exact)
+                                              and not _is_under(path, policy.read_deny))
+                return readable(path)
+
+            # The requested path, the file really opened, and a link's target (#122).
+            problems = _file_problems(
+                event, allowed, readable,
+                lambda path: _file_reason(event.mode, path, policy.read_deny),
+                "linked to a path outside allowed reads")
+            for reason, target in problems:
+                (violations if _bucket_for_failure_or_success(event) == "violation" else attempted).append(
+                    _record(event, reason, phase_of(index), target))
+            continue
 
         elif event.kind == "probe":
             if _is_under(event.target, read_ok) and not _is_under(event.target, policy.read_deny):
@@ -406,19 +464,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
         else:
             continue  # exit events are only used for the completeness check
 
-        record = {
-            "reason": reason,
-            "syscall": event.syscall,
-            "target": event.target,
-            "mode": event.mode,
-            "timestamp": event.timestamp,
-            "phase": phase_of(index),
-            "pid": event.pid,
-            "succeeded": event.succeeded,
-            "error": event.error,
-            "evidence": event.raw,
-        }
-        (violations if bucket == "violation" else attempted).append(record)
+        (violations if bucket == "violation" else attempted).append(_record(event, reason, phase_of(index)))
 
     incomplete = _incomplete_reasons(events, server_launch, session)
     startup_exit = _startup_exit_reason(events, server_launch, relay_pid, session, server_errors)
@@ -554,30 +600,30 @@ def compare_install(events: list[Event], policy: Policy, baseline: InstallBaseli
         return _is_under(path, read_ok) and not _is_under(path, policy.read_deny)
 
     def record(event: Event, reason: str, bucket: str, target: str | None = None) -> None:
-        (violations if bucket == "violation" else attempted).append({
-            "reason": reason, "syscall": event.syscall, "target": target or event.target,
-            "mode": event.mode, "timestamp": event.timestamp, "phase": "install",
-            "pid": event.pid, "succeeded": event.succeeded, "error": event.error,
-            "evidence": event.raw,
-        })
+        (violations if bucket == "violation" else attempted).append(
+            _record(event, reason, "install", target))
 
     for event in events:
         if event.kind in ("file", "probe") and event.target == UNREADABLE:
             unreadable.append(event)
         elif event.kind == "file":
-            if event.mode == "write":
-                if not _is_under(event.target, write_ok):
-                    record(event, "install wrote outside /package and /tmp",
-                           _bucket_for_failure_or_success(event))
-                if event.link_target and not readable(event.link_target):
-                    record(event, "install linked to a path outside allowed reads",
-                           _bucket_for_failure_or_success(event), target=event.link_target)
-            elif (event.mode == "list" and event.target in map(str, baseline.list_exact)
-                  and not _is_under(event.target, policy.read_deny)):
-                continue  # e.g. pip listing /etc: that folder only, nothing inside it
-            elif not readable(event.target):
-                record(event, _file_reason(event.mode, event.target, policy.read_deny, "install "),
-                       _bucket_for_failure_or_success(event))
+            def allowed(path: str, mode=event.mode) -> bool:
+                if mode == "write":
+                    return _is_under(path, write_ok)
+                if mode == "list" and path in map(str, baseline.list_exact):
+                    # e.g. pip listing /etc: that folder only, nothing inside it
+                    return not _is_under(path, policy.read_deny)
+                return readable(path)
+
+            def reason_for(path: str, mode=event.mode) -> str:
+                if mode == "write":
+                    return "install wrote outside /package and /tmp"
+                return _file_reason(mode, path, policy.read_deny, "install ")
+
+            # Same rules as the server's run (#122): requested and opened path, links.
+            for reason, target in _file_problems(event, allowed, readable, reason_for,
+                                                 "install linked to a path outside allowed reads"):
+                record(event, reason, _bucket_for_failure_or_success(event), target=target)
         elif event.kind == "probe":
             if not readable(event.target):
                 entry = probes.setdefault(event.target, {

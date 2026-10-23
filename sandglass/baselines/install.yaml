@@ -25,6 +25,7 @@ read_allow:
   - /usr/share/node_modules         # same (Debian links some of them here)
   - /usr/lib/{multiarch}/nodejs     # same
   - /etc/os-release                 # pip and npm: which OS this is (user agent, platform tags)
+  - /usr/lib/os-release             # = /etc/os-release, which links here: where strace -y shows it opened (#122)
   - /etc/debian_version             # same
   - /etc/mime.types                 # pip: Python's mimetypes module
   - /etc/npmrc                      # npm's global config (none in the image)
