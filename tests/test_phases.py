@@ -70,12 +70,14 @@ def test_probes_and_domains_get_a_phase():
 
 # --- the relay itself ----------------------------------------------------------
 
-def test_relay_startup_and_markers_are_not_reported():
-    # Its Python startup looks for files that don't exist, like any Python.
+def test_relay_launch_and_markers_are_skipped_the_rest_is_judged():
+    # Only its exec and marker stats are skipped (#99). Its Python startup
+    # looks for files that don't exist, like any Python: listed as attempted.
     relay_startup = '7  10:00:00.000065 openat(AT_FDCWD, "/usr/share/locale/locale.alias", O_RDONLY) = -1 ENOENT (No such file or directory)'
     result = run([LAUNCH, relay_startup, TOOL_CALL, EXITED])
     assert result["verdict"] == "CLEAN"
-    assert result["probes"] == [] and result["attempted"] == []
+    assert result["probes"] == [] and result["violations"] == []
+    assert [(a["pid"], a["target"]) for a in result["attempted"]] == [(7, "/usr/share/locale/locale.alias")]
 
 
 def test_relay_missing_is_incomplete_and_phases_unknown():

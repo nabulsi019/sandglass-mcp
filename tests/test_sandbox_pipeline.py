@@ -303,6 +303,41 @@ def test_memfd_create_is_a_violation_and_a_failed_one_is_attempted():
     assert [a["target"] for a in result["attempted"]] == ["memfd:other"]
 
 
+# --- Sandglass's helpers are judged except for their known events (#99) ------
+
+# The sink is pid 9 and the relay pid 7 (see SINK_LINES and RELAY_START).
+CREDENTIALS_READ = 'openat(AT_FDCWD, "/home/sandglass/.aws/credentials", O_RDONLY|O_CLOEXEC) = 3'
+PUBLIC_CONNECT = 'connect(5, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("8.8.8.8")}, 16) = -1 ENETUNREACH (Network is unreachable)'
+SHELL_EXEC = 'execve("/bin/sh", ["sh", "-c", "id"], 0x0 /* 8 vars */) = 0'
+
+
+@pytest.mark.parametrize("helper_pid", ["7 ", "9 "])
+@pytest.mark.parametrize("call, expected", [
+    (CREDENTIALS_READ, ("read", "/home/sandglass/.aws/credentials")),
+    (PUBLIC_CONNECT, (None, '{sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("8.8.8.8")}')),
+    (SHELL_EXEC, (None, "/bin/sh")),
+])
+def test_anything_else_a_helper_does_is_judged_like_the_server(helper_pid, call, expected):
+    result = run([LAUNCH, f"{helper_pid} 10:00:00.2 {call}", EXITED])
+    assert [(v["mode"], v["target"]) for v in result["violations"]] == [expected]
+    assert result["violations"][0]["pid"] == int(helper_pid)
+
+
+def test_the_sinks_proxy_traffic_is_still_skipped():
+    # A proxy client being accepted, and a non-blocking accept with no client yet.
+    accepted = '9  10:00:00.3 accept4(0, {sa_family=AF_INET, sin_port=htons(54321), sin_addr=inet_addr("127.0.0.1")}, [16], SOCK_CLOEXEC) = 4'
+    no_client = '9  10:00:00.4 accept4(0, 0x7ffd0000, [16], SOCK_CLOEXEC) = -1 EAGAIN (Resource temporarily unavailable)'
+    result = run([LAUNCH, accepted, no_client, EXITED])
+    assert result["verdict"] == "CLEAN" and result["violations"] == []
+
+
+def test_a_helpers_launch_is_only_its_first_event():
+    # A second exec of the venv Python by the sink is not its launch.
+    again = '9  10:00:00.5 execve("/opt/venv/bin/python", ["python"], 0x0 /* 0 vars */) = 0'
+    result = run([LAUNCH, again, EXITED])
+    assert [v["target"] for v in result["violations"]] == ["/opt/venv/bin/python"]
+
+
 # --- io_uring (#75) ------------------------------------------------------------
 
 # As Node's libuv does at every startup (seen in the sandbox image); blocked by

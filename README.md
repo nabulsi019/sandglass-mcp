@@ -150,6 +150,12 @@ code runs. A server forging those stats from its own process just produces
 probes. The report's **Network** section lists every domain as allowed or
 not.
 
+The sink and the stdin relay run as the same user as the server, so an event
+in a helper's process isn't proof the helper's own code did it. Only an exact
+list of each helper's known events is skipped (its own launch, its markers,
+and for the sink its proxy socket and the isolation check). Anything else
+from those processes is judged like the server's (#99).
+
 At startup the sink also tries to `connect()` to `1.1.1.1:443` (the
 **isolation check**). It must fail. If it ever succeeds, or the sink never
 starts, the verdict is INCOMPLETE.
