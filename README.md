@@ -43,6 +43,7 @@ test_servers/        Fixture servers written for testing Sandglass. Not real tar
   shell_command_server.py    Same tool, but also runs `/bin/sh -c true`
   undeclared_domain_server.py  Same tool, but also sends a GET to undeclared.example (local sink only)
   good_notes_node_server.js  Node.js twin of good_notes_server (hand-written MCP, no npm packages)
+  missing_api_key_server.py  Exits at startup because its (fake) NOTES_API_KEY isn't set
   allowed_notes/             The only folder the notes servers are allowed to read
   decoy_home/                Fake "home" with an obviously fake credential file
 sandbox/
@@ -88,6 +89,7 @@ Expected verdicts:
 | undeclared_domain_server | VIOLATIONS | 1: domain `undeclared.example` (recorded by the local sink) |
 | good_notes_node_server.js | CLEAN | 0 (with the `node_debian` baseline) |
 | tamper_trace_server | VIOLATIONS | 3: list `/proc/1/fd`, read and write `/proc/1/fd/2` (all blocked with EACCES) |
+| missing_api_key_server | INCOMPLETE | 0; reason: exited during startup, `RuntimeError: NOTES_API_KEY is not set` |
 
 Every run must also show the sink reporting the isolation check as isolated (no route to the internet).
 
@@ -278,7 +280,10 @@ code runs, so the server can't fake the boundary. If the marker is missing
 although tools were called, the phase is **unknown** (with the reason in the
 report), never guessed.
 
-The verdict is **INCOMPLETE**, and never clean, if the server didn't start, the MCP
+The verdict is **INCOMPLETE**, and never clean, if the server didn't start or
+exited during startup (e.g. it needs an API key or a real account: the report
+gives its exit status and, for Python servers, the error message the launcher
+recorded in the trace, since the server's stderr is discarded), the MCP
 session failed, no tool was exercised, the trace is missing or has no
 `+++ exited` line for the server (a truncated trace), the network sink didn't
 start, the sink didn't report the isolation check as isolated, or the stdin relay didn't

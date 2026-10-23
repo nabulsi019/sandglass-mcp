@@ -59,6 +59,14 @@ def result_text(result) -> tuple[str, str]:
     return ("ERROR" if result.is_error else "OK"), "\n".join(texts).strip()
 
 
+def describe_error(exc: BaseException) -> str:
+    """"Type: message" for the report. anyio wraps errors in an ExceptionGroup
+    ("unhandled errors in a TaskGroup"), so name the first real error inside."""
+    while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
+        exc = exc.exceptions[0]
+    return f"{type(exc).__name__}: {exc}"
+
+
 def print_policy(policy: Policy, enforced: bool) -> None:
     """Print the policy. `enforced` is True only in --sandbox mode, where the
     trace is compared with it; host mode just loads and shows it."""
@@ -155,7 +163,7 @@ def run_sandboxed(server_script: Path, policy_path: Path) -> dict:
         except BaseException as exc:  # includes ExceptionGroup from anyio task groups
             if isinstance(exc, KeyboardInterrupt):
                 raise
-            session = {"tools": [], "calls": [], "error": f"{type(exc).__name__}: {exc}"}
+            session = {"tools": [], "calls": [], "error": describe_error(exc)}
             print(f"Session failed: {session['error']}")
 
     trace_text = trace_file.read_text(encoding="utf-8", errors="replace") if trace_file.exists() else ""
