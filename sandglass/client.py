@@ -1,7 +1,8 @@
 """Minimal Sandglass client.
 
 Launches an MCP server as a subprocess over stdio, lists its tools, calls
-each tool once with a simple safe input, and prints what came back.
+each tool once with a valid, harmless input built from its JSON schema
+(sandglass/inputs.py), and prints what came back.
 
 With --sandbox, the server runs inside Docker under strace instead, and
 afterwards the trace is compared with the policy and a report is written
@@ -25,12 +26,9 @@ from mcp.types import CallToolResult, TextContent, Tool
 
 from sandglass import PROJECT_ROOT, sandbox
 from sandglass.compare import build_report, compare, write_reports
+from sandglass.inputs import InputError, build_arguments
 from sandglass.policy import BASELINE_FILES, Policy, load_policy
 from sandglass.trace_parser import parse_trace
-
-# The one input value we use for every string argument. For the notes
-# servers this means read_note("hello") -> allowed_notes/hello.txt.
-SAFE_STRING = "hello"
 
 REPORTS_DIR = PROJECT_ROOT / "reports"
 
@@ -42,13 +40,9 @@ EXIT_CODES = {"CLEAN": 0, "VIOLATIONS": 1, "INCOMPLETE": 2}
 
 
 def build_safe_arguments(tool: Tool) -> dict:
-    """Build a harmless argument dict from the tool's JSON input schema."""
-    defaults = {"string": SAFE_STRING, "integer": 1, "number": 1.0, "boolean": False}
-    properties = tool.input_schema.get("properties", {})
-    return {
-        name: defaults.get(spec.get("type"), SAFE_STRING)
-        for name, spec in properties.items()
-    }
+    """Build a harmless, valid argument dict from the tool's JSON input schema
+    (see sandglass/inputs.py). Raises InputError if the schema is unsupported."""
+    return build_arguments(tool.input_schema)
 
 
 def result_text(result) -> tuple[str, str]:
@@ -92,7 +86,8 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
     `errlog` receives the subprocess's stderr. In the sandbox that stream is
     the strace trace, so run_sandboxed passes the trace file here.
     """
-    session_record = {"tools": [], "calls": []}
+    # calls: tools that were called; skipped: tools we couldn't build an input for.
+    session_record = {"tools": [], "calls": [], "skipped": []}
 
     # stdio_client spawns the subprocess and gives us its stdin/stdout streams.
     async with stdio_client(params, errlog=errlog) as (read_stream, write_stream):
@@ -109,7 +104,13 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
             print()
 
             for tool in tools:
-                args = build_safe_arguments(tool)
+                try:
+                    args = build_safe_arguments(tool)
+                except InputError as exc:
+                    # Not guessed: the tool isn't called, and the report says why.
+                    print(f"Skipping {tool.name}: no valid input ({exc})")
+                    session_record["skipped"].append({"tool": tool.name, "reason": f"no valid input: {exc}"})
+                    continue
                 print(f"Calling {tool.name}({args})")
                 result = await session.call_tool(tool.name, args)
                 status, text = result_text(result)
