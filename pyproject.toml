@@ -8,6 +8,7 @@ license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 dependencies = [
     "mcp>=2.3.0",
+    "pip>=25.0",
     "pyyaml>=6.0.3",
 ]
 

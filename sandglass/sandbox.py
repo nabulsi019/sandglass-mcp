@@ -118,9 +118,24 @@ def docker_command(server_script: Path) -> tuple[str, list[str]]:
     #   --kill-on-exit   if strace dies, the server dies too (no untraced tail)
     #   -o /proc/self/fd/2   write to strace's own stderr; strace opens it
     #                    close-on-exec, so the server doesn't inherit that copy
+    mounts = [
+        "-v", f"{PROJECT_ROOT}:{CONTAINER_PROJECT}:ro",
+        # Cover reports/ (old reports, traces) with an empty, read-only folder.
+        "--mount", f"type=tmpfs,destination={CONTAINER_REPORTS},tmpfs-mode=0555",
+    ]
+    return docker, _traced_run_args(str(to_container_path(server_script)), mounts)
+
+
+def _traced_run_args(server_path: str, mounts: list[str], env: dict | None = None) -> list[str]:
+    """`docker run` arguments that run one server under strace, hardened.
+
+    Shared by the fixture mode (docker_command) and scan mode
+    (scan_run_command); only the mounts and a few environment variables differ.
+    """
     strace = (f"exec strace -f -tt -e trace={TRACED_SYSCALLS} --kill-on-exit"
               f" -o /proc/self/fd/2 {CONTAINER_PYTHON} -S -c \"$1\" \"$2\" \"$3\" \"$4\" 3>/dev/null")
-    args = [
+    env_args = [arg for name, value in (env or {}).items() for arg in ("-e", f"{name}={value}")]
+    return [
         "run",
         "-i",                       # keep stdin open: it's the MCP stdio channel
         "--rm",                     # delete the container when it exits
@@ -129,14 +144,97 @@ def docker_command(server_script: Path) -> tuple[str, list[str]]:
         "--tmpfs", "/tmp",          # ...except a scratch /tmp in memory
         "--user", CONTAINER_USER,   # never root inside the container
         "-e", f"HOME={CONTAINER_HOME}",  # the decoy home, never the host's
-        "-v", f"{PROJECT_ROOT}:{CONTAINER_PROJECT}:ro",
-        # Cover reports/ (old reports, traces) with an empty, read-only folder.
-        "--mount", f"type=tmpfs,destination={CONTAINER_REPORTS},tmpfs-mode=0555",
+        *env_args,
+        *mounts,
         "-w", str(CONTAINER_PROJECT),
         IMAGE,
         # sh runs before strace, so it isn't traced. "$1".."$4" are the launcher
         # code, the server path, the sink code and the relay code, as separate arguments.
         "sh", "-c", strace, "sandglass-launch",
-        LAUNCHER, str(to_container_path(server_script)), NETSINK, STDIN_RELAY,
+        LAUNCHER, server_path, NETSINK, STDIN_RELAY,
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Scan mode (`sandglass scan`, #19): install a package, then run it
+# ---------------------------------------------------------------------------
+
+# Where the scanned package is installed: a fresh Docker volume per scan,
+# writable only for the install container, read-only for the server.
+CONTAINER_PACKAGE = PurePosixPath("/package")
+# Python packages go here (pip install --target); the launcher adds it to sys.path.
+CONTAINER_SITE = CONTAINER_PACKAGE / "site"
+# The files downloaded on the host, mounted read-only into the install container.
+CONTAINER_DOWNLOAD = PurePosixPath("/download")
+# The interpreter with pip (the image's /opt/venv, made by uv, has no pip).
+CONTAINER_SYSTEM_PYTHON = PurePosixPath("/usr/local/bin/python")
+
+
+def create_volume(name: str) -> None:
+    """A new, empty Docker volume. Mounted at /package, it starts as a copy of
+    the image's empty /package (owned by the sandbox user), so it's writable."""
+    _docker(["volume", "create", name], "create the install volume")
+
+
+def remove_volume(name: str) -> None:
+    """Delete the volume (and the installed package) after the scan."""
+    subprocess.run([shutil.which("docker") or "docker", "volume", "rm", "-f", name],
+                   capture_output=True, text=True, timeout=60)
+
+
+def _docker(args: list[str], what: str) -> subprocess.CompletedProcess:
+    docker = shutil.which("docker") or "docker"
+    try:
+        out = subprocess.run([docker, *args], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SandboxError(f"could not {what}: {exc}") from None
+    if out.returncode != 0:
+        raise SandboxError(f"could not {what}: {out.stderr.strip()[:200]}")
+    return out
+
+
+def scan_install_command(volume: str, download_dir: Path, script: str, script_args: list[str],
+                         env: dict | None = None) -> tuple[str, list[str]]:
+    """`docker run` that installs the downloaded files into the volume.
+
+    Same hardening as the server's container (no network, read-only root,
+    non-root, decoy home, no extra capabilities). The ONLY writable places are
+    the volume at /package and the scratch /tmp. `script` is a fixed shell
+    script from scan.py; package names only ever reach it as "$@" arguments.
+    """
+    docker = shutil.which("docker") or "docker"
+    env_args = [arg for name, value in (env or {}).items() for arg in ("-e", f"{name}={value}")]
+    args = [
+        "run", "--rm",
+        "--network", "none",        # offline: everything comes from /download
+        "--read-only",
+        "--tmpfs", "/tmp",
+        "--user", CONTAINER_USER,
+        "-e", f"HOME={CONTAINER_HOME}",
+        *env_args,
+        "-v", f"{download_dir}:{CONTAINER_DOWNLOAD}:ro",
+        "-v", f"{volume}:{CONTAINER_PACKAGE}",   # the one writable mount
+        "-w", str(CONTAINER_PACKAGE),
+        IMAGE,
+        "sh", "-c", script, "sandglass-install", *script_args,
     ]
     return docker, args
+
+
+def scan_run_command(volume: str, server_path: str, runtime: str) -> tuple[str, list[str]]:
+    """`docker run` that runs the installed package's server under strace.
+
+    The volume is mounted READ-ONLY at /package. (The project is still
+    mounted too, like for fixtures; #20 removes it.)
+    """
+    docker = shutil.which("docker") or "docker"
+    mounts = [
+        "-v", f"{PROJECT_ROOT}:{CONTAINER_PROJECT}:ro",
+        "--mount", f"type=tmpfs,destination={CONTAINER_REPORTS},tmpfs-mode=0555",
+        "-v", f"{volume}:{CONTAINER_PACKAGE}:ro",
+    ]
+    # Read by the launcher after the fd swap (sandglass/launcher.py, step 4).
+    env = {"SANDGLASS_RUNTIME": runtime}
+    if runtime == "python":
+        env["SANDGLASS_SITE_DIR"] = str(CONTAINER_SITE)
+    return docker, _traced_run_args(server_path, mounts, env)

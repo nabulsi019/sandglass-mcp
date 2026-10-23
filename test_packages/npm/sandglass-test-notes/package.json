@@ -1,0 +1,10 @@
+{
+  "name": "sandglass-test-notes",
+  "version": "1.0.0",
+  "description": "Sandglass test package: reads notes from its own notes/ folder. Never published.",
+  "license": "Apache-2.0",
+  "private": true,
+  "bin": {
+    "sandglass-test-notes": "server.js"
+  }
+}

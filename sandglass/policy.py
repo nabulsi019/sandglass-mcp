@@ -62,10 +62,16 @@ class Policy:
     baseline_read_allow: list[Path] = field(default_factory=list)  # sandbox only: READS only
 
 
-def _placeholders(server_script: Path | None, in_sandbox: bool, multiarch: str | None) -> dict[str, str]:
-    """Values for the {placeholders}, as host paths or container paths."""
+def _placeholders(server_script: Path | None, in_sandbox: bool, multiarch: str | None,
+                  container_script: str | None = None) -> dict[str, str]:
+    """Values for the {placeholders}, as host paths or container paths.
+    `container_script` (scan mode) is already a container path, e.g.
+    /package/site/bin/<script>: there is no host file to map."""
     if in_sandbox:
-        script = str(sandbox.to_container_path(server_script)) if server_script else ""
+        if container_script:
+            script = container_script
+        else:
+            script = str(sandbox.to_container_path(server_script)) if server_script else ""
         return {
             "python_base": str(sandbox.CONTAINER_PYTHON_BASE),
             "venv": str(sandbox.CONTAINER_VENV),
@@ -164,6 +170,8 @@ def load_policy(
     in_sandbox: bool = False,
     multiarch: str | None = None,
     runtime: str = "python",
+    container_script: str | None = None,
+    package_dir: str | None = None,
 ) -> Policy:
     """Read a YAML policy file and return a validated Policy.
 
@@ -173,9 +181,13 @@ def load_policy(
     `in_sandbox` switches to container paths and loads the container baseline;
     `multiarch` (asked from the container) fills {multiarch} in the baseline.
     `runtime` ("python" or "node") picks which baselines are loaded.
+    Scan mode (`sandglass scan`, #19) passes `container_script` (the entry
+    point inside the container) instead of `server_script`, and `package_dir`
+    (/package): reads there (the package and its dependencies) are added to
+    runtime_allow, like {venv} for the fixtures. Reads only, never writes.
     """
     script = Path(server_script).resolve() if server_script else None
-    values = _placeholders(script, in_sandbox, multiarch)
+    values = _placeholders(script, in_sandbox, multiarch, container_script)
 
     data = _read_yaml(path)
     filesystem = _require(data, "filesystem", dict, "")
@@ -189,6 +201,8 @@ def load_policy(
             list_exact.append(_expand(item[1:], values, in_sandbox))
         else:
             runtime_allow.append(_expand(item, values, in_sandbox))
+    if package_dir:
+        runtime_allow.append(PurePosixPath(package_dir))  # the installed package: reads only
 
     baseline_name, baseline_read_allow = None, []
     if in_sandbox:

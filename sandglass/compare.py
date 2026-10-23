@@ -531,20 +531,36 @@ def coverage(session: dict) -> dict:
 # Report writing
 # ---------------------------------------------------------------------------
 
+def not_run(reason: str) -> dict:
+    """compare()'s result for a scan whose server never ran (#19): the
+    download or the install failed. INCOMPLETE, with nothing observed."""
+    return {
+        "verdict": "INCOMPLETE", "incomplete_reasons": [reason],
+        "violations": [], "attempted": [], "probes": [], "domains": [],
+        "network_isolation": None, "phase_note": "the server was not run",
+        "event_counts": {kind: 0 for kind in ("file", "probe", "process", "network", "io_uring", "exit")},
+    }
+
+
 def build_report(server: str, timestamp: str, policy: Policy, session: dict,
-                 result: dict, trace_file: Path, path_mapping: dict,
-                 baseline: dict) -> dict:
-    """Assemble everything into the final report dict."""
+                 result: dict, trace_file: Path | None, path_mapping: dict,
+                 baseline: dict, package: dict | None = None) -> dict:
+    """Assemble everything into the final report dict.
+
+    `package` (scan mode, #19): what was scanned, downloaded and installed.
+    `trace_file` is None if the server never ran.
+    """
     return {
         "server": server,
         "timestamp": timestamp,
         "verdict": result["verdict"],
         "incomplete_reasons": result["incomplete_reasons"],
+        "package": package,
         "policy": {k: (v if v is None or isinstance(v, (str, bool)) else [str(p) for p in v])
                    for k, v in asdict(policy).items()},
         "baseline": baseline,  # which container baseline was applied, and how
         "path_mapping": path_mapping,
-        "trace_file": str(trace_file),
+        "trace_file": str(trace_file) if trace_file else None,
         "exercised": session.get("calls", []),
         "tools": session.get("tools", []),
         "coverage": coverage(session),  # ran / failed / skipped per tool (#23)
@@ -580,13 +596,14 @@ def _markdown(r: dict) -> str:
         f"- Policy: `{r['policy']['name']}`",
         f"- Baseline: `{r['baseline']['name']}` (`{r['baseline']['file']}`,"
         f" multiarch `{r['baseline']['multiarch']}`; reads only)",
-        f"- Trace: `{r['trace_file']}`",
+        f"- Trace: `{r['trace_file']}`" if r["trace_file"] else "- Trace: none (the server was not run)",
         f"- Violations: {len(r['violations'])} · Attempted: {len(r['attempted'])}"
         f" · Probes: {len(r['probes'])}",
     ]
     if r["incomplete_reasons"]:
         out += ["", "## Why INCOMPLETE", ""]
         out += [f"- {reason}" for reason in r["incomplete_reasons"]]
+    out += _package_section(r)
 
     out += ["", "## Tools exercised", ""]
     if r["exercised"]:
@@ -617,6 +634,23 @@ def _markdown(r: dict) -> str:
     counts = ", ".join(f"{k}: {v}" for k, v in r["event_counts"].items())
     out += ["", f"Event counts: {counts}", ""]
     return "\n".join(out)
+
+
+def _package_section(r: dict) -> list[str]:
+    """Scan mode (#19): what was scanned, where it came from, how it was started."""
+    p = r.get("package")
+    if not p:
+        return []
+    lines = ["", "## Package", "",
+             f"- Spec: `{p['spec']}` (from {p['source']})",
+             f"- Install: {p['install']}"]
+    if p["entry"]:
+        lines.append(f"- Entry point: `{p['entry']['name']}` = `{p['entry']['path']}`")
+    else:
+        lines.append("- Entry point: none (not reached)")
+    lines += ["- Downloaded on the host:" if p["files"] else "- Downloaded on the host: nothing"]
+    lines += [f"  - `{f['name']}` ({f['size']} bytes)" for f in p["files"]]
+    return lines
 
 
 def _coverage_section(r: dict) -> list[str]:

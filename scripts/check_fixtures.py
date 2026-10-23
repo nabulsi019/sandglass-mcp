@@ -1,5 +1,8 @@
 """Run every fixture in the sandbox and check its verdict and exact violations.
 
+Also builds our own test packages (test_packages/ -> test_packages/dist/) and
+scans them with `sandglass scan` from that local folder (#19), no network.
+
 Used before opening a PR and by the CI sandbox job. Exits 0 only if every
 fixture matches its expectation exactly.
 
@@ -7,10 +10,13 @@ fixture matches its expectation exactly.
     uv run python scripts/check_fixtures.py
 """
 
+import importlib.util
 import sys
+from pathlib import Path
 
 from sandglass import PROJECT_ROOT
-from sandglass.client import run_sandboxed
+from sandglass.client import run_sandboxed, run_scan
+from sandglass.scan import parse_spec
 
 POLICY = PROJECT_ROOT / "policies" / "notes_readonly.yaml"
 
@@ -67,6 +73,26 @@ EXPECTED_V04 = {
 }
 
 
+# `sandglass scan` of our own test packages (#19), from the local test
+# registry that scripts/build_test_packages.py builds (no network). Also v0.4,
+# not protected yet. package spec -> (expected verdict, expected violations)
+SCAN_POLICY = PROJECT_ROOT / "policies" / "templates" / "read_only_folder.v1.yaml"
+TEST_REGISTRY = PROJECT_ROOT / "test_packages" / "dist"
+EXPECTED_SCANS = {
+    "pypi:sandglass-test-notes@1.0.0": ("CLEAN", set()),
+    "npm:sandglass-test-notes@1.0.0": ("CLEAN", set()),
+}
+
+
+def build_test_packages() -> None:
+    """Build test_packages/dist/ (scripts/build_test_packages.py) before the scans."""
+    path = Path(__file__).with_name("build_test_packages.py")
+    spec = importlib.util.spec_from_file_location("build_test_packages", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.build_all()
+
+
 def in_order(violations) -> list:
     """(mode, target) pairs in a fixed order. An exec's mode is None, which
     Python can't compare with a string mode, so it sorts as "" (#101)."""
@@ -117,11 +143,18 @@ def main() -> int:
         failures += [f"{fixture}: INCOMPLETE reasons don't mention {text!r}: {reasons}"
                      for text in want_reasons if text not in reasons]
 
+    build_test_packages()
+    for package, (want_verdict, want_violations) in EXPECTED_SCANS.items():
+        print(f"\n===== scan {package} =====")
+        report = run_scan(parse_spec(package), SCAN_POLICY, TEST_REGISTRY)
+        failures += check(package, report, want_verdict, want_violations)
+
     print("\n===== summary =====")
     for line in failures:
         print("FAIL", line)
     if not failures:
-        print(f"all {len(EXPECTED) + len(EXPECTED_V04)} fixtures match expectations")
+        total = len(EXPECTED) + len(EXPECTED_V04) + len(EXPECTED_SCANS)
+        print(f"all {total} fixtures match expectations")
     return 1 if failures else 0
 
 

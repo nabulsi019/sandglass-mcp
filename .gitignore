@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 reports/*
 !reports/.gitkeep
+test_packages/dist/
