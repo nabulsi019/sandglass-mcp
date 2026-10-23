@@ -73,10 +73,10 @@ def main() -> int:
         if wrong_phase:
             failures.append(f"{fixture}: violations outside the tool-call phase: {wrong_phase}")
 
-        # Every run: the sandbox must have no route out (the sink's check failed)...
+        # Every run: the sandbox must have no route out (the sink reported "isolated")...
         isolation = report["network_isolation"]
-        if not isolation or isolation["succeeded"]:
-            failures.append(f"{fixture}: network isolation check did not fail: {isolation}")
+        if not isolation or not isolation["isolated"]:
+            failures.append(f"{fixture}: network isolation check did not report isolated: {isolation}")
         # ...and the sink logged exactly the requests we expect.
         domains = [(d["method"], d["host"], d["port"]) for d in report["domains"]]
         if domains != EXPECTED_DOMAINS.get(fixture, []):

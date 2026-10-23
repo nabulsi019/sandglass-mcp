@@ -35,6 +35,7 @@ SINK_LINES = [
     '9  10:00:00.000020 bind(0, {sa_family=AF_INET, sin_port=htons(18080), sin_addr=inet_addr("127.0.0.1")}, 16) = 0',
     '9  10:00:00.000030 listen(0, 16)     = 0',
     '9  10:00:00.000040 connect(1, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("1.1.1.1")}, 16) = -1 ENETUNREACH (Network is unreachable)',
+    '9  10:00:00.000045 newfstatat(AT_FDCWD, "/sandglass-isolation/isolated/ENETUNREACH", 0x7ffe8cb57b40, 0) = -1 ENOENT (No such file or directory)',
     '9  10:00:00.000050 newfstatat(AT_FDCWD, "/sandglass-netsink/ready", 0x7ffe8cb57b40, 0) = -1 ENOENT (No such file or directory)',
 ]
 

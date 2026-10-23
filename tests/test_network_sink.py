@@ -4,6 +4,8 @@ Hand-written strace lines, so no Docker needed. The sink's startup lines
 come from tests/test_sandbox_pipeline.py's run() helper.
 """
 
+import errno
+
 import pytest
 
 from sandglass import launcher, netsink
@@ -94,8 +96,23 @@ def test_bad_allow_domains_entry(tmp_path):
 def test_sink_startup_is_not_a_violation_and_isolation_is_reported():
     result = run([LAUNCH, EXITED])
     assert result["verdict"] == "CLEAN"
-    assert result["network_isolation"]["succeeded"] is False
-    assert result["network_isolation"]["error"] == "ENETUNREACH"
+    assert result["network_isolation"]["isolated"] is True
+    assert result["network_isolation"]["outcome"] == "ENETUNREACH"
+
+
+@pytest.mark.parametrize("raised, expected", [
+    (OSError(errno.ENETUNREACH, "Network is unreachable"), ("isolated", "ENETUNREACH")),
+    (OSError(errno.EHOSTUNREACH, "No route to host"), ("not-isolated", "EHOSTUNREACH")),
+    (OSError(errno.ECONNREFUSED, "Connection refused"), ("not-isolated", "ECONNREFUSED")),
+    (TimeoutError("timed out"), ("not-isolated", "timeout")),
+    (OSError("no errno"), ("not-isolated", "unknown-error")),
+    (None, ("not-isolated", "connected")),  # the connect worked
+])
+def test_isolation_result_is_decided_after_the_connect_finished(raised, expected):
+    def connect():
+        if raised is not None:
+            raise raised
+    assert netsink.isolation_result(connect) == expected
 
 
 def test_server_cannot_forge_sink_records():
@@ -137,11 +154,43 @@ def test_missing_sink_is_incomplete():
     assert any("network sink did not start" in r for r in result["incomplete_reasons"])
 
 
-def test_reaching_the_internet_is_incomplete():
-    lines = [LAUNCH,
-             '9  10:00:00.1 connect(1, {sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("1.1.1.1")}, 16) = 0',
-             '9  10:00:00.2 newfstatat(AT_FDCWD, "/sandglass-netsink/ready", 0x7f, 0) = -1 ENOENT (No such file or directory)',
-             EXITED]
-    result = run(lines, sink=False)
+# --- the isolation check (#100): only the sink's own report counts ------------
+
+ISOLATION_CONNECT_IN_PROGRESS = ('9  10:00:00.1 connect(1, {sa_family=AF_INET, sin_port=htons(443), '
+                                 'sin_addr=inet_addr("1.1.1.1")}, 16) = -1 EINPROGRESS (Operation now in progress)')
+SINK_READY_LINE = '9  10:00:00.3 newfstatat(AT_FDCWD, "/sandglass-netsink/ready", 0x7f, 0) = -1 ENOENT (No such file or directory)'
+
+
+def isolation_marker(result, outcome, pid=9, time="10:00:00.2"):
+    return (f'{pid}  {time} newfstatat(AT_FDCWD, "/sandglass-isolation/{result}/{outcome}", 0x7f, 0)'
+            ' = -1 ENOENT (No such file or directory)')
+
+
+def sink_run(*sink_lines):
+    """A run whose sink startup is exactly these lines (instead of SINK_LINES)."""
+    return run([LAUNCH, *sink_lines, EXITED], sink=False)
+
+
+@pytest.mark.parametrize("outcome", ["connected", "timeout", "ECONNREFUSED", "EHOSTUNREACH"])
+def test_not_isolated_is_incomplete(outcome):
+    # A host with a route out: the connect's first errno is EINPROGRESS, which
+    # used to read as "failed, so isolated". Only the sink's report counts now.
+    result = sink_run(ISOLATION_CONNECT_IN_PROGRESS, isolation_marker("not-isolated", outcome), SINK_READY_LINE)
     assert result["verdict"] == "INCOMPLETE"
-    assert any("reached the internet" in r for r in result["incomplete_reasons"])
+    assert any(r.startswith("the sandbox may reach the internet") and outcome in r
+               for r in result["incomplete_reasons"])
+    assert result["network_isolation"]["isolated"] is False
+
+
+def test_missing_isolation_result_is_incomplete():
+    result = sink_run(ISOLATION_CONNECT_IN_PROGRESS, SINK_READY_LINE)
+    assert result["verdict"] == "INCOMPLETE"
+    assert "the network isolation result is missing from the trace" in result["incomplete_reasons"]
+
+
+def test_isolation_result_from_another_process_or_after_ready_is_ignored():
+    forged = isolation_marker("isolated", "ENETUNREACH", pid=10)                 # the server's pid
+    late = isolation_marker("isolated", "ENETUNREACH", time="10:00:00.4")       # the sink, after ready
+    result = sink_run(ISOLATION_CONNECT_IN_PROGRESS, forged, SINK_READY_LINE, late)
+    assert result["verdict"] == "INCOMPLETE"
+    assert result["network_isolation"] is None
