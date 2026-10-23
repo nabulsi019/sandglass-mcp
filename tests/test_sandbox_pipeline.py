@@ -39,9 +39,28 @@ SINK_LINES = [
 ]
 
 
-def run(lines, session=SESSION_OK, sink=True, policy=None):
-    """Compare a hand-written trace. Unless sink=False, the sink's startup lines
-    are slipped in right after the first line (the launch), like in a real run."""
+# The stdin relay (sandglass/stdin_relay.py, #91): its exec and ready marker at
+# startup, its tool-call marker, and at the end its eof marker and clean exit.
+RELAY_START = [
+    '7  10:00:00.000060 execve("/opt/venv/bin/python", ["/opt/venv/bin/python", "-I", "-S", "-c", "..."], 0x0 /* 0 vars */) = 0',
+    '7  10:00:00.000070 newfstatat(AT_FDCWD, "/sandglass-phase/ready", 0x7ffe8cb57b40, 0) = -1 ENOENT (No such file or directory)',
+]
+TOOL_CALL = '7  10:00:00.000500 newfstatat(AT_FDCWD, "/sandglass-phase/tool-call", 0x7ffe8cb57b40, 0) = -1 ENOENT (No such file or directory)'
+RELAY_END = [
+    '7  10:00:00.900000 newfstatat(AT_FDCWD, "/sandglass-phase/eof", 0x7ffe8cb57b40, 0) = -1 ENOENT (No such file or directory)',
+    "7  10:00:00.900100 +++ exited with 0 +++",
+]
+
+
+def run(lines, session=SESSION_OK, sink=True, relay=True, policy=None):
+    """Compare a hand-written trace, with Sandglass's helpers added like in a
+    real run (unless sink=False / relay=False): the sink's and the relay's
+    startup lines right after the first line (the launch), then at the end the
+    relay's tool-call marker (unless the test placed its own TOOL_CALL), its
+    eof marker and its exit. So by default every event is in "startup"."""
+    if lines and relay:
+        end = ([] if TOOL_CALL in lines else [TOOL_CALL]) + RELAY_END
+        lines = lines[:1] + RELAY_START + lines[1:] + end
     if sink and lines:
         lines = lines[:1] + SINK_LINES + lines[1:]
     return compare(parse_trace("\n".join(lines)), policy or sandbox_policy(), session)
@@ -261,11 +280,12 @@ def test_trace_is_never_a_file_in_the_container():
 
 
 def test_launcher_closes_the_trace_stream_before_loading_packages():
-    # In main(): fd 2 swapped and fd 3 closed before the sink starts, before
-    # site.main() (which runs .pth files) and before the server itself runs.
+    # In main(): fd 2 swapped and fd 3 closed before the sink and the stdin
+    # relay start, before site.main() (which runs .pth files) and before the
+    # server itself runs.
     main = sandbox.LAUNCHER[sandbox.LAUNCHER.index("def main()"):]
     order = ["os.dup2(3, 2)", "os.close(3)", "sys.path[0] =", "start_sink(",
-             "site.main()", "runpy.run_path("]
+             "start_relay(", "site.main()", "runpy.run_path("]
     positions = [main.index(step) for step in order]
     assert positions == sorted(positions)
 

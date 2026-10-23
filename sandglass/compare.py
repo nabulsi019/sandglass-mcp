@@ -22,6 +22,9 @@ Rules (one place, so they're easy to explain):
   launcher waits for before any server code runs) is Sandglass, not the
   server: its own exec and sockets are not violations. Its startup connect to
   a public IP is the isolation check; if that ever succeeds -> INCOMPLETE.
+  The stdin relay (sandglass/stdin_relay.py) is found the same way, from its
+  own "ready" marker; none of its own events are reported. If it ends before
+  the client closed stdin (no "eof" marker, or not a clean exit) -> INCOMPLETE.
   Process exec:
     the first exec in the trace is the server itself -> allowed
     (Node servers: the launcher then execs node in that same process; that
@@ -30,15 +33,19 @@ Rules (one place, so they're easy to explain):
 
 Phases (#18): every reported event gets a phase:
   install    nothing is installed at run time yet (see #16), so always empty
-  startup    before the client sent its first tool call
+  startup    before the first tool call reached the server
   tool-call  from the first tool call on
-  The boundary is the client's UTC clock just before the first call_tool,
-  compared with strace's -tt times (same clock, UTC inside the container).
+  unknown    the boundary is missing from the trace; never guessed
+  The boundary is the stdin relay's "tool-call" marker (#91): events before
+  that line in the trace are startup, events after it are tool-call. Only the
+  ORDER of lines is used, never a clock, and only the relay's own marker counts.
 
 Verdicts:
   INCOMPLETE  the run can't be trusted: the server didn't start, the session
               errored, nothing was exercised, the trace is missing/truncated,
-              the network sink didn't start, or the sandbox could reach the internet.
+              the network sink didn't start, the sandbox could reach the internet,
+              or the stdin relay didn't start or ended early (the server may have
+              tampered with it).
               Never treated as clean, even when no violations were seen.
   VIOLATIONS  at least one violation.
   CLEAN       a complete run with zero violations.
@@ -48,7 +55,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-from sandglass import netsink, sandbox
+from sandglass import netsink, sandbox, stdin_relay
 from sandglass.policy import Policy
 from sandglass.trace_parser import Event
 
@@ -63,14 +70,6 @@ def _is_under(path: str, roots: list) -> bool:
         if path == root or path.startswith(root.rstrip("/") + "/"):
             return True
     return False
-
-
-def _sink_pid(events: list[Event]) -> int | None:
-    """The network sink's pid: the FIRST process to stat the sink's ready marker."""
-    for event in events:
-        if event.kind == "probe" and event.target == netsink.SINK_READY:
-            return event.pid
-    return None
 
 
 def _is_address(target: str, host: str, port: int) -> bool:
@@ -96,28 +95,49 @@ def _domain_allowed(host: str, policy: Policy) -> bool:
     return False
 
 
-PHASES = ("install", "startup", "tool-call")
+PHASES = ("install", "startup", "tool-call", "unknown")
 
 
-def _seconds(timestamp: str) -> float:
-    """'HH:MM:SS.micro' -> seconds since midnight."""
-    hours, minutes, seconds = timestamp.split(":")
-    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+def _first_pid_to_stat(events: list[Event], path: str) -> int | None:
+    """The pid of the FIRST process to stat a marker path (Sandglass's own helpers)."""
+    for event in events:
+        if event.kind == "probe" and event.target == path:
+            return event.pid
+    return None
 
 
-def _phase_of(events: list[Event], session: dict):
-    """Return a function timestamp -> "startup" / "tool-call".
+def _phase_of(events: list[Event], session: dict, relay_pid: int | None):
+    """Return (function: event index -> phase, note explaining "unknown" or None).
 
-    strace's -tt has no date, so times are measured from the first trace line
-    and wrapped at 24h: a run that crosses midnight still sorts correctly.
+    The boundary is the position of the relay's tool-call marker in the trace.
+    Positions, not timestamps: no clock is involved, so a VM clock that is a
+    few ms off the host's can't move an event into the wrong phase.
     """
-    boundary = session.get("tool_calls_started")
-    if not events or not boundary:
-        return lambda timestamp: "startup"  # no tool was called
-    start = _seconds(events[0].timestamp)
-    since_start = lambda timestamp: (_seconds(timestamp) - start) % 86400
-    cutoff = since_start(boundary)
-    return lambda timestamp: "tool-call" if since_start(timestamp) >= cutoff else "startup"
+    if relay_pid is None:
+        return (lambda index: "unknown"), "the stdin relay did not start, so there is no tool-call marker"
+    boundary = next((i for i, e in enumerate(events) if e.pid == relay_pid
+                     and e.kind == "probe" and e.target == stdin_relay.TOOL_CALL_MARKER), None)
+    if boundary is not None:
+        return (lambda index: "tool-call" if index > boundary else "startup"), None
+    if session.get("calls"):
+        # Tools were called but the relay never marked it: don't guess.
+        return (lambda index: "unknown"), "tools were called, but the tool-call marker is missing from the trace"
+    return (lambda index: "startup"), None  # the relay saw every message: no tool call
+
+
+def _relay_problem(events: list[Event], relay_pid: int | None) -> str | None:
+    """Why the relay can't be trusted, or None. A normal end is its eof marker
+    followed by a clean exit; anything else means it died or was killed early."""
+    if relay_pid is None:
+        return "the stdin relay did not start, so the tool-call phase can't be found"
+    saw_eof = any(e.pid == relay_pid and e.kind == "probe" and e.target == stdin_relay.EOF_MARKER
+                  for e in events)
+    exit_event = next((e for e in events if e.pid == relay_pid and e.kind == "exit"), None)
+    if saw_eof and exit_event is not None and exit_event.target == "exited with 0":
+        return None
+    how = exit_event.target if exit_event else "no exit record"
+    return (f"the stdin relay exited or was killed before the run ended ({how}); "
+            "the server may have tampered with it")
 
 
 def _bucket_for_failure_or_success(event: Event) -> str:
@@ -146,12 +166,19 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
     write_ok = policy.write_allow
     server_launch: Event | None = None
     node_launch: Event | None = None  # runtime "node" only
-    sink_pid = _sink_pid(events)
-    phase_of = _phase_of(events, session)
+    sink_pid = _first_pid_to_stat(events, netsink.SINK_READY)
+    relay_pid = _first_pid_to_stat(events, stdin_relay.RELAY_READY)
+    phase_of, phase_note = _phase_of(events, session, relay_pid)
     domains: list[dict] = []       # every request the sink recorded
     isolation: dict | None = None  # the sink's connect-to-a-public-IP check
 
-    for event in events:
+    for index, event in enumerate(events):
+        if relay_pid is not None and event.pid == relay_pid and event.kind != "exit":
+            # Sandglass's own stdin relay: its exec, its Python startup and its
+            # markers. The server can't make it open anything. (Its exit is
+            # checked below: dying early makes the run INCOMPLETE.)
+            continue
+
         if sink_pid is not None and event.pid == sink_pid and event.kind in ("process", "network", "probe"):
             # Sandglass's own sink: its exec and sockets are ours, not the server's.
             if event.kind == "network" and _is_address(event.target, *netsink.ISOLATION_CHECK):
@@ -165,7 +192,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
             allowed = _domain_allowed(host, policy)
             domains.append({"method": method, "host": host, "port": port,
                             "allowed": allowed, "timestamp": event.timestamp,
-                            "phase": phase_of(event.timestamp)})
+                            "phase": phase_of(index)})
             if allowed:
                 continue
             reason = "contacted a domain not in network.allow_domains"
@@ -194,7 +221,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
             entry = probes.setdefault(event.target, {
                 "path": event.target, "count": 0, "syscalls": {},
                 "first_timestamp": event.timestamp,
-                "phase": phase_of(event.timestamp),  # of the first occurrence
+                "phase": phase_of(index),  # of the first occurrence
             })
             entry["count"] += 1
             entry["syscalls"][event.syscall] = entry["syscalls"].get(event.syscall, 0) + 1
@@ -234,7 +261,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
             "target": event.target,
             "mode": event.mode,
             "timestamp": event.timestamp,
-            "phase": phase_of(event.timestamp),
+            "phase": phase_of(index),
             "pid": event.pid,
             "succeeded": event.succeeded,
             "error": event.error,
@@ -249,6 +276,9 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
         incomplete.append("the network isolation check is missing from the trace")
     elif isolation and isolation["succeeded"]:
         incomplete.append(f"the sandbox reached the internet: connect to {isolation['target']} succeeded")
+    relay_problem = _relay_problem(events, relay_pid) if events else None
+    if relay_problem:
+        incomplete.append(relay_problem)
     if incomplete:
         verdict = "INCOMPLETE"
     elif violations:
@@ -264,6 +294,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
         "probes": sorted(probes.values(), key=lambda p: p["first_timestamp"]),
         "domains": domains,
         "network_isolation": isolation,
+        "phase_note": phase_note,
         "event_counts": {
             kind: sum(1 for e in events if e.kind == kind)
             for kind in ("file", "probe", "process", "network", "exit")
@@ -314,6 +345,7 @@ def build_report(server: str, timestamp: str, policy: Policy, session: dict,
         "probes": result["probes"],
         "domains": result["domains"],
         "network_isolation": result["network_isolation"],
+        "phase_note": result["phase_note"],
         "event_counts": result["event_counts"],
     }
 
@@ -400,10 +432,15 @@ def _network_section(r: dict) -> list[str]:
 
 def _phase_sections(r: dict) -> list[str]:
     """Violations grouped by phase: install / startup / tool calls."""
-    titles = {"install": "Install", "startup": "Startup", "tool-call": "Tool calls"}
+    titles = {"install": "Install", "startup": "Startup", "tool-call": "Tool calls",
+              "unknown": "Phase unknown"}
     lines = ["", "## Violations by phase"]
+    if r.get("phase_note"):
+        lines += ["", f"Phases are unknown: {r['phase_note']}."]
     for phase in PHASES:
         records = [v for v in r["violations"] if v.get("phase") == phase]
+        if phase == "unknown" and not records:
+            continue  # only shown when the boundary was missing
         section = _event_section(titles[phase], records, level="###")
         if phase == "install" and not records:
             section[-1:] = ["Not captured in this version: nothing is installed at run time (see #16)."]

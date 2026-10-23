@@ -57,6 +57,8 @@ CONTAINER_HOME = PurePosixPath("/home/sandglass")
 LAUNCHER = (PROJECT_ROOT / "sandglass" / "launcher.py").read_text(encoding="utf-8")
 # The local network sink the launcher starts (see sandglass/netsink.py).
 NETSINK = (PROJECT_ROOT / "sandglass" / "netsink.py").read_text(encoding="utf-8")
+# The stdin relay the launcher starts (see sandglass/stdin_relay.py).
+STDIN_RELAY = (PROJECT_ROOT / "sandglass" / "stdin_relay.py").read_text(encoding="utf-8")
 
 
 def to_container_path(host_path: Path) -> PurePosixPath:
@@ -108,7 +110,7 @@ def docker_command(server_script: Path) -> tuple[str, list[str]]:
     #   -o /proc/self/fd/2   write to strace's own stderr; strace opens it
     #                    close-on-exec, so the server doesn't inherit that copy
     strace = ("exec strace -f -tt -e trace=file,process,network --kill-on-exit"
-              f" -o /proc/self/fd/2 {CONTAINER_PYTHON} -S -c \"$1\" \"$2\" \"$3\" 3>/dev/null")
+              f" -o /proc/self/fd/2 {CONTAINER_PYTHON} -S -c \"$1\" \"$2\" \"$3\" \"$4\" 3>/dev/null")
     args = [
         "run",
         "-i",                       # keep stdin open: it's the MCP stdio channel
@@ -123,9 +125,9 @@ def docker_command(server_script: Path) -> tuple[str, list[str]]:
         "--mount", f"type=tmpfs,destination={CONTAINER_REPORTS},tmpfs-mode=0555",
         "-w", str(CONTAINER_PROJECT),
         IMAGE,
-        # sh runs before strace, so it isn't traced. "$1"/"$2"/"$3" are the
-        # launcher code, the server path and the sink code, as separate arguments.
+        # sh runs before strace, so it isn't traced. "$1".."$4" are the launcher
+        # code, the server path, the sink code and the relay code, as separate arguments.
         "sh", "-c", strace, "sandglass-launch",
-        LAUNCHER, str(to_container_path(server_script)), NETSINK,
+        LAUNCHER, str(to_container_path(server_script)), NETSINK, STDIN_RELAY,
     ]
     return docker, args

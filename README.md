@@ -21,8 +21,9 @@ Repository: <https://github.com/nabulsi019/sandglass-mcp>. Formerly **MCP Guard*
 sandglass/
   client.py          Runs a server over stdio, calls each tool once; --sandbox adds tracing + report
   sandbox.py         Container paths and the `docker run ... strace ...` command
-  launcher.py        Runs first in the container: hides the trace, starts the sink, runs the server
+  launcher.py        Runs first in the container: hides the trace, starts the sink and relay, runs the server
   netsink.py         Local fake HTTP(S) proxy: records contacted domains, never connects anywhere
+  stdin_relay.py     Passes the client's messages to the server; marks the first tool call in the trace
   trace_parser.py    strace output -> file / probe / process / network / exit events
   compare.py         Events vs policy -> verdict, violations, report files
   policy.py          Loads + validates a policy (and the container baseline)
@@ -108,7 +109,7 @@ docker run -i --rm --network none --read-only --tmpfs /tmp --user 10001:10001 \
   -e HOME=/home/sandglass -v <project>:/project:ro --mount type=tmpfs,destination=/project/reports,tmpfs-mode=0555 \
   -w /project sandglass-sandbox \
   sh -c 'exec strace -f -tt -e trace=file,process,network --kill-on-exit -o /proc/self/fd/2 \
-         /opt/venv/bin/python -S -c "<launcher.py>" <server> "<netsink.py>" 3>/dev/null'
+         /opt/venv/bin/python -S -c "<launcher.py>" <server> "<netsink.py>" "<stdin_relay.py>" 3>/dev/null'
 ```
 
 - `--network none`: no network. Connection attempts still show up in the trace.
@@ -244,20 +245,28 @@ groups violations under three headings:
 
 - **Install**: not captured yet. Nothing is installed at run time (see #16),
   so this section says so.
-- **Startup**: before the client sent its first tool call (imports, the
+- **Startup**: before the first tool call reached the server (imports, the
   server setting itself up).
 - **Tool calls**: from the first tool call on. A server that only
   misbehaves when a tool is used shows up here, like all our fixtures.
 
-The boundary is the client's UTC clock just before the first `call_tool`,
-compared with strace's `-tt` times. The container uses the same clock, in
-UTC. On a Mac the VM's clock can be a few ms off macOS, so an event right at
-the boundary could land in the wrong phase.
+The boundary comes from the trace itself, not from a clock (#91). The
+launcher starts a small **stdin relay** (`sandglass/stdin_relay.py`) as its
+own process. It passes the client's messages to the server unchanged, and
+just before it passes on the first `tools/call` request it `stat()`s
+`/sandglass-phase/tool-call`. Events before that line in the trace are
+startup; events after it are tool calls. Only the relay's marker counts: the
+relay is the first process to stat `/sandglass-phase/ready`, before any server
+code runs, so the server can't fake the boundary. If the marker is missing
+although tools were called, the phase is **unknown** (with the reason in the
+report), never guessed.
 
 The verdict is **INCOMPLETE**, and never clean, if the server didn't start, the MCP
 session failed, no tool was exercised, the trace is missing or has no
 `+++ exited` line for the server (a truncated trace), the network sink didn't
-start, or the isolation check reached the internet.
+start, the isolation check reached the internet, or the stdin relay didn't
+start or ended before the client closed stdin (killed, crashed, or no exit
+record: the server may have tampered with it).
 
 ## Tests
 
