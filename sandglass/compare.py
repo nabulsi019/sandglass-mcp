@@ -29,11 +29,17 @@ Rules (one place, so they're easy to explain):
            the marker where it reports the outcome (#100). The outcome comes
            only from that marker, before "ready": anything but isolated, or
            no marker at all -> INCOMPLETE
-    relay  its own exec and its ready / tool-call / eof markers
+    relay  its own exec and its ready / tool-call / eof / server-exited markers
   Everything else from those pids is judged like the server's, by the rules
   here: they run as the same user, so it may not be the helper's own code.
   If the relay ends before the client closed stdin (no "eof" marker, or not
-  a clean exit) -> INCOMPLETE.
+  a clean exit) -> INCOMPLETE. Its "server-exited" marker (the server process
+  went away first, #24) is a normal end too.
+  Server exits during startup (#24): no tool was called and the server's exit
+  record comes before the client hung up -> INCOMPLETE, with the exit status
+  and, for Python servers, the error message the launcher recorded
+  (/sandglass-server-error/<message>, from the server's own process: used
+  only as the wording of that reason, and skipped as a probe).
   Process exec:
     the first exec in the trace is the server itself -> allowed
     (Node servers: the launcher then execs node in that same process; that
@@ -55,7 +61,8 @@ Phases (#18): every reported event gets a phase:
   ORDER of lines is used, never a clock, and only the relay's own marker counts.
 
 Verdicts:
-  INCOMPLETE  the run can't be trusted: the server didn't start, the session
+  INCOMPLETE  the run can't be trusted: the server didn't start (or exited
+              during startup, e.g. a missing API key), the session
               errored, nothing was exercised, the trace is missing/truncated,
               the network sink didn't start, the sandbox could reach the internet,
               the stdin relay didn't start or ended early (the server may have
@@ -70,7 +77,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-from sandglass import netsink, sandbox, stdin_relay
+from sandglass import launcher, netsink, sandbox, stdin_relay
 from sandglass.policy import Policy
 from sandglass.trace_parser import UNREADABLE, Event
 
@@ -139,11 +146,15 @@ def _helper_exec(events: list[Event], pid: int | None) -> Event | None:
     return None
 
 
-RELAY_MARKERS = {stdin_relay.RELAY_READY, stdin_relay.TOOL_CALL_MARKER, stdin_relay.EOF_MARKER}
+RELAY_MARKERS = {stdin_relay.RELAY_READY, stdin_relay.TOOL_CALL_MARKER, stdin_relay.EOF_MARKER,
+                 stdin_relay.SERVER_EXITED_MARKER}
+# The relay ends normally with one of these: the client closed stdin, or the
+# server exited while the client was still connected (#24).
+RELAY_NORMAL_ENDS = {stdin_relay.EOF_MARKER, stdin_relay.SERVER_EXITED_MARKER}
 
 
 def _is_relay_own(event: Event, relay_exec: Event | None) -> bool:
-    """The relay's known events: its launch and its three marker stats."""
+    """The relay's known events: its launch and its marker stats."""
     return event is relay_exec or (event.kind == "probe" and event.target in RELAY_MARKERS)
 
 
@@ -210,11 +221,12 @@ def _phase_of(events: list[Event], session: dict, relay_pid: int | None):
 
 
 def _relay_problem(events: list[Event], relay_pid: int | None) -> str | None:
-    """Why the relay can't be trusted, or None. A normal end is its eof marker
-    followed by a clean exit; anything else means it died or was killed early."""
+    """Why the relay can't be trusted, or None. A normal end is its eof (or
+    server-exited) marker followed by a clean exit; anything else means it
+    died or was killed early."""
     if relay_pid is None:
         return "the stdin relay did not start, so the tool-call phase can't be found"
-    saw_eof = any(e.pid == relay_pid and e.kind == "probe" and e.target == stdin_relay.EOF_MARKER
+    saw_eof = any(e.pid == relay_pid and e.kind == "probe" and e.target in RELAY_NORMAL_ENDS
                   for e in events)
     exit_event = next((e for e in events if e.pid == relay_pid and e.kind == "exit"), None)
     if saw_eof and exit_event is not None and exit_event.target == "exited with 0":
@@ -258,6 +270,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
     isolation = _isolation(events, sink_pid)  # the sink's own report of its check (#100)
     io_uring_used: list[Event] = []  # io_uring calls that succeeded (#75)
     unreadable: list[Event] = []     # file/stat events whose path strace couldn't read (#98)
+    server_errors: list[str] = []    # the server's own error messages, via the launcher (#24)
 
     for index, event in enumerate(events):
         if event.kind in ("file", "probe") and event.target == UNREADABLE:
@@ -271,6 +284,12 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
 
         if event.pid == sink_pid and _is_sink_own(event, sink_exec):
             continue  # the sink's launch, ready marker, proxy socket, isolation check (#99)
+
+        if (server_launch is not None and event.pid == server_launch.pid and event.kind == "probe"
+                and event.target.startswith(launcher.SERVER_ERROR_DIR + "/")):
+            # The launcher's record of the server's own error message (#24).
+            server_errors.append(event.target[len(launcher.SERVER_ERROR_DIR) + 1:])
+            continue
 
         request = _sink_request(event.target) if event.pid == sink_pid and event.kind == "probe" else None
         if request is not None:
@@ -365,6 +384,9 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
         (violations if bucket == "violation" else attempted).append(record)
 
     incomplete = _incomplete_reasons(events, server_launch, session)
+    startup_exit = _startup_exit_reason(events, server_launch, relay_pid, session, server_errors)
+    if startup_exit:
+        incomplete.append(startup_exit)
     if events and sink_pid is None:
         incomplete.append("the network sink did not start, so contacted domains can't be recorded")
     elif events and isolation is None:
@@ -421,6 +443,34 @@ def _incomplete_reasons(events: list[Event], server_launch: Event | None, sessio
         # line) is missing, and so might be the very events we care about.
         reasons.append("trace has no exit record for the server process (possibly truncated)")
     return reasons
+
+
+def _startup_exit_reason(events: list[Event], server_launch: Event | None, relay_pid: int | None,
+                         session: dict, server_errors: list[str]) -> str | None:
+    """'The server exited during startup', or None (#24).
+
+    True when no tool was called and the server's process exited before the
+    client hung up: its exit record comes before the relay's eof marker (or
+    there is no eof marker; the relay then saw the server go, server-exited).
+    A server that quits on its own this early usually needs something it
+    doesn't have, e.g. an API key or a real account.
+    """
+    if session.get("calls") or server_launch is None:
+        return None
+    exit_index = next((i for i, e in enumerate(events)
+                       if e.kind == "exit" and e.pid == server_launch.pid), None)
+    if exit_index is None:
+        return None
+    eof_index = next((i for i, e in enumerate(events) if e.pid == relay_pid and e.kind == "probe"
+                      and e.target == stdin_relay.EOF_MARKER), None)
+    if eof_index is not None and eof_index < exit_index:
+        return None  # the client closed the connection first: a normal shutdown
+    reason = f"the server exited during startup ({events[exit_index].target}) before any tool call"
+    if server_errors:
+        # Recorded inside the server's own process, so the server could fake
+        # it. It only explains a run that is INCOMPLETE anyway.
+        reason += f"; its error message (as the server reported it): {server_errors[-1]}"
+    return reason
 
 
 # ---------------------------------------------------------------------------

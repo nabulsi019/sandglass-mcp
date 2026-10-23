@@ -18,6 +18,8 @@ so the container never has to read an extra file. In this order it:
      loading site-packages (skipped by -S, because .pth files can run code);
      a .js server by exec'ing Node in this same process (#17), so the fds
      stay closed and compare.py sees one extra exec it treats as the launch.
+     If a Python server dies with an exception, its message is put into the
+     trace (record_server_error, #24), since its stderr is /dev/null.
 
 Until step 4 only frozen stdlib modules (os, sys, runpy, site) are used, so no
 package code runs while the trace stream is still reachable.
@@ -33,6 +35,11 @@ SINK_READY_FD = 3
 RELAY_READY_FD = 3
 PYTHON = "/opt/venv/bin/python"
 NODE = "/usr/bin/node"  # must match sandglass/sandbox.py CONTAINER_NODE
+# (#24) A Python server that dies with an exception: the launcher stat()s
+# <this>/<message> (it doesn't exist), so the message lands in the trace.
+SERVER_ERROR_DIR = "/sandglass-server-error"
+# Characters kept in that message; anything else (including "/") becomes "_".
+MESSAGE_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,:;=_-+'()[]")
 
 
 def start_sink(source: str) -> None:
@@ -103,7 +110,37 @@ def main() -> None:
     import site
     site.main()
     import runpy
-    runpy.run_path(server, run_name="__main__")
+    try:
+        runpy.run_path(server, run_name="__main__")
+    except SystemExit as exc:
+        if exc.code not in (None, 0):
+            # e.g. sys.exit("NOTES_API_KEY is not set"): Python would print
+            # the message to stderr, which is /dev/null here (#47).
+            record_server_error(str(exc.code) if isinstance(exc.code, str) else f"exit code {exc.code}")
+        raise
+    except BaseException as exc:
+        record_server_error(f"{type(exc).__name__}: {exc}")
+        raise
+
+
+def record_server_error(message: str) -> None:
+    """Put the server's own error message into the trace (#24).
+
+    The server's stderr is /dev/null (step 1), so its traceback is lost. Like
+    the sink and the relay, this stat()s a path that doesn't exist, so the
+    message lands in the trace. It runs inside the server's process, so the
+    server could fake it: compare.py only uses it as the wording of a reason
+    when the run is already INCOMPLETE (the server exited during startup).
+    """
+    try:
+        os.stat(f"{SERVER_ERROR_DIR}/{clean_message(message)}")
+    except OSError:
+        pass
+
+
+def clean_message(message: str) -> str:
+    """One safe path component: allowed characters only, at most 200 of them."""
+    return "".join(c if c in MESSAGE_CHARS else "_" for c in message)[:200] or "_"
 
 
 if __name__ == "__main__":
