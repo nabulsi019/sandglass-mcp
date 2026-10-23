@@ -35,7 +35,8 @@ from sandglass import PROJECT_ROOT, sandbox, scan
 from sandglass.compare import (build_report, compare, compare_install, not_run, with_install,
                                write_reports)
 from sandglass.inputs import InputError, build_arguments
-from sandglass.policy import BASELINE_FILES, Policy, PolicyError, load_install_baseline, load_policy
+from sandglass.policy import (BASELINE_FILES, Policy, PolicyError, check_scan_paths,
+                              load_install_baseline, load_policy)
 from sandglass.trace_parser import parse_trace_file
 
 REPORTS_DIR = PROJECT_ROOT / "reports"
@@ -391,6 +392,11 @@ def scan_main(argv: list[str]) -> None:
         parser.error(str(exc))
     if not args.policy.is_file():
         parser.error(f"policy file not found: {args.policy}")
+    try:
+        # Before Docker or any download: a scan has no project folder (#123).
+        check_scan_paths(args.policy)
+    except PolicyError as exc:
+        parser.error(str(exc))
     if args.registry_dir is not None and not args.registry_dir.is_dir():
         parser.error(f"--registry-dir is not a folder: {args.registry_dir}")
     registry_dir = args.registry_dir.resolve() if args.registry_dir else None
