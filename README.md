@@ -238,6 +238,7 @@ library in `/opt/venv` or `/lib` is a violation.
 | `memfd_create` (a file that lives only in memory; code in it can run without touching disk) | recorded as a write to `memfd:<name>`, so the same rules as a file write: VIOLATION if it succeeded |
 | `io_uring_setup`/`enter`/`register` that **failed** (e.g. `EPERM` from Docker's seccomp profile; Node's libuv tries this at every startup) | listed under "attempted", verdict unchanged |
 | `io_uring_*` that **succeeded** | **INCOMPLETE**: the kernel does io_uring's file opens and reads itself, so strace can't see them and the trace may be missing file access |
+| A file or stat call whose path strace **couldn't read** (shown as an address) | **INCOMPLETE**, from any process: it can't be judged, so it's never dropped |
 | `stat` / `access` / `readlink` (looking, not reading) | listed under "probes", grouped by path with a count per syscall; informational |
 | Any network attempt, even a failed one | VIOLATION |
 | A successful connect to the local network sink | not counted itself; the sink records the domain |
@@ -270,9 +271,11 @@ session failed, no tool was exercised, the trace is missing or has no
 `+++ exited` line for the server (a truncated trace), the network sink didn't
 start, the isolation check reached the internet, or the stdin relay didn't
 start or ended before the client closed stdin (killed, crashed, or no exit
-record: the server may have tampered with it), or an io_uring call succeeded
+record: the server may have tampered with it), an io_uring call succeeded
 (Docker 25+ blocks io_uring by default; see #84 for a seccomp profile that
-blocks it whatever the Docker version).
+blocks it whatever the Docker version), or strace couldn't read the path of
+a file or stat call (it then prints a memory address instead; such an event
+is never dropped, because we can't tell what was touched).
 
 ## Tests
 

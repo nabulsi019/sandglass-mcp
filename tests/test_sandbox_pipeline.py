@@ -143,6 +143,32 @@ def test_parser_collapses_leading_slashes(path, expected):
     assert events[0].target == expected
 
 
+def test_parser_keeps_paths_strace_could_not_read():
+    # strace shows memory it can't read as a bare address. Never drop these (#98).
+    events = parse_trace("\n".join([
+        '8 10:00:00.1 openat(AT_FDCWD, 0xffff83995370, O_RDONLY|O_CLOEXEC) = 3',
+        '8 10:00:00.2 newfstatat(AT_FDCWD, 0xffff83995370, 0xffffc0de0000, 0) = 0',
+        '8 10:00:00.3 unlink(0xffff83995370) = 0',
+        # Two paths, one unreadable: not silently judged by the readable one.
+        '8 10:00:00.4 rename("/tmp/a", 0xffff83995370) = 0',
+    ]))
+    assert [(e.kind, e.target, e.mode) for e in events] == [
+        ("file", "<unreadable>", "read"),
+        ("probe", "<unreadable>", None),
+        ("file", "<unreadable>", "write"),
+        ("file", "<unreadable>", "write"),
+    ]
+
+
+def test_parser_null_and_fd_only_paths_are_not_unreadable():
+    events = parse_trace("\n".join([
+        '8 10:00:00.1 openat(AT_FDCWD, NULL, O_RDONLY) = -1 EFAULT (Bad address)',
+        '8 10:00:00.2 newfstatat(3, "", {st_mode=S_IFREG|0644, st_size=10, ...}, AT_EMPTY_PATH) = 0',
+        '8 10:00:00.3 newfstatat(AT_FDCWD, "/etc/x", 0xffffc0de0000, 0) = -1 ENOENT (No such file or directory)',
+    ]))
+    assert [(e.kind, e.target) for e in events] == [("probe", "/etc/x")]
+
+
 def test_parser_memfd_create_is_a_write_to_memfd_name():
     events = parse_trace("\n".join([
         '8 10:00:00.1 memfd_create("payload", MFD_CLOEXEC) = 5',
@@ -250,6 +276,19 @@ def test_exact_server_dir_entry_allows_only_that_listing():
 def test_second_exec_is_violation():
     result = run([LAUNCH, '11 10:00:00.2 execve("/bin/sh", ["sh", "-c", "id"], 0x0 /* 8 vars */) = 0', EXITED])
     assert [v["target"] for v in result["violations"]] == ["/bin/sh"]
+
+
+@pytest.mark.parametrize("line", [
+    '8 10:00:00.2 openat(AT_FDCWD, 0xffff83995370, O_RDONLY|O_CLOEXEC) = 3',
+    '8 10:00:00.2 newfstatat(AT_FDCWD, 0xffff83995370, 0xffffc0de0000, 0) = 0',
+    '7  10:00:00.2 openat(AT_FDCWD, 0xffff83995370, O_RDONLY) = 3',  # from the relay's pid too
+])
+def test_unreadable_path_makes_the_run_incomplete(line):
+    result = run([LAUNCH, NOTE_READ, line, EXITED])
+    assert result["verdict"] == "INCOMPLETE"
+    [reason] = [r for r in result["incomplete_reasons"] if "couldn't read" in r]
+    assert reason.startswith("1 file event(s) with a path strace couldn't read") and "0xffff83995370" in reason
+    assert result["violations"] == [] and result["probes"] == []  # never judged as a real path
 
 
 def test_memfd_create_is_a_violation_and_a_failed_one_is_attempted():

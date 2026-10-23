@@ -13,6 +13,8 @@ Rules (one place, so they're easy to explain):
     failed otherwise          -> "attempted" (listed, does not change the verdict)
   Probes (stat/access/readlink) outside the read allow-list:
     -> "probes" (informational only)
+  A file or probe whose path strace couldn't read ("<unreadable>", #98):
+    -> INCOMPLETE, from any process. Never dropped, never guessed.
   Network (when network.allow is false):
     any attempt, even a failed one -> VIOLATION
     except a SUCCESSFUL connect to the local network sink (sandglass/netsink.py):
@@ -50,7 +52,8 @@ Verdicts:
               errored, nothing was exercised, the trace is missing/truncated,
               the network sink didn't start, the sandbox could reach the internet,
               the stdin relay didn't start or ended early (the server may have
-              tampered with it), or an io_uring call succeeded.
+              tampered with it), an io_uring call succeeded, or a file
+              event's path couldn't be read.
               Never treated as clean, even when no violations were seen.
   VIOLATIONS  at least one violation.
   CLEAN       a complete run with zero violations.
@@ -62,7 +65,7 @@ from pathlib import Path
 
 from sandglass import netsink, sandbox, stdin_relay
 from sandglass.policy import Policy
-from sandglass.trace_parser import Event
+from sandglass.trace_parser import UNREADABLE, Event
 
 # Errors that mean "this exists but you're not allowed": a real access attempt.
 BLOCKED_ERRORS = {"EACCES", "EPERM"}
@@ -180,8 +183,15 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
     domains: list[dict] = []       # every request the sink recorded
     isolation: dict | None = None  # the sink's connect-to-a-public-IP check
     io_uring_used: list[Event] = []  # io_uring calls that succeeded (#75)
+    unreadable: list[Event] = []     # file/stat events whose path strace couldn't read (#98)
 
     for index, event in enumerate(events):
+        if event.kind in ("file", "probe") and event.target == UNREADABLE:
+            # Fail closed: we can't tell what was touched, so we can't judge
+            # it against any allow-list. From any pid; INCOMPLETE below.
+            unreadable.append(event)
+            continue
+
         if relay_pid is not None and event.pid == relay_pid and event.kind != "exit":
             # Sandglass's own stdin relay: its exec, its Python startup and its
             # markers. The server can't make it open anything. (Its exit is
@@ -296,6 +306,10 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
     relay_problem = _relay_problem(events, relay_pid) if events else None
     if relay_problem:
         incomplete.append(relay_problem)
+    if unreadable:
+        incomplete.append(f"{len(unreadable)} file event(s) with a path strace couldn't read "
+                          "(the process may have stopped strace from reading its memory); "
+                          f"first: {unreadable[0].raw}")
     if io_uring_used:
         incomplete.append(f"{IO_URING_INCOMPLETE} ({len(io_uring_used)} successful io_uring "
                           f"call(s), first: {io_uring_used[0].raw})")
