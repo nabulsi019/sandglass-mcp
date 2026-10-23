@@ -423,6 +423,16 @@ blocks it whatever the Docker version), or strace couldn't read the path of
 a file or stat call (it then prints a memory address instead; such an event
 is never dropped, because we can't tell what was touched).
 
+**Programs run and attempts** (#120). The report's "Programs run" section
+lists every program that was started successfully (pid, time, full argv),
+per phase, whether it was allowed or not; it shows what ran and never
+changes the verdict. The Markdown "Attempted" list is grouped: one entry
+per (category, path, errno, phase) with a count, the first time and the
+first evidence line (the JSON keeps every event). A run of failed execs
+from one pid with the same argv and the same program name (`npm` trying
+each folder in `PATH`) is shown as one entry, "looked for npm in PATH
+(N places)", plus where it was found.
+
 **Coverage** (#23). The report lists every tool the server offered, with
 totals:
 
@@ -494,6 +504,10 @@ below are from each project's own paper or documentation.
   launcher points the server's stderr at `/dev/null` before any server code
   runs; otherwise the server could write fake lines into its own trace. To see
   a server's tracebacks, run it without `--sandbox`.
+
+- **PyPI scans are wheels only**: a package published only as an sdist gives
+  INCOMPLETE, because building an sdist would run the package's own code on
+  the host, outside the sandbox.
 
 - **Fixture runs mount the whole project read-only**, so a fixture server
   can read `sandglass/`, `policies/` and the other fixtures. That is acceptable for

@@ -259,6 +259,35 @@ def _link_target(syscall: str, args: str, cwd: str, link_path: str) -> str | Non
     return path_of(0)
 
 
+def exec_argv(raw: str) -> list[str] | None:
+    """The argument list of an execve/execveat line, or None if strace
+    couldn't read it (#120). Used by the report's "Programs run" section.
+
+        execve("/usr/bin/sh", ["sh", "-c", "node postinstall.js"], 0x55f6 /* 49 vars */) = 0
+        -> ["sh", "-c", "node postinstall.js"]
+
+    strace cuts long strings short and marks them with "..." after the
+    closing quote ("\\"\\"\\"The local network sink: a fak"...); the "..." is kept.
+    """
+    path = STRING_RE.search(raw)  # the program's path comes first
+    start = raw.find("[", path.end()) if path else -1
+    if start < 0:
+        return None
+    argv, pos = [], start + 1
+    while True:
+        string = STRING_RE.match(raw, pos)
+        if not string:
+            break
+        text, pos = _unescape(string[1]), string.end()
+        if raw.startswith("...", pos):  # cut short by strace
+            text, pos = text + "...", pos + 3
+        argv.append(text)
+        if not raw.startswith(", ", pos):
+            break
+        pos += 2
+    return argv
+
+
 def _strings_and_paths(args: str, cwd: str, fd_dirs: dict):
     """The quoted strings of the arguments, and path_of(i): string i as an
     absolute path, relative to the dirfd argument just before it (if any)."""
