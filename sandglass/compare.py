@@ -474,6 +474,52 @@ def _startup_exit_reason(events: list[Event], server_launch: Event | None, relay
 
 
 # ---------------------------------------------------------------------------
+# Coverage (#23): which tools ran, failed, or were skipped
+# ---------------------------------------------------------------------------
+
+COVERAGE_REASON_CHARS = 200  # error texts are cut to this length in the coverage table
+
+
+def coverage(session: dict) -> dict:
+    """One row per tool the server listed: ran / failed / skipped, plus totals.
+
+      ran      the call returned a normal result
+      failed   the call returned an MCP error (isError), raised (e.g. timed
+               out), or got no answer before the session ended
+      skipped  no valid input could be built (#22), or the session ended first
+
+    Coverage is reported, not judged: it never changes the verdict.
+    """
+    calls = {c["tool"]: c for c in session.get("calls", [])}
+    skipped = {s["tool"]: s["reason"] for s in session.get("skipped", [])}
+    rows = []
+    for tool in session.get("tools", []):
+        name = tool["name"]
+        if name in calls:
+            call = calls[name]
+            if call["status"] == "OK":
+                rows.append({"tool": name, "status": "ran", "reason": None})
+            else:
+                text = " ".join(str(call["result"]).split())[:COVERAGE_REASON_CHARS]
+                rows.append({"tool": name, "status": "failed", "reason": f"{call['status']}: {text}"})
+        elif name in skipped:
+            rows.append({"tool": name, "status": "skipped", "reason": skipped[name]})
+        else:
+            why = f": {session['error']}" if session.get("error") else ""
+            rows.append({"tool": name, "status": "skipped",
+                         "reason": f"not called, the session ended first{why}"})
+
+    totals = {status: sum(1 for r in rows if r["status"] == status)
+              for status in ("ran", "failed", "skipped")}
+    totals["total"] = len(rows)
+    note = None
+    if not rows:
+        note = ("the server's tool list was never received" if session.get("error")
+                else "the server listed no tools")
+    return {"tools": rows, "totals": totals, "note": note}
+
+
+# ---------------------------------------------------------------------------
 # Report writing
 # ---------------------------------------------------------------------------
 
@@ -493,6 +539,7 @@ def build_report(server: str, timestamp: str, policy: Policy, session: dict,
         "trace_file": str(trace_file),
         "exercised": session.get("calls", []),
         "tools": session.get("tools", []),
+        "coverage": coverage(session),  # ran / failed / skipped per tool (#23)
         "violations": result["violations"],
         "attempted": result["attempted"],
         "probes": result["probes"],
@@ -542,6 +589,7 @@ def _markdown(r: dict) -> str:
     else:
         out.append("None.")
 
+    out += _coverage_section(r)
     out += _network_section(r)
     out += _phase_sections(r)
     out += _event_section("Attempted (failed, not violations)", r["attempted"])
@@ -561,6 +609,24 @@ def _markdown(r: dict) -> str:
     counts = ", ".join(f"{k}: {v}" for k, v in r["event_counts"].items())
     out += ["", f"Event counts: {counts}", ""]
     return "\n".join(out)
+
+
+def _coverage_section(r: dict) -> list[str]:
+    """Every listed tool as ran / failed / skipped, with the reason and totals (#23)."""
+    cov = r.get("coverage")
+    if cov is None:
+        return []
+    t = cov["totals"]
+    lines = ["", "## Coverage", "",
+             f"Ran {t['ran']} · Failed {t['failed']} · Skipped {t['skipped']} · Total {t['total']}"
+             " (each tool is called once, with one input; see the README)", ""]
+    if cov["note"]:
+        return lines + [f"No tools: {cov['note']}."]
+    lines += ["| Tool | Status | Reason |", "|---|---|---|"]
+    for row in cov["tools"]:
+        reason = (row["reason"] or "").replace("|", "\\|")
+        lines.append(f"| `{row['tool']}` | {row['status']} | {reason} |")
+    return lines
 
 
 def _network_section(r: dict) -> list[str]:

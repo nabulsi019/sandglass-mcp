@@ -294,6 +294,20 @@ blocks it whatever the Docker version), or strace couldn't read the path of
 a file or stat call (it then prints a memory address instead; such an event
 is never dropped, because we can't tell what was touched).
 
+**Coverage** (#23). The report lists every tool the server offered, with
+totals:
+
+- **ran**: the call returned a normal result;
+- **failed**: the call returned an MCP error (e.g. "not logged in"), raised,
+  took longer than 30 s, or got no answer before the session ended;
+- **skipped**: no valid input could be built from its schema, or the session
+  ended before the tool was reached.
+
+A failing call doesn't stop the run: the next tool is still called.
+Coverage is reported, not judged; it doesn't change the verdict. A CLEAN
+verdict only covers what ran, so check this table: a tool that failed or was
+skipped did nothing we could observe.
+
 ## Tests
 
 ```bash

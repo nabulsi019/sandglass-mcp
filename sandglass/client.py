@@ -34,6 +34,9 @@ REPORTS_DIR = PROJECT_ROOT / "reports"
 
 # Upper bound for the whole MCP session, so a hung server can't hang us.
 SESSION_TIMEOUT_SECONDS = 120
+# Upper bound for one tool call; a call that takes longer is recorded as
+# FAILED and the next tool is still called (#23).
+CALL_TIMEOUT_SECONDS = 30
 
 # --sandbox exit codes, so scripts and CI can check the verdict.
 EXIT_CODES = {"CLEAN": 0, "VIOLATIONS": 1, "INCOMPLETE": 2}
@@ -80,14 +83,25 @@ def print_policy(policy: Policy, enforced: bool) -> None:
     print()
 
 
-async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr) -> dict:
+def new_session_record() -> dict:
+    """What run() fills in. tools: what the server listed; calls: tools that
+    were called (status OK, ERROR, UNEXPECTED, FAILED, or NO ANSWER if the
+    session ended during the call); skipped: tools we
+    couldn't build an input for."""
+    return {"tools": [], "calls": [], "skipped": []}
+
+
+async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr,
+              session_record: dict | None = None) -> dict:
     """Run one MCP session and return a record of what was exercised.
 
     `errlog` receives the subprocess's stderr. In the sandbox that stream is
     the strace trace, so run_sandboxed passes the trace file here.
+    `session_record` is filled in as the session goes, so if the session
+    fails half-way the caller still has everything recorded until then (#23).
     """
-    # calls: tools that were called; skipped: tools we couldn't build an input for.
-    session_record = {"tools": [], "calls": [], "skipped": []}
+    if session_record is None:
+        session_record = new_session_record()
 
     # stdio_client spawns the subprocess and gives us its stdin/stdout streams.
     async with stdio_client(params, errlog=errlog) as (read_stream, write_stream):
@@ -112,12 +126,18 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
                     session_record["skipped"].append({"tool": tool.name, "reason": f"no valid input: {exc}"})
                     continue
                 print(f"Calling {tool.name}({args})")
-                result = await session.call_tool(tool.name, args)
-                status, text = result_text(result)
-                print(f"  -> [{status}] {text}")
-                session_record["calls"].append(
-                    {"tool": tool.name, "arguments": args, "status": status, "result": text}
-                )
+                # Recorded BEFORE the call, so a session that dies during it
+                # still shows the call was made and never answered (#23).
+                call = {"tool": tool.name, "arguments": args, "status": "NO ANSWER",
+                        "result": "the session ended before the call returned"}
+                session_record["calls"].append(call)
+                try:
+                    result = await session.call_tool(tool.name, args,
+                                                     read_timeout_seconds=CALL_TIMEOUT_SECONDS)
+                    call["status"], call["result"] = result_text(result)
+                except Exception as exc:  # e.g. this call timed out: record it, go on (#23)
+                    call["status"], call["result"] = "FAILED", describe_error(exc)
+                print(f"  -> [{call['status']}] {call['result']}")
     # Leaving the `async with` closes the server's stdin and waits for it to
     # exit. In the sandbox, that's what lets strace finish writing the trace.
     return session_record
@@ -157,14 +177,15 @@ def run_sandboxed(server_script: Path, policy_path: Path) -> dict:
     # Any failure (image missing, server crash, timeout) is recorded, not
     # raised: the report must still be written, with verdict INCOMPLETE.
     # The container's stderr (the trace) goes straight into trace_file.
+    session = new_session_record()  # filled in by run(), kept even if it fails half-way
     with open(trace_file, "w", encoding="utf-8") as trace_out:
         try:
-            session = asyncio.run(asyncio.wait_for(run(params, server_script.name, trace_out),
-                                                   SESSION_TIMEOUT_SECONDS))
+            asyncio.run(asyncio.wait_for(run(params, server_script.name, trace_out, session),
+                                         SESSION_TIMEOUT_SECONDS))
         except BaseException as exc:  # includes ExceptionGroup from anyio task groups
             if isinstance(exc, KeyboardInterrupt):
                 raise
-            session = {"tools": [], "calls": [], "error": describe_error(exc)}
+            session["error"] = describe_error(exc)
             print(f"Session failed: {session['error']}")
 
     trace_text = trace_file.read_text(encoding="utf-8", errors="replace") if trace_file.exists() else ""
