@@ -487,6 +487,10 @@ def _startup_exit_reason(events: list[Event], server_launch: Event | None, relay
 # Install phase (#16): `sandglass scan` traces the install too
 # ---------------------------------------------------------------------------
 
+# How strace prints the loopback addresses in a sockaddr.
+LOOPBACK_ADDRESSES = ('inet_addr("127.0.0.1")', 'inet_pton(AF_INET6, "::1"')
+
+
 def compare_install(events: list[Event], policy: Policy, baseline: InstallBaseline,
                     exit_code: int | None, log: str = "", trace_cut_short: bool = False) -> dict:
     """Judge the install trace. Every reported event gets phase "install".
@@ -498,7 +502,8 @@ def compare_install(events: list[Event], policy: Policy, baseline: InstallBaseli
       writes    /package, /tmp, /dev/null (nothing else is writable anyway)
       programs  the first exec (the installer's shell), then the baseline's
                 sh / cp / env / node / npm / Python / uname
-      network   sockets of a family that can't leave the machine (AF_NETLINK)
+      network   sockets of a family that can't leave the machine (AF_NETLINK),
+                and bind() to the loopback address (pip checking for IPv6)
     A new symlink or hard link counts as a READ of where it points: a link in
     /tmp to ~/.aws/credentials would otherwise make that read look allowed.
     Everything else follows the same rules as the server's run (violation /
@@ -551,7 +556,10 @@ def compare_install(events: list[Event], policy: Policy, baseline: InstallBaseli
                        _bucket_for_failure_or_success(event))
         elif event.kind == "network":
             family = re.search(r"sa_family=(\w+)", event.target)
-            if not policy.network_allow and not (family and family[1] in baseline.network_families_allow):
+            local_family = family is not None and family[1] in baseline.network_families_allow
+            loopback_bind = (baseline.loopback_bind_allow and event.syscall == "bind"
+                             and any(address in event.target for address in LOOPBACK_ADDRESSES))
+            if not policy.network_allow and not local_family and not loopback_bind:
                 record(event, "network activity during the install", "violation")
         elif event.kind == "io_uring":
             if event.succeeded:

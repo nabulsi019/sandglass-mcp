@@ -69,3 +69,8 @@ exec_allow:
 # socket to list the network interfaces; it can't reach any other host.
 network_families_allow:
   - AF_NETLINK
+
+# bind() to the loopback address (127.0.0.1 or ::1), never connect(): pip's
+# bundled urllib3 binds a socket to ::1, port 0, to see whether IPv6 works.
+# Binding is local; anything that connects or sends is still a violation.
+loopback_bind_allow: true

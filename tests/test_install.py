@@ -78,6 +78,22 @@ def test_install_misbehaviour_is_flagged_in_the_install_phase(line, expected):
     assert {v["phase"] for v in result["violations"]} == {"install"}
 
 
+IPV6_LOOPBACK = ('{sa_family=AF_INET6, sin6_port=htons(0), sin6_flowinfo=htonl(0), '
+                 'inet_pton(AF_INET6, "::1", &sin6_addr), sin6_scope_id=0}')
+
+
+@pytest.mark.parametrize("line, flagged", [
+    # pip's urllib3 checking for IPv6 (seen on the CI runner, which has IPv6 loopback).
+    (f"10    10:00:01.5 bind(3<socket:[5]>, {IPV6_LOOPBACK}, 28) = 0", False),
+    ('10    10:00:01.5 bind(3<socket:[5]>, {sa_family=AF_INET, sin_port=htons(0), sin_addr=inet_addr("127.0.0.1")}, 16) = 0', False),
+    # Connecting is never allowed, not even to loopback; binding elsewhere neither.
+    (f"10    10:00:01.5 connect(3<socket:[5]>, {IPV6_LOOPBACK}, 28) = -1 ECONNREFUSED (Connection refused)", True),
+    ('10    10:00:01.5 bind(3<socket:[5]>, {sa_family=AF_INET, sin_port=htons(0), sin_addr=inet_addr("0.0.0.0")}, 16) = 0', True),
+])
+def test_only_loopback_binds_are_allowed(line, flagged):
+    assert bool(found(judge(NPM + [line]))) is flagged
+
+
 def test_a_failed_install_is_incomplete_with_the_end_of_its_log():
     result = judge(NPM, exit_code=1, log="npm ERR! ENOTCACHED")
     assert result["incomplete_reasons"] == [
