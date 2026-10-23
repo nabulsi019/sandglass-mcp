@@ -66,8 +66,9 @@ def test_read_only_folder(line, expected):
 # --- no_network.v1 ---------------------------------------------------------------
 
 @pytest.mark.parametrize("line, expected", [
-    (read(CREDS), ("CLEAN", [])),                 # reads aren't restricted (documented)
-    (read("/etc/passwd"), ("CLEAN", [])),
+    (read(CREDS), ("VIOLATIONS", [("read", CREDS)])),   # read_deny: /home (#121)
+    (read("/root/.ssh/id_rsa"), ("VIOLATIONS", [("read", "/root/.ssh/id_rsa")])),
+    (read("/etc/passwd"), ("CLEAN", [])),         # other reads aren't restricted (documented)
     (write("/tmp/cache"), ("CLEAN", [])),
     (write("/home/sandglass/.bashrc"), ("VIOLATIONS", [("write", "/home/sandglass/.bashrc")])),
     (EXEC_SH, ("VIOLATIONS", [(None, "/bin/sh")])),
@@ -85,7 +86,8 @@ def test_no_network(line, expected):
     (asked_sink_for("evil.example.net"), ("VIOLATIONS", [("domain", "evil.example.net")])),
     (asked_sink_for("sub.api.example.com"), ("VIOLATIONS", [("domain", "sub.api.example.com")])),  # exact only
     (CONNECT, ("VIOLATIONS", [(None, '{sa_family=AF_INET, sin_port=htons(443), sin_addr=inet_addr("93.184.216.34")}')])),
-    (read(CREDS), ("CLEAN", [])),
+    (read(CREDS), ("VIOLATIONS", [("read", CREDS)])),   # read_deny: /home (#121)
+    (read("/etc/passwd"), ("CLEAN", [])),
     (write("/tmp/cache"), ("CLEAN", [])),
     (write("/opt/venv/lib/x.py"), ("VIOLATIONS", [("write", "/opt/venv/lib/x.py")])),
     (EXEC_SH, ("VIOLATIONS", [(None, "/bin/sh")])),
@@ -117,6 +119,15 @@ def test_template_is_versioned_and_named_after_its_file(path):
 @pytest.mark.parametrize("path", all_templates(), ids=lambda p: p.name)
 def test_template_is_documented_in_the_readme(path):
     assert f"policies/templates/{path.name}" in (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("name, deny", [
+    ("no_network", ["/home", "/root"]),
+    ("listed_domains_only", ["/home", "/root"]),
+    ("read_only_folder", []),   # reads only /data anyway
+])
+def test_read_anywhere_templates_deny_home_folders(name, deny):
+    assert [str(p) for p in template(name).read_deny] == deny
 
 
 @pytest.mark.parametrize("path", all_templates(), ids=lambda p: p.name)

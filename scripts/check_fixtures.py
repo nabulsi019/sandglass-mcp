@@ -73,6 +73,17 @@ EXPECTED_V04 = {
 }
 
 
+# Fixtures run under another policy than notes_readonly (#121 onwards).
+# fixture -> (policy file, expected verdict, expected violations)
+EXPECTED_POLICY_RUNS = {
+    # "Read anywhere" stops at home folders (read_deny: /home, /root).
+    "aws_credentials_server.py": (PROJECT_ROOT / "policies" / "templates" / "no_network.v1.yaml",
+                                  "VIOLATIONS", {
+                                      ("read", "/home/sandglass/.aws/credentials"),
+                                  }),
+}
+
+
 # `sandglass scan` of our own test packages (#19), from the local test
 # registry that scripts/build_test_packages.py builds (no network). Also v0.4,
 # not protected yet. package spec -> (expected verdict, expected violations)
@@ -175,6 +186,11 @@ def main() -> int:
         failures += [f"{fixture}: INCOMPLETE reasons don't mention {text!r}: {reasons}"
                      for text in want_reasons if text not in reasons]
 
+    for fixture, (policy, want_verdict, want_violations) in EXPECTED_POLICY_RUNS.items():
+        print(f"\n===== {fixture} under {policy.name} =====")
+        report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, policy)
+        failures += check(f"{fixture} under {policy.name}", report, want_verdict, want_violations)
+
     build_test_packages()
     for package, (want_verdict, want_violations) in EXPECTED_SCANS.items():
         print(f"\n===== scan {package} =====")
@@ -194,7 +210,7 @@ def main() -> int:
     for line in failures:
         print("FAIL", line)
     if not failures:
-        total = len(EXPECTED) + len(EXPECTED_V04) + len(EXPECTED_SCANS)
+        total = len(EXPECTED) + len(EXPECTED_V04) + len(EXPECTED_POLICY_RUNS) + len(EXPECTED_SCANS)
         print(f"all {total} fixtures match expectations")
     return 1 if failures else 0
 

@@ -60,6 +60,9 @@ class Policy:
     allow_domains: list[str] = field(default_factory=list)      # domains the server may contact (via the sink)
     baseline_name: str | None = None                            # sandbox only
     baseline_read_allow: list[Path] = field(default_factory=list)  # sandbox only: READS only
+    # Reads that are ALWAYS a violation, even under read_allow, runtime_allow
+    # or the baseline: deny wins (#121). e.g. /home in a "read anywhere" template.
+    read_deny: list[Path] = field(default_factory=list)
 
 
 INSTALL_BASELINE_FILE = BASELINES_DIR / "install.yaml"
@@ -254,6 +257,9 @@ def load_policy(
         name=_require(data, "name", str, ""),
         description=_require(data, "description", str, ""),
         read_allow=_path_list(filesystem, "read_allow", "filesystem.", values, in_sandbox),
+        # Optional (#121); same path rules as read_allow.
+        read_deny=(_path_list(filesystem, "read_deny", "filesystem.", values, in_sandbox)
+                   if "read_deny" in filesystem else []),
         write_allow=_path_list(filesystem, "write_allow", "filesystem.", values, in_sandbox),
         network_allow=_require(network, "allow", bool, "network."),
         allow_domains=_domains(network),

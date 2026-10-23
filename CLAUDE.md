@@ -29,6 +29,10 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
     npm:sandglass-test-postinstall's violation; the stop reasons of
     pypi:sandglass-test-tampered; and the failed attempts
     pypi:sandglass-test-peek must show)
+  - every `EXPECTED_POLICY_RUNS` entry in `scripts/check_fixtures.py` (the
+    policy, verdict and exact violations of aws_credentials_server under
+    policies/templates/no_network.v1.yaml), and the `read_deny: [/home, /root]`
+    of the no_network.v1 and listed_domains_only.v1 templates
   - the sandbox hardening flags (--network none, --read-only, non-root user,
     no --cap-add)
   - the strace permissions: `chmod 0711 /usr/bin/strace` in the Dockerfile
