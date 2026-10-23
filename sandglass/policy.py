@@ -74,6 +74,7 @@ class InstallBaseline:
     write_allow: list[PurePosixPath]    # /package, /tmp, /dev/null
     exec_allow: list[PurePosixPath]     # sh, cp, node, npm, the image's Python, ...
     network_families_allow: list[str]   # e.g. AF_NETLINK: sockets that can't leave the machine
+    loopback_bind_allow: bool           # bind() to 127.0.0.1 / ::1 (pip checking for IPv6)
 
 
 def load_install_baseline(multiarch: str) -> InstallBaseline:
@@ -92,6 +93,7 @@ def load_install_baseline(multiarch: str) -> InstallBaseline:
         write_allow=_path_list(data, "write_allow", "install.", values, True),
         exec_allow=_path_list(data, "exec_allow", "install.", values, True),
         network_families_allow=_strings(data, "network_families_allow", "install."),
+        loopback_bind_allow=_require(data, "loopback_bind_allow", bool, "install."),
     )
 
 
