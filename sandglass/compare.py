@@ -797,8 +797,16 @@ def _package_section(r: dict) -> list[str]:
         lines.append(f"- Entry point: `{p['entry']['name']}` = `{p['entry']['path']}`")
     else:
         lines.append("- Entry point: none (not reached)")
+    h = p.get("hash")
+    if h:
+        verdict = "matches" if h["match"] else "**DOES NOT MATCH**"
+        lines.append(f"- Hash (#21): `{h['file']}` {h['algorithm']} `{h['ours']}` {verdict}"
+                     f" the value published by {h['source']}"
+                     + ("" if h["match"] else f" (`{h['published']}`)"))
+    else:
+        lines.append("- Hash: not checked (the download didn't get that far)")
     lines += ["- Downloaded on the host:" if p["files"] else "- Downloaded on the host: nothing"]
-    lines += [f"  - `{f['name']}` ({f['size']} bytes)" for f in p["files"]]
+    lines += [f"  - `{f['name']}` ({f['size']} bytes, sha256 `{f.get('sha256', '?')}`)" for f in p["files"]]
     return lines
 
 

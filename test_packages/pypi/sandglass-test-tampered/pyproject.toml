@@ -1,0 +1,17 @@
+# A test package for `sandglass scan` (#21): a clean notes server whose file
+# does NOT match the hash its (local test) registry publishes, like a file
+# changed after it was published. Expected: INCOMPLETE, never installed.
+# Written for testing Sandglass only; never published.
+
+[project]
+name = "sandglass-test-tampered"
+version = "1.0.0"
+description = "Sandglass test package: its published hash is deliberately wrong"
+dependencies = []
+
+[project.scripts]
+sandglass-test-tampered = "sandglass_test_tampered.server:main"
+
+# Read by scripts/build_test_packages.py: write a wrong "published" sha256.
+[tool.sandglass-test]
+wrong_published_hash = true

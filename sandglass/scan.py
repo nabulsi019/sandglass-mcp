@@ -15,9 +15,13 @@ The steps, in order (client.run_scan runs them and writes the report):
                           lockfile are kept.
                   With --registry-dir, our own test packages come from a local
                   folder instead of PyPI/npm (no network at all).
+  2b. hash        (#21) the package's own file is hashed and compared with the
+                  value the registry publishes (PyPI sha256, npm dist.integrity);
+                  a mismatch stops the scan before the install
   3. install      INSIDE the sandbox (sandbox.scan_install_command): offline, no
                   network, into a fresh Docker volume at /package, the only
-                  writable folder besides /tmp. Not traced yet (#16).
+                  writable folder besides /tmp. Traced with strace (#16):
+                  compare.compare_install judges it as the "install" phase.
   4. entry point  which program starts the server: a console script (pypi) or
                   a "bin" of package.json (npm). --entry picks one if there
                   are several. Read from the downloaded files on the host
@@ -26,7 +30,9 @@ The steps, in order (client.run_scan runs them and writes the report):
 Every failure is a ScanError with a plain reason; the scan is then INCOMPLETE.
 """
 
+import base64
 import configparser
+import hashlib
 import json
 import posixpath
 import re
@@ -34,6 +40,8 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import urllib.parse
+import urllib.request
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -96,6 +104,8 @@ class Prepared:
     folder: Path                                       # mounted at /download in the install
     files: list[Path] = field(default_factory=list)    # the package files that were downloaded
     entries: dict[str, str] = field(default_factory=dict)  # entry name -> path inside the container
+    artifact: Path | None = None   # the package's own file (wheel / tarball): its hash is checked (#21)
+    labels: dict[Path, str] = field(default_factory=dict)  # name to show for a file (npm cache names are hashes)
 
 
 def parse_spec(text: str) -> PackageSpec:
@@ -171,7 +181,7 @@ def _download_pypi(spec, folder, multiarch, registry_dir) -> Prepared:
     files = sorted(folder.glob("*.whl"))
     main = _main_wheel(spec, files)
     entries = {name: str(sandbox.CONTAINER_SITE / "bin" / name) for name in _console_scripts(main)}
-    return Prepared(spec, folder, files, entries)
+    return Prepared(spec, folder, files, entries, artifact=main)
 
 
 def _normalize(name: str) -> str:
@@ -225,6 +235,7 @@ def _download_npm(spec, folder, registry_dir) -> Prepared:
         (project / "package.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         package_json = _package_json_from_tarball(folder / tarball.name)
         files = [folder / tarball.name]
+        artifact, labels = files[0], {}
     else:
         npm = shutil.which("npm")
         if npm is None:
@@ -238,8 +249,7 @@ def _download_npm(spec, folder, registry_dir) -> Prepared:
         # Only the cache and the lockfile go into the sandbox; the files npm
         # unpacked here are deleted (they were never run).
         shutil.rmtree(project / "node_modules")
-        files = sorted((folder / "npm-cache").rglob("*"))
-        files = [f for f in files if f.is_file()]
+        files, labels, artifact = _cache_tarballs(spec, folder)
 
     if package_json.get("name") != spec.name or package_json.get("version") != spec.version:
         raise ScanError(f"the downloaded package.json says {package_json.get('name')}@"
@@ -251,7 +261,38 @@ def _download_npm(spec, folder, registry_dir) -> Prepared:
         if target.startswith(("/", "../")) or target == "..":
             raise ScanError(f"bin {name!r} points outside the package: {target!r}")
         entries[name] = str(package_dir / target)
-    return Prepared(spec, folder, files, entries)
+    return Prepared(spec, folder, files, entries, artifact=artifact, labels=labels)
+
+
+def _cache_tarballs(spec: PackageSpec, folder: Path) -> tuple[list[Path], dict[Path, str], Path]:
+    """The tarballs npm put in the cache, found through the lockfile.
+
+    npm's cache (cacache) stores each tarball under its own hash, so the
+    lockfile's "integrity" of every package says where it is. Returns (files,
+    their names to show, the package's own tarball).
+    """
+    lock = json.loads((folder / "project" / "package-lock.json").read_text(encoding="utf-8"))
+    files, labels, artifact = [], {}, None
+    for key, info in sorted(lock.get("packages", {}).items()):
+        if not key or "integrity" not in info:
+            continue  # "" is the scan's own package.json
+        path = cache_content_path(folder / "npm-cache", info["integrity"])
+        if not path.is_file():
+            raise ScanError(f"{key} is not in the downloaded npm cache")
+        files.append(path)
+        labels[path] = f"{key.removeprefix('node_modules/')}@{info.get('version')} (npm cache)"
+        if key == f"node_modules/{spec.name}":
+            artifact = path
+    if artifact is None:
+        raise ScanError(f"the lockfile doesn't list {spec.name}")
+    return files, labels, artifact
+
+
+def cache_content_path(cache: Path, integrity: str) -> Path:
+    """Where cacache keeps the file with this integrity (its sha512 entry)."""
+    algorithm, digest = _pick_sri(integrity)
+    hex_digest = base64.b64decode(digest).hex()
+    return cache / "_cacache" / "content-v2" / algorithm / hex_digest[:2] / hex_digest[2:4] / hex_digest[4:]
 
 
 def _package_json_from_tarball(tarball: Path) -> dict:
@@ -292,6 +333,117 @@ def choose_entry(prepared: Prepared, wanted: str | None) -> tuple[str, str]:
         raise ScanError("the package declares no entry point (console script or npm bin) "
                         "to start a server with")
     raise ScanError(f"the package has several entry points, pick one with --entry: {sorted(entries)}")
+
+
+# ---------------------------------------------------------------------------
+# Step 2b: the package hash (#21), checked before anything is installed
+# ---------------------------------------------------------------------------
+
+PYPI_JSON_URL = "https://pypi.org/pypi/{name}/{version}/json"
+NPM_VERSION_URL = "https://registry.npmjs.org/{name}/{version}"
+REGISTRY_TIMEOUT_SECONDS = 30
+# The SRI algorithms npm uses, strongest first.
+SRI_ALGORITHMS = ("sha512", "sha384", "sha256", "sha1")
+
+
+def sha256_hex(path: Path) -> str:
+    """The file's sha256, as hex (what PyPI publishes)."""
+    return _digest(path, "sha256").hex()
+
+
+def sri(path: Path, algorithm: str = "sha512") -> str:
+    """The file's Subresource Integrity string, "sha512-<base64>" (what npm publishes)."""
+    return f"{algorithm}-{base64.b64encode(_digest(path, algorithm)).decode()}"
+
+
+def _digest(path: Path, algorithm: str) -> bytes:
+    h = hashlib.new(algorithm)
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.digest()
+
+
+def _pick_sri(integrity: str) -> tuple[str, str]:
+    """(algorithm, base64 digest) of the strongest hash in an SRI string.
+    npm's may hold several, space-separated: "sha512-... sha1-..."."""
+    found = dict(item.split("-", 1) for item in integrity.split() if "-" in item)
+    for algorithm in SRI_ALGORITHMS:
+        if algorithm in found:
+            return algorithm, found[algorithm]
+    raise ScanError(f"no supported hash in the integrity value {integrity!r}")
+
+
+def registry_url(spec: PackageSpec) -> str:
+    """Where the registry publishes this exact version's metadata."""
+    if spec.ecosystem == "pypi":
+        return PYPI_JSON_URL.format(name=spec.name, version=spec.version)
+    return NPM_VERSION_URL.format(name=urllib.parse.quote(spec.name, safe="@"), version=spec.version)
+
+
+def fetch_json(url: str) -> dict:
+    """GET a registry's JSON (metadata only, never package code). ScanError if it fails."""
+    try:
+        with urllib.request.urlopen(url, timeout=REGISTRY_TIMEOUT_SECONDS) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ScanError(f"could not get the published hash from {url}: {exc}") from None
+
+
+def published_metadata(spec: PackageSpec, registry_dir: Path | None, fetch=fetch_json) -> tuple[dict, str]:
+    """(metadata, where it came from). A local test registry keeps registry-style
+    metadata next to the files (scripts/build_test_packages.py writes it)."""
+    if registry_dir is None:
+        url = registry_url(spec)
+        return fetch(url), url
+    path = registry_dir / f"{spec.ecosystem}-meta" / spec.name / f"{spec.version}.json"
+    if not path.is_file():
+        raise ScanError(f"could not get the published hash: {path} doesn't exist")
+    return (json.loads(path.read_text(encoding="utf-8")),
+            f"the local test registry ({path.relative_to(registry_dir).as_posix()})")
+
+
+def compare_hash(spec: PackageSpec, artifact: Path, metadata: dict) -> dict:
+    """Our hash of the downloaded artifact vs the registry's published one.
+
+      pypi  sha256 hex  vs  urls[].digests.sha256 of the same file name
+      npm   SRI         vs  dist.integrity (or dist.shasum, sha1 hex, for old packages)
+    Returns {"algorithm", "ours", "published", "match"}; ScanError if the
+    registry publishes nothing to compare with.
+    """
+    if spec.ecosystem == "pypi":
+        listed = [u for u in metadata.get("urls", []) if u.get("filename") == artifact.name]
+        if not listed or "sha256" not in listed[0].get("digests", {}):
+            raise ScanError(f"the registry lists no sha256 for {artifact.name}")
+        ours, published, algorithm = sha256_hex(artifact), listed[0]["digests"]["sha256"].lower(), "sha256"
+    else:
+        dist = metadata.get("dist", {})
+        if dist.get("integrity"):
+            algorithm, digest = _pick_sri(dist["integrity"])
+            published, ours = f"{algorithm}-{digest}", sri(artifact, algorithm)
+        elif dist.get("shasum"):
+            algorithm, published, ours = "sha1", dist["shasum"].lower(), _digest(artifact, "sha1").hex()
+        else:
+            raise ScanError(f"the registry publishes no integrity or shasum for {spec}")
+    return {"algorithm": algorithm, "ours": ours, "published": published, "match": ours == published}
+
+
+def verify_hash(prepared: Prepared, registry_dir: Path | None, fetch=fetch_json) -> dict:
+    """Check the package's own artifact against the registry (#21).
+
+    Returns the comparison (with "file" and "source") for the report, match or
+    not; the caller stops the scan on a mismatch.
+    """
+    metadata, source = published_metadata(prepared.spec, registry_dir, fetch)
+    result = compare_hash(prepared.spec, prepared.artifact, metadata)
+    name = prepared.labels.get(prepared.artifact, prepared.artifact.name)
+    return {"file": name, "source": source, **result}
+
+
+def describe_files(prepared: Prepared) -> list[dict]:
+    """Every downloaded file, with its size and sha256, for the report."""
+    return [{"name": prepared.labels.get(f, f.name), "size": f.stat().st_size, "sha256": sha256_hex(f)}
+            for f in prepared.files]
 
 
 # ---------------------------------------------------------------------------

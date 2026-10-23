@@ -293,6 +293,7 @@ def run_scan(spec: scan.PackageSpec, policy_path: Path, registry_dir: Path | Non
         "source": (f"local test registry {registry_dir}" if registry_dir else
                    "PyPI" if spec.ecosystem == "pypi" else "the npm registry"),
         "files": [], "entry": None,
+        "hash": None,     # the package hash vs the registry's (#21)
         "install": None,  # filled in once the install has run (#16)
     }
     print(f"Scanning {spec} (from {package['source']})")
@@ -304,7 +305,15 @@ def run_scan(spec: scan.PackageSpec, policy_path: Path, registry_dir: Path | Non
         folder.chmod(0o755)  # the install container's user must be able to read it
         try:
             prepared = scan.download(spec, folder, multiarch, registry_dir)
-            package["files"] = [{"name": f.name, "size": f.stat().st_size} for f in prepared.files]
+            package["files"] = scan.describe_files(prepared)  # each with its sha256
+            # The package hash (#21): compared with the registry's before any install.
+            package["hash"] = scan.verify_hash(prepared, registry_dir)
+            h = package["hash"]
+            print(f"Hash of {h['file']}: {h['ours']} ({'matches' if h['match'] else 'DOES NOT MATCH'}"
+                  f" {h['source']})")
+            if not h["match"]:
+                raise scan.ScanError(f"package hash mismatch: {h['file']} has {h['algorithm']} {h['ours']}, "
+                                     f"but {h['source']} publishes {h['published']}; not installed")
             entry_name, server_path = scan.choose_entry(prepared, entry)
             package["entry"] = {"name": entry_name, "path": server_path}
             print(f"Entry point: {entry_name} -> {server_path}")
