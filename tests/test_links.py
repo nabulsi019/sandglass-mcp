@@ -92,6 +92,56 @@ def test_either_path_outside_the_policy_is_a_violation():
     assert run([LAUNCH, same, EXITED], policy=notes)["verdict"] == "CLEAN"
 
 
+# --- /proc/self can't excuse a read that leaves /proc (#131) ----------------------
+
+ROOT_ESCAPE = (f'10 10:00:00.2 openat(AT_FDCWD, "/proc/self/root{CREDS}", O_RDONLY|O_CLOEXEC)'
+               f' = 7<{CREDS}>')
+OPEN_CREDS = f'10 10:00:00.3 openat(AT_FDCWD, "{CREDS}", O_RDONLY|O_CLOEXEC) = 8<{CREDS}>'
+FD_REOPEN = f'10 10:00:00.4 openat(AT_FDCWD, "/proc/self/fd/100", O_RDONLY|O_CLOEXEC) = 9<{CREDS}>'
+NOTE = "/project/test_servers/allowed_notes/hello.txt"
+
+
+def notes_readonly():
+    return load_policy(PROJECT_ROOT / "policies" / "notes_readonly.yaml",
+                       server_script=PROJECT_ROOT / "test_servers" / "good_notes_server.py",
+                       in_sandbox=True, multiarch="x86_64-linux-gnu")
+
+
+@pytest.mark.parametrize("policy, expected", [
+    # Read anywhere but /home: the requested /proc paths are fine, the opened file isn't.
+    (lambda: template("no_network"), [("read", CREDS)] * 3),
+    # Only the notes folder: the requested paths are already outside it.
+    (notes_readonly, [("read", f"/proc/self/root{CREDS}"), ("read", CREDS),
+                      ("read", "/proc/self/fd/100")]),
+])
+def test_proc_self_root_and_fd_escapes_are_violations(policy, expected):
+    result = run([LAUNCH, ROOT_ESCAPE, OPEN_CREDS, FD_REOPEN, EXITED], policy=policy())
+    assert result["verdict"] == "VIOLATIONS"
+    assert [(v["mode"], v["target"]) for v in result["violations"]] == expected
+    # Under either policy, the report names the file really opened.
+    assert all(v.get("opened", CREDS) == CREDS for v in result["violations"])
+
+
+def test_proc_self_fd_reopening_an_allowed_file_stays_allowed():
+    note = f'10 10:00:00.3 openat(AT_FDCWD, "{NOTE}", O_RDONLY|O_CLOEXEC) = 8<{NOTE}>'
+    reopen = f'10 10:00:00.4 openat(AT_FDCWD, "/proc/self/fd/8", O_RDONLY|O_CLOEXEC) = 9<{NOTE}>'
+    # Under no_network.v1 /proc/self/fd/8 and the note are both readable: CLEAN.
+    assert run([LAUNCH, note, reopen, EXITED], policy=template("no_network"))["verdict"] == "CLEAN"
+    # The opened path is the note itself, never mapped back to /proc.
+    assert parse_trace(reopen)[0].opened == NOTE
+
+
+@pytest.mark.parametrize("requested, opened", [
+    ("/proc/self/root/proc/1/environ", "/proc/1/environ"),   # through /proc/self/root
+    ("/proc/self/fd/5", "/proc/1/environ"),                  # an fd of another process's file
+    ("/proc/self/environ", "/proc/1/cmdline"),               # a different file
+    ("/proc/self/root/proc/self/environ", "/proc/1/environ"),
+])
+def test_another_pids_proc_file_is_never_mapped(requested, opened):
+    line = f'8 10:00:00.1 openat(AT_FDCWD, "{requested}", O_RDONLY) = 3<{opened}>'
+    assert parse_trace(line)[0].opened == opened
+
+
 # --- the install phase ----------------------------------------------------------
 
 def test_the_install_judges_the_opened_file_too():

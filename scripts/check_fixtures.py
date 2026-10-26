@@ -93,6 +93,29 @@ EXPECTED_POLICY_RUNS = {
 }
 
 
+# Hostile fixtures (#131 onwards): servers that actively try to hide what they
+# do from the tracer, each run through the real sandbox. One fixture can run
+# under several policies, so the key is (fixture, policy name in POLICIES).
+# -> (expected verdict, expected violations as a LIST: the same file can be
+# caught more than once, text that must appear in the INCOMPLETE reasons)
+POLICIES = {
+    "notes_readonly": POLICY,
+    "no_network.v1": PROJECT_ROOT / "policies" / "templates" / "no_network.v1.yaml",
+}
+CREDS = "/home/sandglass/.aws/credentials"
+EXPECTED_HOSTILE = {
+    # Reads the credentials through /proc/self/root and /proc/self/fd (#131).
+    # Read anywhere but /home: each read is judged by the file really opened.
+    ("proc_self_escape_server.py", "no_network.v1"): ("VIOLATIONS", [
+        ("read", CREDS), ("read", CREDS), ("read", CREDS),
+    ], []),
+    # Notes only: the paths asked for are already outside the policy.
+    ("proc_self_escape_server.py", "notes_readonly"): ("VIOLATIONS", [
+        ("read", f"/proc/self/root{CREDS}"), ("read", CREDS), ("read", "/proc/self/fd/100"),
+    ], []),
+}
+
+
 # `sandglass scan` of our own test packages (#19), from the local test
 # registry that scripts/build_test_packages.py builds (no network). Also v0.4,
 # not protected yet. package spec -> (expected verdict, expected violations)
@@ -209,6 +232,15 @@ def main() -> int:
         report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, policy)
         failures += check(f"{fixture} under {policy.name}", report, want_verdict, want_violations)
 
+    for (fixture, policy_name), (want_verdict, want_violations, want_reasons) in EXPECTED_HOSTILE.items():
+        label = f"{fixture} under {policy_name}"
+        print(f"\n===== {label} =====")
+        report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, POLICIES[policy_name])
+        failures += check(label, report, want_verdict, want_violations)
+        reasons = " | ".join(report.get("incomplete_reasons", []))
+        failures += [f"{label}: INCOMPLETE reasons don't mention {text!r}: {reasons}"
+                     for text in want_reasons if text not in reasons]
+
     build_test_packages()
     for package, (want_verdict, want_violations) in EXPECTED_SCANS.items():
         print(f"\n===== scan {package} =====")
@@ -228,7 +260,8 @@ def main() -> int:
     for line in failures:
         print("FAIL", line)
     if not failures:
-        total = len(EXPECTED) + len(EXPECTED_V04) + len(EXPECTED_POLICY_RUNS) + len(EXPECTED_SCANS)
+        total = (len(EXPECTED) + len(EXPECTED_V04) + len(EXPECTED_POLICY_RUNS) + len(EXPECTED_HOSTILE)
+                 + len(EXPECTED_SCANS))
         print(f"all {total} fixtures match expectations")
     return 1 if failures else 0
 

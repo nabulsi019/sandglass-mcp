@@ -36,6 +36,15 @@ def test_every_v04_expectation_is_protected():
             assert short in PROTECTED, f"{name} entry {fixture} is not in CLAUDE.md's protected items"
 
 
+def test_every_hostile_fixture_is_protected():
+    # (#131 onwards) every hostile fixture, under every policy it runs with.
+    for fixture, policy_name in check_fixtures.EXPECTED_HOSTILE:
+        assert fixture.removesuffix(".py").removesuffix(".js") in PROTECTED, \
+            f"EXPECTED_HOSTILE entry {fixture} is not in CLAUDE.md's protected items"
+        assert policy_name in PROTECTED, f"policy {policy_name} is not in CLAUDE.md's protected items"
+        assert policy_name in check_fixtures.POLICIES
+
+
 def test_every_expectation_dict_is_protected():
     # A new EXPECTED_* dict must be added to the protected list too.
     for name in dir(check_fixtures):
