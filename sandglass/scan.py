@@ -15,6 +15,10 @@ The steps, in order (client.run_scan runs them and writes the report):
                           lockfile are kept.
                   With --registry-dir, our own test packages come from a local
                   folder instead of PyPI/npm (no network at all).
+  2a. archives    (#133) every downloaded file is checked member by member
+                  (headers only, never unpacked): absolute or ".." paths,
+                  links out, devices, or too big -> the scan stops
+                  (check_archive).
   2b. hash        (#21) the package's own file is hashed and compared with the
                   value the registry publishes (PyPI sha256, npm dist.integrity);
                   a mismatch stops the scan before the install
@@ -34,6 +38,7 @@ import base64
 import configparser
 import hashlib
 import json
+import os
 import posixpath
 import re
 import shutil
@@ -147,15 +152,148 @@ def download(spec: PackageSpec, folder: Path, multiarch: str,
 
 
 def _run_host(command: list[str], what: str, cwd: Path | None = None) -> None:
-    """Run a download command on the host; ScanError with its output if it fails."""
+    """Run a download command on the host; ScanError with its output if it fails.
+
+    npm must never run a package's install scripts on the host (#133): an npm
+    command without --ignore-scripts is refused before it starts (fail closed),
+    and npm_config_ignore_scripts is set as well.
+    """
+    env = None
+    if Path(command[0]).name.startswith("npm"):
+        if "--ignore-scripts" not in command:
+            raise ScanError(f"{what}: refusing to run npm on the host without --ignore-scripts")
+        env = {**os.environ, "npm_config_ignore_scripts": "true"}
     try:
         out = subprocess.run(command, cwd=cwd, capture_output=True, text=True,
-                             timeout=HOST_TIMEOUT_SECONDS)
+                             timeout=HOST_TIMEOUT_SECONDS, env=env)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ScanError(f"{what} failed: {exc}") from None
     if out.returncode != 0:
         log = (out.stdout + out.stderr).strip()[-INSTALL_LOG_CHARS:]
         raise ScanError(f"{what} failed (exit {out.returncode}): {log}")
+
+
+# ---------------------------------------------------------------------------
+# Step 2a: every downloaded archive is checked on the host, never unpacked (#133)
+# ---------------------------------------------------------------------------
+
+# Limits for one archive, uncompressed. A real MCP server package and each of
+# its dependencies is far below them; a bigger archive (or a "zip bomb" that
+# claims to be) is refused rather than handed to pip or npm.
+MAX_ARCHIVE_BYTES = 500 * 1024 * 1024
+MAX_ARCHIVE_FILES = 20_000
+# The most of one file (entry_points.txt, package.json) Sandglass reads out of an archive.
+MAX_METADATA_BYTES = 1024 * 1024
+
+
+def _unsafe_name(name: str) -> str | None:
+    """Why a member's path is unsafe to unpack, or None. Absolute paths and any
+    ".." component would land outside the folder it is unpacked into."""
+    parts = name.replace("\\", "/").split("/")  # a "\\" is a separator on Windows
+    if name.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", name):
+        return "an absolute path"
+    if ".." in parts:
+        return 'a path with a ".." component'
+    return None
+
+
+def _link_escapes(member_name: str, target: str, relative_to_member: bool) -> bool:
+    """Does a link member lead outside the archive's folder?
+
+    A symlink's target is relative to the folder of the link itself; a tar
+    hardlink's target is a path inside the archive (relative to its root).
+    """
+    if target.startswith("/") or not target:
+        return True
+    base = posixpath.dirname(member_name) if relative_to_member else ""
+    resolved = posixpath.normpath(posixpath.join(base, target))
+    return resolved == ".." or resolved.startswith("../")
+
+
+def check_archive(path: Path) -> None:
+    """Refuse an archive that would be unsafe to unpack; ScanError (INCOMPLETE) says why.
+
+    Only the member HEADERS are read (names, types, sizes); nothing is ever
+    written to disk. A member is refused if it is absolute or has a ".."
+    component, is a symlink or hardlink leading outside the archive, or is a
+    device or fifo; the whole archive is refused past MAX_ARCHIVE_FILES members
+    or MAX_ARCHIVE_BYTES uncompressed. Wheels and zips (.whl, .zip) and npm
+    tarballs (.tgz, and the npm cache's content files, which are tgz too).
+    """
+    try:
+        if zipfile.is_zipfile(path):
+            _check_zip(path)
+        else:
+            _check_tar(path)
+    except (OSError, EOFError, tarfile.TarError, zipfile.BadZipFile, ValueError) as exc:
+        raise ScanError(f"unsafe archive {path.name}: can't be read ({exc})") from None
+
+
+def _refuse(path: Path, member: str, why: str) -> ScanError:
+    return ScanError(f"unsafe archive {path.name}: member {member!r} is {why}; not installed")
+
+
+def _check_zip(path: Path) -> None:
+    with zipfile.ZipFile(path) as archive:
+        members = archive.infolist()
+        if len(members) > MAX_ARCHIVE_FILES:
+            raise ScanError(f"unsafe archive {path.name}: {len(members)} files, more than "
+                            f"{MAX_ARCHIVE_FILES}; not installed")
+        total = 0
+        for info in members:
+            why = _unsafe_name(info.filename)
+            if why:
+                raise _refuse(path, info.filename, why)
+            # Unix file type, kept in the top 16 bits of external_attr.
+            kind = (info.external_attr >> 16) & 0o170000
+            if kind == 0o120000:  # a symlink: its target is the member's content
+                if info.file_size > 4096:
+                    raise _refuse(path, info.filename, "a symlink with an oversized target")
+                with archive.open(info) as data:  # read at most 4097 bytes, whatever it claims
+                    target = data.read(4097).decode("utf-8", "replace")
+                if _link_escapes(info.filename, target, relative_to_member=True):
+                    raise _refuse(path, info.filename, f"a symlink leading outside the archive ({target})")
+            elif kind not in (0, 0o100000, 0o040000):  # not a plain file or folder
+                raise _refuse(path, info.filename, "a device, fifo or socket")
+            # file_size is the size the header claims once unpacked.
+            total += info.file_size
+            if total > MAX_ARCHIVE_BYTES:
+                raise ScanError(f"unsafe archive {path.name}: more than {MAX_ARCHIVE_BYTES // 2**20} MB "
+                                "uncompressed; not installed")
+
+
+def _check_tar(path: Path) -> None:
+    total = files = 0
+    # "r:*" opens plain or compressed tar; members are read one header at a time,
+    # so a huge (or endless) archive is stopped at the limits below.
+    with tarfile.open(path, "r:*") as archive:
+        for member in archive:
+            files += 1
+            if files > MAX_ARCHIVE_FILES:
+                raise ScanError(f"unsafe archive {path.name}: more than {MAX_ARCHIVE_FILES} files; "
+                                "not installed")
+            why = _unsafe_name(member.name)
+            if why:
+                raise _refuse(path, member.name, why)
+            if member.issym() and _link_escapes(member.name, member.linkname, relative_to_member=True):
+                raise _refuse(path, member.name, f"a symlink leading outside the archive ({member.linkname})")
+            if member.islnk() and (_unsafe_name(member.linkname)
+                                   or _link_escapes(member.name, member.linkname, relative_to_member=False)):
+                raise _refuse(path, member.name, f"a hardlink leading outside the archive ({member.linkname})")
+            if member.isdev():  # character/block device or fifo
+                raise _refuse(path, member.name, "a device or fifo")
+            total += member.size
+            if total > MAX_ARCHIVE_BYTES:
+                raise ScanError(f"unsafe archive {path.name}: more than {MAX_ARCHIVE_BYTES // 2**20} MB "
+                                "uncompressed; not installed")
+
+
+def _read_member(data, name: str) -> bytes:
+    """At most MAX_METADATA_BYTES of an archive member (an open file object)."""
+    content = data.read(MAX_METADATA_BYTES + 1)
+    if len(content) > MAX_METADATA_BYTES:
+        raise ScanError(f"{name} is bigger than {MAX_METADATA_BYTES // 1024} KB; not read")
+    return content
 
 
 def pip_download_command(spec: PackageSpec, dest: Path, multiarch: str,
@@ -179,6 +317,8 @@ def pip_download_command(spec: PackageSpec, dest: Path, multiarch: str,
 def _download_pypi(spec, folder, multiarch, registry_dir) -> Prepared:
     _run_host(pip_download_command(spec, folder, multiarch, registry_dir), "pip download (on the host)")
     files = sorted(folder.glob("*.whl"))
+    for wheel in files:  # the package and every dependency, before anything reads them (#133)
+        check_archive(wheel)
     main = _main_wheel(spec, files)
     entries = {name: str(sandbox.CONTAINER_SITE / "bin" / name) for name in _console_scripts(main)}
     return Prepared(spec, folder, files, entries, artifact=main)
@@ -207,8 +347,17 @@ def _console_scripts(wheel: Path) -> list[str]:
             return []
         parser = configparser.ConfigParser(interpolation=None, delimiters=("=",))
         parser.optionxform = str  # keep the script names' case
-        parser.read_string(whl.read(names[0]).decode("utf-8"))
+        with whl.open(names[0]) as data:
+            parser.read_string(_read_member(data, names[0]).decode("utf-8"))
     return sorted(parser["console_scripts"]) if parser.has_section("console_scripts") else []
+
+
+def npm_download_command(npm: str, spec: PackageSpec, cache: Path) -> list[str]:
+    """npm on the host: fills the npm cache with the package and its
+    dependencies. --ignore-scripts: no package code runs here (_run_host refuses
+    an npm command without it)."""
+    return [npm, "install", "--ignore-scripts", "--no-audit", "--no-fund", "--save-exact",
+            "--cache", str(cache), f"{spec.name}@{spec.version}"]
 
 
 def npm_tarball_name(name: str, version: str) -> str:
@@ -231,9 +380,9 @@ def _download_npm(spec, folder, registry_dir) -> Prepared:
         if not tarball.is_file():
             raise ScanError(f"{tarball.name} is not in {registry_dir / 'npm'}")
         shutil.copy2(tarball, folder / tarball.name)
+        check_archive(folder / tarball.name)  # before anything reads it (#133)
         manifest["dependencies"] = {spec.name: f"file:{sandbox.CONTAINER_DOWNLOAD}/{tarball.name}"}
         (project / "package.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-        package_json = _package_json_from_tarball(folder / tarball.name)
         files = [folder / tarball.name]
         artifact, labels = files[0], {}
     else:
@@ -241,15 +390,18 @@ def _download_npm(spec, folder, registry_dir) -> Prepared:
         if npm is None:
             raise ScanError("npm is not installed on the host (needed to download npm packages)")
         (project / "package.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-        _run_host([npm, "install", "--ignore-scripts", "--no-audit", "--no-fund", "--save-exact",
-                   "--cache", str(folder / "npm-cache"), f"{spec.name}@{spec.version}"],
+        _run_host(npm_download_command(npm, spec, folder / "npm-cache"),
                   "npm install --ignore-scripts (on the host)", cwd=project)
-        installed = project / "node_modules" / spec.name / "package.json"
-        package_json = json.loads(installed.read_text(encoding="utf-8"))
         # Only the cache and the lockfile go into the sandbox; the files npm
-        # unpacked here are deleted (they were never run).
-        shutil.rmtree(project / "node_modules")
+        # unpacked here are deleted unread (they were never run). rmtree
+        # removes a symlink npm made, never what it points to.
+        shutil.rmtree(project / "node_modules", ignore_errors=True)
         files, labels, artifact = _cache_tarballs(spec, folder)
+        for tarball in files:  # the package and every dependency (#133)
+            check_archive(tarball)
+    # package.json from the checked tarball itself, never from a folder npm
+    # unpacked on the host (a symlink there could point anywhere).
+    package_json = _package_json_from_tarball(artifact)
 
     if package_json.get("name") != spec.name or package_json.get("version") != spec.version:
         raise ScanError(f"the downloaded package.json says {package_json.get('name')}@"
@@ -274,8 +426,14 @@ def _cache_tarballs(spec: PackageSpec, folder: Path) -> tuple[list[Path], dict[P
     lock = json.loads((folder / "project" / "package-lock.json").read_text(encoding="utf-8"))
     files, labels, artifact = [], {}, None
     for key, info in sorted(lock.get("packages", {}).items()):
-        if not key or "integrity" not in info:
+        if not key:
             continue  # "" is the scan's own package.json
+        if info.get("link") or str(info.get("resolved", "")).startswith("file:"):
+            # A dependency on a local path ("file:../.."): it would point at a
+            # folder on this machine, not a downloaded file (#133).
+            raise ScanError(f"{key} points at a local path ({info.get('resolved')}); not installed")
+        if "integrity" not in info:
+            continue
         path = cache_content_path(folder / "npm-cache", info["integrity"])
         if not path.is_file():
             raise ScanError(f"{key} is not in the downloaded npm cache")
@@ -297,11 +455,23 @@ def cache_content_path(cache: Path, integrity: str) -> Path:
 
 def _package_json_from_tarball(tarball: Path) -> dict:
     """package/package.json from an npm tarball, read without unpacking anything."""
-    with tarfile.open(tarball, "r:gz") as tar:
-        member = tar.extractfile("package/package.json")
-        if member is None:
-            raise ScanError(f"{tarball.name} has no package/package.json")
-        return json.loads(member.read().decode("utf-8"))
+    try:
+        with tarfile.open(tarball, "r:gz") as tar:
+            # npm strips the archive's one top folder, whatever its name; it
+            # is "package/" for almost every package, so that one wins.
+            candidates = [m for m in tar.getmembers()
+                          if m.name.count("/") == 1 and m.name.endswith("/package.json")]
+            candidates.sort(key=lambda m: m.name != "package/package.json")
+            if not candidates:
+                raise ScanError(f"{tarball.name} has no package/package.json")
+            info = candidates[0]
+            # extractfile() of a link would read another member: plain files only.
+            member = tar.extractfile(info) if info.isfile() else None
+            if member is None:
+                raise ScanError(f"{tarball.name}: {info.name} is not a plain file")
+            return json.loads(_read_member(member, info.name).decode("utf-8"))
+    except (OSError, EOFError, tarfile.TarError, ValueError) as exc:
+        raise ScanError(f"{tarball.name}: package/package.json can't be read ({exc})") from None
 
 
 def _npm_bins(spec: PackageSpec, package_json: dict) -> dict[str, str]:

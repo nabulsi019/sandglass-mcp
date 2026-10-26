@@ -23,12 +23,18 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
     `EXPECTED_SCAN_STOPPED` and `EXPECTED_SCAN_ATTEMPTS` entry in
     `scripts/check_fixtures.py` (the verdict, exact violations and INCOMPLETE
     reasons of missing_api_key_server; the verdict and exact violations of all
-    5 scans: pypi:sandglass-test-notes, npm:sandglass-test-notes,
+    8 scans: pypi:sandglass-test-notes, npm:sandglass-test-notes,
     pypi:sandglass-test-peek, npm:sandglass-test-postinstall,
-    pypi:sandglass-test-tampered; the install phase of
+    pypi:sandglass-test-tampered, and the hostile archives
+    npm:sandglass-test-traversal, pypi:sandglass-test-symlink and
+    pypi:sandglass-test-bomb; the install phase of
     npm:sandglass-test-postinstall's violation; the stop reasons of
-    pypi:sandglass-test-tampered; and the failed attempts
-    pypi:sandglass-test-peek must show)
+    pypi:sandglass-test-tampered and of the three hostile archives; and the
+    failed attempts pypi:sandglass-test-peek must show)
+  - the host-side archive checks in `sandglass/scan.py` (#133): `check_archive`
+    on every downloaded file before anything reads it, its limits
+    (`MAX_ARCHIVE_BYTES` 500 MB, `MAX_ARCHIVE_FILES` 20,000), and
+    `--ignore-scripts` on every npm command run on the host
   - every `EXPECTED_POLICY_RUNS` entry in `scripts/check_fixtures.py` (the
     policy, verdict and exact violations of aws_credentials_server and
     symlink_escape_server under policies/templates/no_network.v1.yaml), and the `read_deny: [/home, /root]`

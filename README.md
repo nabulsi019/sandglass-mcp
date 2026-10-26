@@ -45,6 +45,9 @@ test_packages/       Packages written for testing `sandglass scan`. Never publis
   npm/sandglass-test-notes/   Notes server as an npm tarball (bin)
   npm/sandglass-test-postinstall/  Clean server whose postinstall script reads ~/.aws/credentials
   pypi/sandglass-test-tampered/    Clean server whose (test) registry publishes a wrong hash
+  (generated, no source folder)    Hostile archives (#133): sandglass-test-traversal (npm, "../" and
+                                   absolute members), sandglass-test-symlink (wheel, symlink out of its
+                                   folder), sandglass-test-bomb (wheel, 520 MB of zeros once unpacked)
 test_servers/        Fixture servers written for testing Sandglass. Not real targets.
   good_notes_server.py       read_note(name): reads only from allowed_notes/
   overreach_notes_server.py  Same tool, but also reads decoy_home/.fake_credentials
@@ -151,6 +154,21 @@ What happens (`sandglass/scan.py`):
      package with no wheel can't be scanned (INCOMPLETE, with pip's error).
    - npm: `npm install --ignore-scripts` in a scratch folder fills an npm
      cache with the package and its dependencies (needs `npm` on your machine).
+     Sandglass refuses to run npm on the host without `--ignore-scripts`
+     (and sets `npm_config_ignore_scripts=true` too). A lockfile entry that
+     points at a local path (`file:`, `link`) stops the scan.
+
+   **Archive check** (#133): every downloaded file (the package and each
+   dependency: wheels, npm tarballs, the npm cache's tarballs) is checked
+   member by member, reading only the headers, before anything else reads
+   it. Nothing is ever unpacked on your machine by Sandglass. The scan stops,
+   INCOMPLETE (`unsafe archive <file>: member '<name>' is ...; not
+   installed`), if a member is an absolute path or has a `..` component, is
+   a symlink or hard link leading outside the archive, or is a device or
+   fifo, or if the archive has more than 20,000 files or more than 500 MB
+   once unpacked (`MAX_ARCHIVE_FILES` / `MAX_ARCHIVE_BYTES` in
+   `sandglass/scan.py`). Sandglass's own reads from an archive
+   (`entry_points.txt`, `package.json`) are plain files only, at most 1 MB.
 
    **Package hash** (#21): every downloaded file's sha256 goes in the report,
    and the package's own file is checked against the value its registry
@@ -214,6 +232,9 @@ builds it (`scripts/build_test_packages.py`) and scans:
 | `pypi:sandglass-test-peek@1.0.0` | CLEAN; its reads of `/project/guard` and `/project/CLAUDE.md` are listed as attempted (`ENOENT`): the project isn't mounted |
 | `npm:sandglass-test-postinstall@1.0.0` | VIOLATIONS: 1, its `postinstall` script reads `/home/sandglass/.aws/credentials` (the decoy), in the **install** phase; the server itself is clean |
 | `pypi:sandglass-test-tampered@1.0.0` | INCOMPLETE: `package hash mismatch` (its test registry publishes a wrong sha256); never installed or run |
+| `npm:sandglass-test-traversal@1.0.0` | INCOMPLETE: `unsafe archive`, its member `../../sandglass-escaped-traversal.txt` has a `..` component; never unpacked, installed or run |
+| `pypi:sandglass-test-symlink@1.0.0` | INCOMPLETE: `unsafe archive`, a symlink leading outside the archive (to `~/.aws/credentials`) |
+| `pypi:sandglass-test-bomb@1.0.0` | INCOMPLETE: `unsafe archive`, more than 500 MB uncompressed (a 0.5 MB wheel) |
 
 The local test registry also holds registry-style metadata
 (`test_packages/dist/<pypi|npm>-meta/<name>/<version>.json`) with the
@@ -541,6 +562,13 @@ below are from each project's own paper or documentation.
 - **PyPI scans are wheels only**: a package published only as an sdist gives
   INCOMPLETE, because building an sdist would run the package's own code on
   the host, outside the sandbox.
+- **npm unpacks on the host when scanning from the real npm registry**
+  (#133). `npm install --ignore-scripts` (no package code runs) unpacks the
+  package into a scratch folder in the scan's temp folder, with npm's own
+  path checks, before Sandglass checks the tarballs it cached and deletes
+  that folder unread. Sandglass's own checks cover every archive before it
+  is used, but not npm's unpacking itself. A package (or dependency) bigger
+  than 500 MB unpacked, or with more than 20,000 files, can't be scanned.
 
 - **Fixture runs mount the whole project read-only**, so a fixture server
   can read `sandglass/`, `policies/` and the other fixtures. That is acceptable for
