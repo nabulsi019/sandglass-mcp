@@ -60,6 +60,14 @@ def test_the_syscall_filter_is_protected_and_in_place():
     assert order == sorted(order)
 
 
+def test_the_sink_accounting_is_protected():
+    # (#136) named in CLAUDE.md, with the hostile fixture's expected requests.
+    for item in ("`EXPECTED_HOSTILE_DOMAINS`", "drains", "count mismatch", "unidentified connection",
+                 "stall_sink_server", "listed_domains_only.v1"):
+        assert item in PROTECTED, f"{item!r} is not in CLAUDE.md's protected items"
+    assert set(check_fixtures.EXPECTED_HOSTILE_DOMAINS) <= set(check_fixtures.EXPECTED_HOSTILE)
+
+
 def test_the_host_archive_checks_are_protected_and_in_place():
     # (#133) named in CLAUDE.md, and still what the code does.
     from sandglass import scan

@@ -43,7 +43,9 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
     `POLICIES` it names (the policy, verdict, exact violations and INCOMPLETE
     reasons of the hostile fixtures: proc_self_escape_server under
     no_network.v1 and notes_readonly; untraced_clone_server,
-    iouring_node_server.js and ptrace_server under notes_readonly), the
+    iouring_node_server.js and ptrace_server under notes_readonly;
+    stall_sink_server under listed_domains_only.v1 and notes_readonly, with
+    the sink requests in `EXPECTED_HOSTILE_DOMAINS`), the
     `FIXTURE_DOCKER_OPTIONS` they run with, and every `EXPECTED_OLD_DOCKER`
     entry (the old-Docker simulation with `OLD_DOCKER_OPTIONS`, Docker's own
     seccomp profile off, test code only: good_notes_node_server.js CLEAN,
@@ -55,6 +57,11 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
     syscall refused for another ABI; and compare.py's rules for it (a missing
     or failed self-test is INCOMPLETE, an evasion attempt is a violation).
     `seccomp=unconfined` never appears in `sandglass/`
+  - the network sink's accounting (#136): `sandglass/netsink.py` reads every
+    connection side by side with a deadline and drains open and queued ones
+    on shutdown (one record per connection); compare.py makes a trace/sink
+    connection count mismatch INCOMPLETE, and an unidentified connection a
+    violation (no network allowed) or INCOMPLETE (some domains allowed)
   - `EXPECTED_EXIT_CODES` in `scripts/check_fixtures.py` (the exit code of
     every verdict: 0 CLEAN, 1 VIOLATIONS, 3 INCOMPLETE; 2 is a usage error)
   - the sandbox hardening flags (--network none, --read-only, non-root user,

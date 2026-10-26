@@ -39,13 +39,16 @@ READY_FD = 3
 # "_invalid_", so a crafted request can't put ".." or "/" into the marker path.
 # "_" is allowed: real DNS names use it (_dmarc.example.com, some internal hosts).
 _HOST_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+# What's recorded when no method or host can be read (#136: compare.py calls
+# such a record an "unidentified connection to the sink").
+INVALID = "_invalid_"
 
 
 def clean_host(host: str) -> str:
-    """Return the host if every label is letters/digits/hyphens/underscores, else "_invalid_"."""
+    """Return the host if every label is letters/digits/hyphens/underscores, else INVALID."""
     labels = host.lower().split(".")
     if len(host) > 253 or not all(labels) or any(c not in _HOST_CHARS for c in "".join(labels)):
-        return "_invalid_"
+        return INVALID
     return host.lower()
 
 
@@ -58,7 +61,7 @@ def parse_request(data: bytes) -> tuple[str, str, int]:
     first = data.split(b"\r\n", 1)[0].decode("latin-1")
     parts = first.split(" ")
     if len(parts) != 3 or not parts[0].isalpha() or not parts[0].isupper() or len(parts[0]) > 10:
-        return "_invalid_", "_invalid_", 0
+        return INVALID, INVALID, 0
     method, target = parts[0], parts[1]
     default_port = 443 if method == "CONNECT" else 80
     if target.startswith("http://"):
@@ -101,15 +104,56 @@ def isolation_result(connect=None) -> tuple[str, str]:
     return "not-isolated", "connected"
 
 
+# (#136) How long the sink waits for one connection's request, from the
+# moment it accepts it: a deadline, not a per-read timeout, so a client that
+# trickles a byte at a time can't hold the sink. And after the server has
+# exited, how long it keeps reading the connections still open or queued.
+REQUEST_DEADLINE = 2.0   # seconds
+DRAIN_DEADLINE = 1.0     # seconds
+MAX_REQUEST_BYTES = 8192
+
+
+def _reply(method: str) -> bytes:
+    """403 for HTTPS CONNECT, a short 200 for plain HTTP."""
+    if method == "CONNECT":
+        return b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    body = b"sandglass sink: request recorded, nothing was sent anywhere\n"
+    return (b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+
+
+def _finish(conn, data: bytes) -> None:
+    """Record one connection's request (exactly one record per connection,
+    "_invalid_" if it can't be parsed), answer it, close it."""
+    method, host, port = parse_request(data)
+    _record(f"{SINK_MARKER_DIR}/{method}/{host}/{port}")
+    try:
+        conn.setblocking(True)
+        conn.settimeout(0.5)
+        conn.sendall(_reply(method))
+    except OSError:
+        pass
+    conn.close()
+
+
 def serve() -> None:
-    """Answer proxy requests locally and record each one, until the server exits."""
+    """Answer proxy requests locally and record each one, until the server exits.
+
+    (#136) Connections are read side by side, in this one thread (selectors),
+    so one unfinished request can't keep the next one waiting, and every
+    record is made by this process's main thread (compare.py finds them by
+    its pid). When the server has exited, every connection still open AND
+    every one still queued in the listen backlog is read and recorded before
+    the sink stops: a request can't hide behind a stalled one.
+    """
+    import selectors
     import socket
+    import time
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((SINK_HOST, SINK_PORT))
-    server.listen(16)
-    server.settimeout(0.5)
+    server.listen(64)
 
     # Isolation check (#100): decided once the connect has finished, and
     # reported in the trace before "ready", so before any server code runs.
@@ -120,35 +164,67 @@ def serve() -> None:
     os.write(READY_FD, b"1")  # tell the launcher the sink is listening
     os.close(READY_FD)
 
-    parent = os.getppid()
-    while os.getppid() == parent:  # stop once the server has exited
+    server.setblocking(False)
+    selector = selectors.DefaultSelector()
+    selector.register(server, selectors.EVENT_READ)
+    pending = {}  # connection -> [bytes read so far, deadline]
+
+    def accept_all(deadline: float) -> None:
+        """Accept every connection waiting in the backlog."""
+        while True:
+            try:
+                conn, _ = server.accept()
+            except (BlockingIOError, InterruptedError):
+                return
+            conn.setblocking(False)
+            pending[conn] = [b"", deadline]
+            selector.register(conn, selectors.EVENT_READ)
+
+    def read(conn) -> None:
+        """Read what's there; finish the request once it's complete or closed."""
+        data = pending[conn][0]
         try:
-            conn, _ = server.accept()
-        except socket.timeout:
-            continue
-        with conn:
-            conn.settimeout(2)
-            data = b""
-            try:
-                while b"\r\n\r\n" not in data and len(data) < 8192:
-                    chunk = conn.recv(4096)
-                    if not chunk:
-                        break
-                    data += chunk
-            except OSError:
-                pass
-            method, host, port = parse_request(data)
-            _record(f"{SINK_MARKER_DIR}/{method}/{host}/{port}")
-            if method == "CONNECT":
-                reply = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            chunk = conn.recv(4096)
+        except (BlockingIOError, InterruptedError):
+            return
+        except OSError:
+            chunk = b""
+        data += chunk
+        pending[conn][0] = data
+        if not chunk or b"\r\n\r\n" in data or len(data) >= MAX_REQUEST_BYTES:
+            selector.unregister(conn)
+            del pending[conn]
+            _finish(conn, data)
+
+    def expire(now: float) -> None:
+        """Finish every connection past its deadline with what it sent."""
+        for conn in [c for c, (_, deadline) in pending.items() if deadline <= now]:
+            selector.unregister(conn)
+            _finish(conn, pending.pop(conn)[0])
+
+    parent = os.getppid()
+    while os.getppid() == parent:  # until the server has exited
+        for key, _ in selector.select(timeout=0.2):
+            if key.fileobj is server:
+                accept_all(time.monotonic() + REQUEST_DEADLINE)
             else:
-                body = b"sandglass sink: request recorded, nothing was sent anywhere\n"
-                reply = (b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n"
-                         b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
-            try:
-                conn.sendall(reply)
-            except OSError:
-                pass
+                read(key.fileobj)
+        expire(time.monotonic())
+
+    # The server has exited: drain. Everything still queued is accepted, and
+    # everything open is read until it's complete, closed or out of time.
+    end = time.monotonic() + DRAIN_DEADLINE
+    accept_all(end)
+    for item in pending.values():
+        item[1] = min(item[1], end)
+    while pending:
+        for key, _ in selector.select(timeout=0.1):
+            if key.fileobj is server:
+                accept_all(end)
+            else:
+                read(key.fileobj)
+        expire(time.monotonic())
+    server.close()
 
 
 if __name__ == "__main__":

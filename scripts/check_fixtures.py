@@ -102,6 +102,7 @@ EXPECTED_POLICY_RUNS = {
 POLICIES = {
     "notes_readonly": POLICY,
     "no_network.v1": PROJECT_ROOT / "policies" / "templates" / "no_network.v1.yaml",
+    "listed_domains_only.v1": PROJECT_ROOT / "policies" / "templates" / "listed_domains_only.v1.yaml",
 }
 CREDS = "/home/sandglass/.aws/credentials"
 EXPECTED_HOSTILE = {
@@ -127,6 +128,22 @@ EXPECTED_HOSTILE = {
     ("ptrace_server.py", "notes_readonly"): ("VIOLATIONS", [
         ("evade", "ptrace PTRACE_ATTACH"), ("evade", "process_vm_readv"), ("evade", "process_vm_writev"),
     ], []),
+    # (#136) Stalls a request to an allowed domain, queues one to hidden.example
+    # behind it. The sink reads both side by side (and drains on exit), so
+    # hidden.example is recorded; with the old sink this run was CLEAN.
+    ("stall_sink_server.py", "listed_domains_only.v1"): ("VIOLATIONS", [("domain", "hidden.example")], []),
+    ("stall_sink_server.py", "notes_readonly"): ("VIOLATIONS", [
+        ("domain", "api.example.com"), ("domain", "hidden.example"),
+    ], []),
+}
+
+# The requests the sink must record for a hostile fixture, in any order
+# (others: none). (fixture, policy name) -> [(method, host, port)]
+EXPECTED_HOSTILE_DOMAINS = {
+    ("stall_sink_server.py", "listed_domains_only.v1"): [
+        ("GET", "api.example.com", 80), ("CONNECT", "hidden.example", 443)],
+    ("stall_sink_server.py", "notes_readonly"): [
+        ("GET", "api.example.com", 80), ("CONNECT", "hidden.example", 443)],
 }
 
 # Extra `docker run` options for one fixture, in every run of it (test only).
@@ -239,7 +256,8 @@ def in_order(violations) -> list:
 
 
 def check(fixture: str, report: dict, want_verdict: str, want_violations: set,
-          want_phase: str = "tool-call", server_ran: bool = True) -> list[str]:
+          want_phase: str = "tool-call", server_ran: bool = True,
+          want_domains: list | None = None) -> list[str]:
     """Every check that applies to every fixture; returns the failures."""
     failures = []
     print(f"{fixture}: {report['verdict']}, exit code {EXIT_CODES.get(report['verdict'])}")
@@ -268,7 +286,11 @@ def check(fixture: str, report: dict, want_verdict: str, want_violations: set,
         failures.append(f"{fixture}: network isolation check did not report isolated: {isolation}")
     # ...and the sink logged exactly the requests we expect.
     domains = [(d["method"], d["host"], d["port"]) for d in report["domains"]]
-    if domains != EXPECTED_DOMAINS.get(fixture, []):
+    if want_domains is not None:
+        # Hostile fixtures (#136): requests made side by side may be recorded in any order.
+        if sorted(domains) != sorted(want_domains):
+            failures.append(f"{fixture}: expected sink requests {sorted(want_domains)}, got {sorted(domains)}")
+    elif domains != EXPECTED_DOMAINS.get(fixture, []):
         failures.append(f"{fixture}: expected sink requests {EXPECTED_DOMAINS.get(fixture, [])}, "
                         f"got {domains}")
     return failures
@@ -302,7 +324,8 @@ def main() -> int:
         print(f"\n===== {label} =====")
         with docker_options(FIXTURE_DOCKER_OPTIONS.get(fixture, [])):
             report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, POLICIES[policy_name])
-        failures += check(label, report, want_verdict, want_violations)
+        failures += check(label, report, want_verdict, want_violations,
+                          want_domains=EXPECTED_HOSTILE_DOMAINS.get((fixture, policy_name), []))
         reasons = " | ".join(report.get("incomplete_reasons", []))
         failures += [f"{label}: INCOMPLETE reasons don't mention {text!r}: {reasons}"
                      for text in want_reasons if text not in reasons]
