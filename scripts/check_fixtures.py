@@ -1,7 +1,9 @@
 """Run every fixture in the sandbox and check its verdict and exact violations.
 
 Also builds our own test packages (test_packages/ -> test_packages/dist/) and
-scans them with `sandglass scan` from that local folder (#19), no network.
+scans them with `sandglass scan` from that local folder (#19), no network;
+then scans two npm ones again through the npm download container (#138),
+from that folder served as a local npm registry (never the real one).
 
 Used before opening a PR and by the CI sandbox job. Exits 0 only if every
 fixture matches its expectation exactly.
@@ -12,12 +14,19 @@ fixture matches its expectation exactly.
 
 import contextlib
 import importlib.util
+import json
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
+import time
+import urllib.request
 from pathlib import Path
 
-from sandglass import PROJECT_ROOT, sandbox
+from sandglass import PROJECT_ROOT, sandbox, scan
 from sandglass.client import EXIT_CODES, run_sandboxed, run_scan
-from sandglass.scan import parse_spec
+from sandglass.scan import npm_tarball_name, parse_spec
 
 POLICY = PROJECT_ROOT / "policies" / "notes_readonly.yaml"
 
@@ -234,6 +243,23 @@ EXPECTED_SCAN_ATTEMPTS = {
     },
 }
 
+# npm scans through the download container (#138): npm runs in a throwaway
+# container, never on the host. Served from a LOCAL npm registry that this
+# script starts itself in a private Docker network (local_npm_registry), never
+# the real one. Added in #138. package spec -> (verdict, violations, INCOMPLETE
+# reason texts; a scan with reasons must stop before anything is installed)
+EXPECTED_NPM_REGISTRY_SCANS = {
+    "npm:sandglass-test-notes@1.0.0": ("CLEAN", set(), []),
+    # Unpacked by npm only inside the download container's /tmp; its cached
+    # tarball is refused on the host, member by member (#133).
+    "npm:sandglass-test-traversal@1.0.0": ("INCOMPLETE", set(), [
+        "unsafe archive", "member '../../sandglass-escaped-traversal.txt' is a path with a \"..\" component",
+        "not installed"]),
+}
+# What the download container may leave in the scan's temp folder: npm's
+# cache, package.json and the lockfile. Never node_modules (npm's unpacked files).
+NPM_DOWNLOAD_OUTPUT = ("npm-cache/", "project/package.json", "project/package-lock.json")
+
 
 # The exit code of `sandglass ... --sandbox` and `sandglass scan` per verdict
 # (#124). 2 is not a verdict: it's argparse's usage error.
@@ -247,6 +273,87 @@ def build_test_packages() -> None:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     module.build_all()
+
+
+@contextlib.contextmanager
+def local_npm_registry():
+    """Serve test_packages/dist as an npm registry, for the download container (#138).
+
+    A static HTTP server (Python's http.server, in the sandbox image, read-only,
+    non-root) on a private Docker network. The download container joins that
+    network and reaches it by name; the host reaches it on a 127.0.0.1 port
+    for the hash check (#21). Yields what the download step saw: a list of
+    (package, files the container left in the temp folder). Test code only:
+    the product's defaults (the real registry, Docker's bridge) are restored after.
+    """
+    tag = f"{os.getpid()}"
+    network, server = f"sandglass-test-npm-{tag}", f"sandglass-test-registry-{tag}"
+    docker = shutil.which("docker") or "docker"
+    root = Path(tempfile.mkdtemp(prefix="sandglass-test-registry-"))
+    root.chmod(0o755)  # readable by the server's user (uid 10001)
+    # The registry's layout: GET /<name> is the package's document (index.html
+    # of a folder), /<name>/<version> one version's, /-/<file>.tgz the tarballs.
+    (root / "-").mkdir()
+    for meta in sorted((TEST_REGISTRY / "npm-meta").glob("*/*.json")):
+        version_doc = json.loads(meta.read_text(encoding="utf-8"))
+        name, version = version_doc["name"], version_doc["version"]
+        tarball = npm_tarball_name(name, version)
+        shutil.copy(TEST_REGISTRY / "npm" / tarball, root / "-" / tarball)
+        version_doc["dist"]["tarball"] = f"http://{server}:8000/-/{tarball}"
+        (root / name).mkdir()
+        (root / name / version).write_text(json.dumps(version_doc), encoding="utf-8")
+        (root / name / "index.html").write_text(json.dumps(
+            {"name": name, "dist-tags": {"latest": version}, "versions": {version: version_doc}}),
+            encoding="utf-8")
+    for path in root.rglob("*"):
+        path.chmod(0o755 if path.is_dir() else 0o644)
+
+    seen = []
+    original = (scan.NPM_DOWNLOAD_REGISTRY, scan.NPM_DOWNLOAD_NETWORK, scan.NPM_VERSION_URL, scan.download)
+
+    def watched_download(spec, folder, multiarch, registry_dir=None):
+        try:
+            return original[3](spec, folder, multiarch, registry_dir)
+        finally:  # what reached the host, even if the scan stops here
+            seen.append((str(spec), sorted(p.relative_to(folder).as_posix()
+                                           for p in folder.rglob("*") if not p.is_dir())))
+
+    try:
+        subprocess.run([docker, "network", "create", network], check=True, capture_output=True)
+        subprocess.run([docker, "run", "-d", "--rm", "--name", server, "--network", network,
+                        "--read-only", "--user", sandbox.CONTAINER_USER, "--cap-drop", "ALL",
+                        "-p", "127.0.0.1::8000", "-v", f"{root}:/srv:ro", sandbox.IMAGE,
+                        "python", "-m", "http.server", "8000", "-d", "/srv"],
+                       check=True, capture_output=True)
+        port = subprocess.run([docker, "port", server, "8000/tcp"], check=True, capture_output=True,
+                              text=True).stdout.split()[0].rsplit(":", 1)[1]
+        base = f"http://127.0.0.1:{port}"
+        for _ in range(50):  # wait for the server to answer
+            try:
+                urllib.request.urlopen(f"{base}/-/", timeout=2).close()
+                break
+            except OSError:
+                time.sleep(0.2)
+        scan.NPM_DOWNLOAD_REGISTRY = f"http://{server}:8000/"
+        scan.NPM_DOWNLOAD_NETWORK = network
+        scan.NPM_VERSION_URL = base + "/{name}/{version}"
+        scan.download = watched_download
+        yield seen
+    finally:
+        (scan.NPM_DOWNLOAD_REGISTRY, scan.NPM_DOWNLOAD_NETWORK, scan.NPM_VERSION_URL,
+         scan.download) = original
+        subprocess.run([docker, "rm", "-f", server], capture_output=True)
+        subprocess.run([docker, "network", "rm", network], capture_output=True)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def escaped_traversal_files() -> list[str]:
+    """Where sandglass-test-traversal's "../../" member would land if anything
+    on the host unpacked it: the temp folders and the project."""
+    name = "sandglass-escaped-traversal.txt"
+    places = [Path(tempfile.gettempdir()), PROJECT_ROOT, PROJECT_ROOT.parent, Path.cwd()]
+    places += [p for p in Path(tempfile.gettempdir()).glob("sandglass-download-*") if p.is_dir()]
+    return sorted({str(p / name) for p in places if (p / name).exists()})
 
 
 def in_order(violations) -> list:
@@ -352,12 +459,34 @@ def main() -> int:
         if missing:
             failures.append(f"{package}: expected failed attempts {sorted(missing)} are missing")
 
+    # npm through the download container (#138), from a local registry.
+    with local_npm_registry() as downloads:
+        for package, (want_verdict, want_violations, want_reasons) in EXPECTED_NPM_REGISTRY_SCANS.items():
+            label = f"{package} (download container, local npm registry)"
+            print(f"\n===== scan {label} =====")
+            report = run_scan(parse_spec(package), SCAN_POLICY, None)
+            failures += check(label, report, want_verdict, want_violations, server_ran=not want_reasons)
+            reasons = " | ".join(report.get("incomplete_reasons", []))
+            failures += [f"{label}: INCOMPLETE reasons don't mention {text!r}: {reasons}"
+                         for text in want_reasons if text not in reasons]
+            if not want_reasons and not (report.get("package", {}).get("hash") or {}).get("match"):
+                failures.append(f"{label}: the hash check did not match: {report.get('package', {}).get('hash')}")
+    for package, files in downloads:
+        unexpected = [f for f in files if not f.startswith(NPM_DOWNLOAD_OUTPUT)]
+        if unexpected or "project/package-lock.json" not in files:
+            failures.append(f"{package}: the download container left {unexpected or 'no lockfile'} on the host")
+    if len(downloads) != len(EXPECTED_NPM_REGISTRY_SCANS):
+        failures.append(f"expected {len(EXPECTED_NPM_REGISTRY_SCANS)} npm downloads, saw {len(downloads)}")
+    escaped = escaped_traversal_files()
+    if escaped:
+        failures.append(f"sandglass-test-traversal wrote outside its folder on the host: {escaped}")
+
     print("\n===== summary =====")
     for line in failures:
         print("FAIL", line)
     if not failures:
         total = (len(EXPECTED) + len(EXPECTED_V04) + len(EXPECTED_POLICY_RUNS) + len(EXPECTED_HOSTILE)
-                 + len(EXPECTED_OLD_DOCKER) + len(EXPECTED_SCANS))
+                 + len(EXPECTED_OLD_DOCKER) + len(EXPECTED_SCANS) + len(EXPECTED_NPM_REGISTRY_SCANS))
         print(f"all {total} fixtures match expectations")
     return 1 if failures else 0
 

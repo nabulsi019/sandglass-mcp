@@ -62,6 +62,14 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
     on shutdown (one record per connection); compare.py makes a trace/sink
     connection count mismatch INCOMPLETE, and an unidentified connection a
     violation (no network allowed) or INCOMPLETE (some domains allowed)
+  - every `EXPECTED_NPM_REGISTRY_SCANS` entry in `scripts/check_fixtures.py`
+    (#138: npm:sandglass-test-notes CLEAN and npm:sandglass-test-traversal
+    INCOMPLETE `unsafe archive`, through the npm download container from a
+    local registry), and the download container's hardening in
+    `sandglass/sandbox.py` (`npm_download_container_args`: uid 10001,
+    `--read-only`, `--cap-drop ALL`, no-new-privileges, only the scan's temp
+    folder mounted, no project mount, `--ignore-scripts`; npm never runs on
+    the host and node_modules never reaches it)
   - `EXPECTED_EXIT_CODES` in `scripts/check_fixtures.py` (the exit code of
     every verdict: 0 CLEAN, 1 VIOLATIONS, 3 INCOMPLETE; 2 is a usage error)
   - the sandbox hardening flags (--network none, --read-only, non-root user,
