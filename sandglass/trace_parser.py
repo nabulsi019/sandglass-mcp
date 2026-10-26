@@ -24,6 +24,8 @@ Event kinds:
   process  execve/execveat: a program was launched
   network  connect/bind/listen/accept, and sendto/sendmsg/sendmmsg WITH a destination
   io_uring io_uring_setup/enter/register: file access strace can't see (#75)
+  evasion  clone/clone3 with CLONE_UNTRACED, ptrace, process_vm_readv/writev:
+           ways out of strace's sight (#84), mode "evade"
   exit     a traced process exited ("+++ exited with 0 +++")
 """
 
@@ -71,6 +73,15 @@ MEMFD_PREFIX = "memfd:"
 # is the ring being set up and used. compare.py decides what that means.
 IO_URING_SYSCALLS = {"io_uring_setup", "io_uring_enter", "io_uring_register"}
 
+# (#84) Ways to get out of strace's sight, which Sandglass's syscall filter
+# (sandglass/launcher.py) refuses: a child strace can't follow (clone or
+# clone3 with CLONE_UNTRACED), tracing another process (ptrace), and reading
+# or writing another process's memory (process_vm_readv/writev).
+# A plain clone (threads, fork) is not one of them and is skipped.
+EVASION_SYSCALLS = {"ptrace", "process_vm_readv", "process_vm_writev"}
+CLONE_SYSCALLS = {"clone", "clone3"}
+UNTRACED_FLAG = "CLONE_UNTRACED"
+
 # connect/bind/listen/accept always count. sendto/sendmsg/sendmmsg only count
 # when they carry a destination address: without one they're sending on an already
 # connected socket (whose connect() we already recorded) or on a local
@@ -109,7 +120,7 @@ ADDRESS_RE = re.compile(r"(?:^|, )0x[0-9a-f]+(?=,|$)")
 
 @dataclass
 class Event:
-    kind: str           # file | probe | process | network | io_uring | exit
+    kind: str           # file | probe | process | network | io_uring | evasion | exit
     syscall: str        # e.g. "openat"
     pid: int
     timestamp: str      # HH:MM:SS.micro, from strace -tt
@@ -347,6 +358,15 @@ def _classify(syscall: str, args: str, cwd: str) -> tuple[str, str, str | None] 
 
     if syscall in IO_URING_SYSCALLS:
         return "io_uring", syscall, None
+
+    # (#84) mode "evade"; the target names what was tried, e.g.
+    # "clone CLONE_UNTRACED", "ptrace PTRACE_ATTACH", "process_vm_writev".
+    if syscall in CLONE_SYSCALLS:
+        return ("evasion", f"{syscall} {UNTRACED_FLAG}", "evade") if UNTRACED_FLAG in args else None
+    if syscall == "ptrace":
+        return "evasion", f"ptrace {args.split(',', 1)[0].strip()}", "evade"
+    if syscall in EVASION_SYSCALLS:
+        return "evasion", syscall, "evade"
 
     if syscall in WRITE_SYSCALLS:
         if _path_unreadable(syscall, args, strings):

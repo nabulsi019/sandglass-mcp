@@ -5,11 +5,11 @@ import inspect
 from sandglass import client, trace_parser
 from sandglass.compare import compare
 from sandglass.trace_parser import parse_trace, parse_trace_file
-from tests.test_sandbox_pipeline import (EXITED, LAUNCH, NOTE_READ, RELAY_END, RELAY_START,
+from tests.test_sandbox_pipeline import (EXITED, LAUNCH, NOTE_READ, RELAY_END, RELAY_START, SELF_TEST,
                                          SESSION_OK, SINK_LINES, TOOL_CALL, sandbox_policy)
 
 # A complete, clean run (what run() in test_sandbox_pipeline builds).
-CLEAN_RUN = [LAUNCH] + SINK_LINES + RELAY_START + [NOTE_READ, TOOL_CALL] + RELAY_END + [EXITED]
+CLEAN_RUN = [LAUNCH] + SELF_TEST + SINK_LINES + RELAY_START + [NOTE_READ, TOOL_CALL] + RELAY_END + [EXITED]
 
 
 def write(tmp_path, lines):

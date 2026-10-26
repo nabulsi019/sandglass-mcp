@@ -45,6 +45,21 @@ def test_every_hostile_fixture_is_protected():
         assert policy_name in check_fixtures.POLICIES
 
 
+def test_the_syscall_filter_is_protected_and_in_place():
+    # (#84) named in CLAUDE.md, and still called right after the fd swap.
+    for item in ("install_syscall_filter", "filter_self_test", "CLONE_UNTRACED", "clone3",
+                 "process_vm_writev", "`EXPECTED_OLD_DOCKER`", "`OLD_DOCKER_OPTIONS`",
+                 "`FIXTURE_DOCKER_OPTIONS`", "seccomp=unconfined"):
+        assert item in PROTECTED, f"{item!r} is not in CLAUDE.md's protected items"
+    for fixture in check_fixtures.EXPECTED_OLD_DOCKER:
+        assert fixture.removesuffix(".py") in PROTECTED
+    launcher = (PROJECT_ROOT / "sandglass" / "launcher.py").read_text(encoding="utf-8")
+    main = launcher[launcher.index("def main()"):]
+    order = [main.index(s) for s in ("os.dup2(3, 2)", "os.close(3)", "install_syscall_filter()",
+                                     "filter_self_test()", "start_sink(")]
+    assert order == sorted(order)
+
+
 def test_the_host_archive_checks_are_protected_and_in_place():
     # (#133) named in CLAUDE.md, and still what the code does.
     from sandglass import scan

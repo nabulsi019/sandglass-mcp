@@ -8,7 +8,8 @@ from sandglass import PROJECT_ROOT, sandbox
 from sandglass.compare import compare
 from sandglass.policy import PolicyError, load_policy
 from sandglass.trace_parser import parse_trace
-from tests.test_sandbox_pipeline import EXITED, LAUNCH, POLICY_FILE, SESSION_OK, SINK_LINES, RELAY_END, RELAY_START, TOOL_CALL
+from tests.test_sandbox_pipeline import (EXITED, LAUNCH, POLICY_FILE, SELF_TEST, SESSION_OK, SINK_LINES,
+                                         RELAY_END, RELAY_START, TOOL_CALL)
 
 NODE_SERVER = PROJECT_ROOT / "test_servers" / "good_notes_node_server.js"
 NODE_EXEC = '8  10:00:00.000060 execve("/usr/bin/node", ["/usr/bin/node", "/project/test_servers/good_notes_node_server.js"], 0x0 /* 9 vars */) = 0'
@@ -22,7 +23,7 @@ def node_policy():
 
 def run(lines, runtime):
     # Sandglass's sink and stdin relay, like in a real run (see test_sandbox_pipeline.run).
-    lines = lines[:1] + SINK_LINES + RELAY_START + lines[1:] + [TOOL_CALL] + RELAY_END
+    lines = lines[:1] + SELF_TEST + SINK_LINES + RELAY_START + lines[1:] + [TOOL_CALL] + RELAY_END
     return compare(parse_trace("\n".join(lines)), node_policy(), SESSION_OK, runtime=runtime)
 
 

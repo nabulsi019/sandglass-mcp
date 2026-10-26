@@ -66,8 +66,13 @@ STDIN_RELAY = (PROJECT_ROOT / "sandglass" / "stdin_relay.py").read_text(encoding
 #                 run with execveat() without ever touching the disk.
 #   io_uring_*    (#75) the kernel does io_uring's reads and opens itself, so
 #                 strace can't see them; we can only see that a ring was used.
+#   ptrace, process_vm_readv, process_vm_writev   (#84) tracing another
+#                 process or reaching into its memory; refused by Sandglass's
+#                 syscall filter (launcher.py), recorded as attempts to evade.
+#                 (clone and clone3 are already in "process".)
 TRACED_SYSCALLS = ("file,process,network,memfd_create,"
-                   "io_uring_setup,io_uring_enter,io_uring_register")
+                   "io_uring_setup,io_uring_enter,io_uring_register,"
+                   "ptrace,process_vm_readv,process_vm_writev")
 
 
 def to_container_path(host_path: Path) -> PurePosixPath:

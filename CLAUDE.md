@@ -42,7 +42,19 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
   - every `EXPECTED_HOSTILE` entry in `scripts/check_fixtures.py`, and the
     `POLICIES` it names (the policy, verdict, exact violations and INCOMPLETE
     reasons of the hostile fixtures: proc_self_escape_server under
-    no_network.v1 and notes_readonly)
+    no_network.v1 and notes_readonly; untraced_clone_server,
+    iouring_node_server.js and ptrace_server under notes_readonly), the
+    `FIXTURE_DOCKER_OPTIONS` they run with, and every `EXPECTED_OLD_DOCKER`
+    entry (the old-Docker simulation with `OLD_DOCKER_OPTIONS`, Docker's own
+    seccomp profile off, test code only: good_notes_node_server.js CLEAN,
+    untraced_clone_server and iouring_node_server.js VIOLATIONS)
+  - Sandglass's syscall filter in `sandglass/launcher.py` (#84):
+    `install_syscall_filter` and `filter_self_test`, run right after the fd
+    swap; EPERM for io_uring_setup/enter/register, ptrace, process_vm_readv,
+    process_vm_writev and clone with CLONE_UNTRACED, ENOSYS for clone3, every
+    syscall refused for another ABI; and compare.py's rules for it (a missing
+    or failed self-test is INCOMPLETE, an evasion attempt is a violation).
+    `seccomp=unconfined` never appears in `sandglass/`
   - `EXPECTED_EXIT_CODES` in `scripts/check_fixtures.py` (the exit code of
     every verdict: 0 CLEAN, 1 VIOLATIONS, 3 INCOMPLETE; 2 is a usage error)
   - the sandbox hardening flags (--network none, --read-only, non-root user,
