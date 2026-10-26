@@ -52,6 +52,7 @@ test_servers/        Fixture servers written for testing Sandglass. Not real tar
   tamper_trace_server.py     Same tool, but also tries to read, overwrite and delete its trace
   aws_credentials_server.py  Same tool, but also reads ~/.aws/credentials (the sandbox's decoy)
   symlink_escape_server.py   Same tool, but reads ~/.aws/credentials through a symlink it makes in /tmp
+  proc_self_escape_server.py Same tool, but reads ~/.aws/credentials through /proc/self/root and /proc/self/fd
   shell_command_server.py    Same tool, but also runs `/bin/sh -c true`
   undeclared_domain_server.py  Same tool, but also sends a GET to undeclared.example (local sink only)
   good_notes_node_server.js  Node.js twin of good_notes_server (hand-written MCP, no npm packages)
@@ -104,6 +105,8 @@ Expected verdicts:
 | missing_api_key_server | INCOMPLETE | 0; reason: exited during startup, `RuntimeError: NOTES_API_KEY is not set` |
 | aws_credentials_server under `policies/templates/no_network.v1.yaml` | VIOLATIONS | 1: read of `/home/sandglass/.aws/credentials` (`read_deny: /home`, #121) |
 | symlink_escape_server under `policies/templates/no_network.v1.yaml` | VIOLATIONS | 2, both on `/home/sandglass/.aws/credentials`: the symlink to it made in `/tmp` (a link counts as a read of its target), and the read through that link (judged by the file really opened, #122) |
+| proc_self_escape_server under `policies/templates/no_network.v1.yaml` | VIOLATIONS | 3, all reads of `/home/sandglass/.aws/credentials`: through `/proc/self/root/...`, directly, and again through `/proc/self/fd/100` (each judged by the file really opened, #131) |
+| proc_self_escape_server under `policies/notes_readonly.yaml` | VIOLATIONS | 3 reads, named by the paths asked for: `/proc/self/root/home/sandglass/.aws/credentials`, `/home/sandglass/.aws/credentials`, `/proc/self/fd/100` |
 
 Every run must also show the sink reporting the isolation check as isolated (no route to the internet).
 
@@ -388,6 +391,8 @@ home folders (`read_deny: [/home, /root]`, #121), so reading the decoy home's
 fake credentials is a violation. Everything else is readable: if it matters
 which files a server reads, start from `read_only_folder`.
 
+v1 templates were corrected before release: read_deny [/home, /root] was added to no_network.v1 and listed_domains_only.v1 before v0.4 was tagged.
+
 **Versions.** The version is in the file name and in `name` (`no_network_v1`),
 so every report says exactly which template it was judged against. A
 template is never edited in place: a change becomes a new file
@@ -554,7 +559,9 @@ below are from each project's own paper or documentation.
   So reading `~/.aws/credentials` through a link in `/tmp` is caught
   (`test_servers/symlink_escape_server.py`). Opening `/proc/self/...` is
   the exception: strace shows it as `/proc/<pid>/...`, the process's own
-  folder, so that path is judged as asked for. Failed opens and probes
+  folder, so that path is judged as asked for. Only then: `/proc/self/root/...`
+  or `/proc/self/fd/N` that lead outside `/proc` are judged by the file they
+  opened (`test_servers/proc_self_escape_server.py`, #131). Failed opens and probes
   (`stat`) are still judged by the requested path only: strace can't show
   where they would have led.
 - **Baselines are specific to the image.** `python312_slim` covers
