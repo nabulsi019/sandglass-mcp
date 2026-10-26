@@ -22,6 +22,9 @@ Rules (one place, so they're easy to explain):
     except a SUCCESSFUL connect to the local network sink (sandglass/netsink.py):
       the sink then records the domain the server asked for, and
     a domain not in network.allow_domains -> VIOLATION naming the domain
+    a record with no readable domain (#136) -> "unidentified connection to
+      the sink": VIOLATION if no domain is allowed, INCOMPLETE if some are
+    successful connects to the sink != the sink's records (#136) -> INCOMPLETE
   The sink (the first process to stat its "ready" marker, which the launcher
   waits for before any server code runs) and the stdin relay (found the same
   way, from its own "ready" marker) are Sandglass's helpers. Only an exact
@@ -166,6 +169,21 @@ def _sink_request(target: str) -> tuple[str, str, int] | None:
     if not target.startswith(netsink.SINK_MARKER_DIR + "/") or len(parts) != 3 or not parts[2].isdigit():
         return None
     return parts[0], parts[1], int(parts[2])
+
+
+# (#136) A sink record with no domain: the connection sent nothing readable.
+UNIDENTIFIED = "unidentified connection to the sink"
+UNIDENTIFIED_TARGET = "(unidentified)"
+
+
+def _connects_to_sink(events: list[Event], sink_pid: int | None) -> int:
+    """How many connections to the sink the trace shows (#136): connect()s to
+    its address that worked (or are completing: EINPROGRESS), from anyone but
+    the sink itself. The sink makes exactly one record per connection."""
+    return sum(1 for e in events
+               if e.kind == "network" and e.syscall == "connect" and e.pid != sink_pid
+               and _is_address(e.target, netsink.SINK_HOST, netsink.SINK_PORT)
+               and (e.succeeded or e.error == "EINPROGRESS"))
 
 
 def _domain_allowed(host: str, policy: Policy) -> bool:
@@ -390,6 +408,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
     isolation = _isolation(events, sink_pid)  # the sink's own report of its check (#100)
     io_uring_used: list[Event] = []  # io_uring calls that succeeded (#75)
     evaded: list[Event] = []         # evasions that worked (#84): a child or memory strace can't see
+    unidentified: list[Event] = []   # sink records with no domain, when some domains are allowed (#136)
     self_test, filter_problem = _filter_self_test(events, sink_pid)  # the syscall filter's (#84)
     unreadable: list[Event] = []     # file/stat events whose path strace couldn't read (#98)
     server_errors: list[str] = []    # the server's own error messages, via the launcher (#24)
@@ -438,6 +457,15 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
             if allowed:
                 continue
             reason = "contacted a domain not in network.allow_domains"
+            if host == netsink.INVALID:
+                # (#136) The sink couldn't read a domain from this connection
+                # (nothing sent, or not a proxy request). With no domains
+                # allowed at all it's a violation like any other; if some are
+                # allowed, it might have been one of them or not: INCOMPLETE.
+                if policy.allow_domains:
+                    unidentified.append(event)
+                    continue
+                reason, host = UNIDENTIFIED, UNIDENTIFIED_TARGET
             bucket = "violation"
             event = Event("domain", "proxy request", event.pid, event.timestamp, host,
                           "domain", True, None, event.raw)
@@ -553,6 +581,15 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
                           f"call(s), first: {io_uring_used[0].raw})")
     if filter_problem and events:
         incomplete.append(filter_problem)
+    if unidentified:
+        incomplete.append(f"a request could not be attributed to a domain: {len(unidentified)} "
+                          f"{UNIDENTIFIED}(s), first: {unidentified[0].raw}")
+    connects = _connects_to_sink(events, sink_pid)
+    if sink_pid is not None and connects != len(domains):
+        # (#136) Every connection to the sink gets exactly one record. A
+        # different count means a request went unrecorded (or a record is fake).
+        incomplete.append(f"the trace shows {connects} connection(s) to the network sink but the sink "
+                          f"recorded {len(domains)} request(s); a request may be missing")
     if evaded:
         incomplete.append(f"{EVADED_INCOMPLETE} ({len(evaded)} call(s), first: {evaded[0].raw})")
     if incomplete:

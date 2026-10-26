@@ -59,6 +59,7 @@ test_servers/        Fixture servers written for testing Sandglass. Not real tar
   untraced_clone_server.py   Same tool, but a clone(CLONE_UNTRACED) child (invisible to strace) reads ~/.aws/credentials
   ptrace_server.py           Same tool, but tries ptrace and process_vm_readv/writev on its parent
   iouring_node_server.js     Node twin that reads ~/.aws/credentials with io_uring enabled in libuv
+  stall_sink_server.py       Same tool, but stalls one request to the sink to hide a second one behind it
   shell_command_server.py    Same tool, but also runs `/bin/sh -c true`
   undeclared_domain_server.py  Same tool, but also sends a GET to undeclared.example (local sink only)
   good_notes_node_server.js  Node.js twin of good_notes_server (hand-written MCP, no npm packages)
@@ -116,6 +117,8 @@ Expected verdicts:
 | untraced_clone_server | VIOLATIONS | 2: the refused `clone CLONE_UNTRACED` ("tried to evade tracing", #84), and the read of `/home/sandglass/.aws/credentials` by the ordinary child it falls back to |
 | iouring_node_server.js (run with `UV_USE_IO_URING=1`) | VIOLATIONS | 1: read of `/home/sandglass/.aws/credentials`; io_uring is refused, so libuv reads through its thread pool, visibly |
 | ptrace_server | VIOLATIONS | 3: `ptrace PTRACE_ATTACH`, `process_vm_readv`, `process_vm_writev` (all refused, #84) |
+| stall_sink_server under `policies/templates/listed_domains_only.v1.yaml` | VIOLATIONS | 1: domain `hidden.example`, the request queued behind a stalled one to the allowed `api.example.com` (#136; CLEAN with the old sink) |
+| stall_sink_server | VIOLATIONS | 2: domains `api.example.com` and `hidden.example` |
 | good_notes_node_server.js, untraced_clone_server, iouring_node_server.js with Docker's own seccomp profile **off** (old-Docker simulation, test code only) | CLEAN / VIOLATIONS / VIOLATIONS | the same as above: Sandglass's filter doesn't rely on Docker's |
 
 Every run must also show the sink reporting the isolation check as isolated (no route to the internet).
@@ -336,6 +339,19 @@ code runs. A server forging those stats from its own process just produces
 probes. The report's **Network** section lists every domain as allowed or
 not.
 
+**Every connection is accounted for** (#136). The sink reads all its
+connections side by side, each with a 2-second deadline from the moment it
+was accepted (trickling a byte at a time doesn't extend it), so one
+unfinished request can't keep the next waiting. When the server exits, the
+sink drains: every connection still open or still queued is read and
+recorded before it stops. Each connection gets exactly one record; one whose
+request names no readable domain is an **unidentified connection to the
+sink**: a violation if the policy allows no network at all, INCOMPLETE ("a
+request could not be attributed to a domain") if it allows some domains
+(it might have been one of them, or not). And compare.py counts the
+successful `connect()`s to the sink in the trace: if that number differs
+from the sink's records, a request may be missing, so the run is INCOMPLETE.
+
 The sink and the stdin relay run as the same user as the server, so an event
 in a helper's process isn't proof the helper's own code did it. Only an exact
 list of each helper's known events is skipped (its own launch, its markers,
@@ -487,6 +503,8 @@ cp policies/templates/read_only_folder.v1.yaml policies/my_notes_server.yaml   #
 | Any network attempt, even a failed one | VIOLATION |
 | A successful connect to the local network sink | not counted itself; the sink records the domain |
 | A domain asked of the sink that isn't in `network.allow_domains` | VIOLATION naming the domain |
+| A connection to the sink with no readable domain (#136) | VIOLATION if no domain is allowed; **INCOMPLETE** if some are |
+| Connections to the sink in the trace ≠ the sink's records (#136) | **INCOMPLETE** |
 | Any exec besides the server's own launch | VIOLATION (same failure rules as files) |
 
 **Phases.** Every reported event has a phase, and the Markdown report
@@ -521,7 +539,8 @@ start, the sink didn't report the isolation check as isolated, or the stdin rela
 start or ended before the client closed stdin (killed, crashed, or no exit
 record: the server may have tampered with it), Sandglass's syscall filter
 failed its self-test, an io_uring call or an attempt to evade tracing
-succeeded (#84), or strace couldn't read the path of
+succeeded (#84), the sink's records don't match the connections made to it
+or one can't be attributed to a domain (#136), or strace couldn't read the path of
 a file or stat call (it then prints a memory address instead; such an event
 is never dropped, because we can't tell what was touched).
 

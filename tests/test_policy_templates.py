@@ -39,8 +39,11 @@ CONNECT = ('8 10:00:00.2 connect(5, {sa_family=AF_INET, sin_port=htons(443), '
 
 
 def asked_sink_for(host):
-    """The sink (pid 9) recording a request for `host`."""
-    return (f'9 10:00:00.3 newfstatat(AT_FDCWD, "/sandglass-netsink/CONNECT/{host}/443", '
+    """The server connecting to the sink, and the sink (pid 9) recording a
+    request for `host` (two trace lines: every connection has its record, #136)."""
+    return ('8 10:00:00.25 connect(5, {sa_family=AF_INET, sin_port=htons(18080), '
+            'sin_addr=inet_addr("127.0.0.1")}, 16) = 0\n'
+            f'9 10:00:00.3 newfstatat(AT_FDCWD, "/sandglass-netsink/CONNECT/{host}/443", '
             '0x7ffe8cb57b40, 0) = -1 ENOENT (No such file or directory)')
 
 
