@@ -156,22 +156,43 @@ absolute path`. Normal runs still accept relative paths.
 
 What happens (`sandglass/scan.py`):
 
-1. **Download, on your machine**, into a temporary folder. No package code
+1. **Download** into a temporary folder on your machine. No package code
    runs here:
    - PyPI: `pip download`, **wheels only** (`--only-binary=:all:`), for the
      container's platform (Linux, CPython 3.12, its CPU), so it works from a
      Mac too. Building an sdist would run its `setup.py` on your machine, so a
      package with no wheel can't be scanned (INCOMPLETE, with pip's error).
-   - npm: `npm install --ignore-scripts` in a scratch folder fills an npm
-     cache with the package and its dependencies (needs `npm` on your machine).
-     Sandglass refuses to run npm on the host without `--ignore-scripts`
-     (and sets `npm_config_ignore_scripts=true` too). A lockfile entry that
-     points at a local path (`file:`, `link`) stops the scan.
+   - npm (#138): **not on your machine**. A separate, short-lived **download
+     container** (same `sandglass-sandbox` image, deleted when it exits) runs
+     `npm install --ignore-scripts --no-audit --no-fund`, which fills an npm
+     cache with the package and its dependencies. npm unpacks only inside
+     that container's in-memory `/tmp`; the unpacked `node_modules` never
+     reaches your machine. What comes back into the scan's temp folder is
+     only the npm cache (the tarballs, still packed, and npm's index),
+     `package.json` and `package-lock.json`. `npm` doesn't need to be
+     installed on your machine. A lockfile entry that points at a local path
+     (`file:`, `link`) stops the scan, and so does a lockfile or cache file
+     that is a symlink or leads outside the temp folder.
+
+     What the download container may do:
+
+     | | |
+     |---|---|
+     | Network | **Yes, for this step only** (Docker's default bridge), to reach the npm registry. The analysis sandbox below stays `--network none`. |
+     | User | `--user 10001:10001` (non-root), plus your temp folder's group (`--group-add`) so it can write there |
+     | Filesystem | `--read-only` root; writable only: the scan's temp folder (at `/out`) and a `/tmp` tmpfs (`noexec,nosuid`) |
+     | Privileges | `--cap-drop ALL`, `--security-opt no-new-privileges`; never `--privileged` or `--cap-add` |
+     | Mounts | the temp folder only: no project, no home folder; `HOME` is an empty `/tmp/home` |
+     | Code | npm only, with `--ignore-scripts` and `npm_config_ignore_scripts=true`: no package code runs. Sandglass refuses to start it without `--ignore-scripts`. |
+
+     What it can't stop: npm itself downloads and unpacks the tarballs
+     (inside the container), and a package's registry could see the request.
+     The container doesn't see the decoy credentials or your files.
 
    **Archive check** (#133): every downloaded file (the package and each
    dependency: wheels, npm tarballs, the npm cache's tarballs) is checked
    member by member, reading only the headers, before anything else reads
-   it. Nothing is ever unpacked on your machine by Sandglass. The scan stops,
+   it. Nothing is ever unpacked on your machine, by Sandglass or by npm. The scan stops,
    INCOMPLETE (`unsafe archive <file>: member '<name>' is ...; not
    installed`), if a member is an absolute path or has a `..` component, is
    a symlink or hard link leading outside the archive, or is a device or
@@ -249,6 +270,21 @@ builds it (`scripts/build_test_packages.py`) and scans:
 The local test registry also holds registry-style metadata
 (`test_packages/dist/<pypi|npm>-meta/<name>/<version>.json`) with the
 published hashes, so the hash check runs offline too.
+
+With `--registry-dir`, an npm test package's tarball is copied straight from
+that folder: no npm and no download container (the fast path the fixtures
+above use). To test the download container itself (#138),
+`check_fixtures.py` also serves `test_packages/dist` as an npm registry, from
+a container on a private Docker network (never the real registry), and scans
+through it (`EXPECTED_NPM_REGISTRY_SCANS`):
+
+| Package (download container) | Verdict |
+|---|---|
+| `npm:sandglass-test-notes@1.0.0` | CLEAN; the hash matches the registry's `dist.integrity` |
+| `npm:sandglass-test-traversal@1.0.0` | INCOMPLETE: `unsafe archive`, member `../../sandglass-escaped-traversal.txt`; npm unpacked it only inside the download container, nothing escaped on the host |
+
+It also checks that the download left only `npm-cache/`, `project/package.json`
+and `project/package-lock.json` in the temp folder.
 
 ### What the sandbox does
 
@@ -641,13 +677,12 @@ below are from each project's own paper or documentation.
 - **PyPI scans are wheels only**: a package published only as an sdist gives
   INCOMPLETE, because building an sdist would run the package's own code on
   the host, outside the sandbox.
-- **npm unpacks on the host when scanning from the real npm registry**
-  (#133). `npm install --ignore-scripts` (no package code runs) unpacks the
-  package into a scratch folder in the scan's temp folder, with npm's own
-  path checks, before Sandglass checks the tarballs it cached and deletes
-  that folder unread. Sandglass's own checks cover every archive before it
-  is used, but not npm's unpacking itself. A package (or dependency) bigger
-  than 500 MB unpacked, or with more than 20,000 files, can't be scanned.
+- **npm downloads with network access** (#138). The npm download container
+  is the one Sandglass container with network, for the download only, and
+  npm unpacks the tarballs inside it (never on your machine) before
+  Sandglass's archive checks run on the host. A package (or dependency)
+  bigger than 500 MB unpacked, or with more than 20,000 files, can't be
+  scanned.
 
 - **Fixture runs mount the whole project read-only**, so a fixture server
   can read `sandglass/`, `policies/` and the other fixtures. That is acceptable for

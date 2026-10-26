@@ -167,17 +167,16 @@ def test_the_scan_report_is_incomplete_with_the_reason(registry, monkeypatch):
 # --- npm on the host never runs install scripts ---------------------------------
 
 def test_npm_download_command_ignores_scripts():
-    command = scan.npm_download_command("/usr/bin/npm", parse_spec("npm:pkg@1.0.0"), Path("/tmp/c"))
+    command = scan.npm_download_command(parse_spec("npm:pkg@1.0.0"))
     assert "--ignore-scripts" in command and command[-1] == "pkg@1.0.0"
 
 
 def test_npm_without_ignore_scripts_fails_closed(monkeypatch, tmp_path):
     ran = []
     monkeypatch.setattr(scan.subprocess, "run", lambda *a, **k: ran.append(a))
-    # A future edit that drops the flag: refused before npm starts.
+    # A future edit that drops the flag: refused before Docker (and npm) starts.
     monkeypatch.setattr(scan, "npm_download_command",
-                        lambda npm, spec, cache: [npm, "install", f"{spec.name}@{spec.version}"])
-    monkeypatch.setattr(scan.shutil, "which", lambda name: "/usr/bin/npm")
+                        lambda spec: ["npm", "install", f"{spec.name}@{spec.version}"])
     with pytest.raises(ScanError, match="without --ignore-scripts"):
         scan.download(parse_spec("npm:pkg@1.0.0"), tmp_path, "x86_64-linux-gnu", None)
     assert ran == []

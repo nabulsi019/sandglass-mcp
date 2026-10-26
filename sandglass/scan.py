@@ -5,14 +5,16 @@ The steps, in order (client.run_scan runs them and writes the report):
   1. parse_spec   "pypi:name@1.2.3" -> PackageSpec. Exact versions only:
                   "latest", ranges ("^1.2", ">=1", "1.*") are refused, so a
                   report always names exactly what was scanned.
-  2. download     ON THE HOST, into a temporary folder, running no package code:
-                    pypi  pip download, wheels only (--only-binary=:all:), for the
-                          container's platform (Linux, CPython 3.12, its CPU).
-                          Building an sdist would run its setup.py on the host.
-                    npm   npm install --ignore-scripts in a scratch folder, which
-                          fills an npm cache with the package and its
-                          dependencies; only that cache, package.json and the
-                          lockfile are kept.
+  2. download     into a temporary folder on the host, running no package code:
+                    pypi  pip download ON THE HOST, wheels only
+                          (--only-binary=:all:), for the container's platform
+                          (Linux, CPython 3.12, its CPU). Building an sdist
+                          would run its setup.py on the host.
+                    npm   (#138) npm install --ignore-scripts in a separate,
+                          throwaway DOWNLOAD container, never on the host. npm
+                          unpacks into that container's /tmp; only its cache
+                          (the tarballs), package.json and the lockfile reach
+                          the host folder.
                   With --registry-dir, our own test packages come from a local
                   folder instead of PyPI/npm (no network at all).
   2a. archives    (#133) every downloaded file is checked member by member
@@ -352,12 +354,79 @@ def _console_scripts(wheel: Path) -> list[str]:
     return sorted(parser["console_scripts"]) if parser.has_section("console_scripts") else []
 
 
-def npm_download_command(npm: str, spec: PackageSpec, cache: Path) -> list[str]:
-    """npm on the host: fills the npm cache with the package and its
-    dependencies. --ignore-scripts: no package code runs here (_run_host refuses
-    an npm command without it)."""
-    return [npm, "install", "--ignore-scripts", "--no-audit", "--no-fund", "--save-exact",
-            "--cache", str(cache), f"{spec.name}@{spec.version}"]
+# The npm download container (#138). Its network is Docker's default bridge,
+# for this step only. NPM_DOWNLOAD_REGISTRY None means npm's own default
+# (registry.npmjs.org); test code points both at a local test registry.
+NPM_DOWNLOAD_NETWORK = "bridge"
+NPM_DOWNLOAD_REGISTRY: str | None = None
+NPM_DOWNLOAD_CACHE = sandbox.CONTAINER_OUT / "npm-cache"
+NPM_DOWNLOAD_PROJECT = sandbox.CONTAINER_OUT / "project"
+# A fixed script; the npm command only reaches it as "$@" arguments. npm runs
+# in /tmp/project, the container's own tmpfs, so the folder it unpacks
+# (node_modules) never reaches the host; only package.json and the lockfile
+# are copied back, and the cache is written to /out directly. umask 007 and
+# chmod: on a Linux host the files belong to uid 10001; the host user (through
+# the folder's group) must still be able to delete them, other users can't
+# write them.
+NPM_DOWNLOAD_SCRIPT = (
+    f'umask 007; mkdir -p /tmp/home /tmp/project {NPM_DOWNLOAD_PROJECT} {NPM_DOWNLOAD_CACHE}'
+    ' && cd /tmp/project'
+    ' && printf \'{"name": "sandglass-scan", "version": "0.0.0", "private": true}\\n\' > package.json'
+    ' && "$@"; status=$?'
+    f'; cp package.json package-lock.json {NPM_DOWNLOAD_PROJECT}/'
+    f'; chmod -R ug+rwX,o-w {NPM_DOWNLOAD_PROJECT} {NPM_DOWNLOAD_CACHE}'
+    '; exit $status'
+)
+# npm's settings in the download container: logs in /tmp, no update check,
+# and install scripts off a second way (on top of --ignore-scripts).
+NPM_DOWNLOAD_ENV = {
+    "npm_config_ignore_scripts": "true",
+    "npm_config_logs_dir": "/tmp/npm-logs",
+    "npm_config_update_notifier": "false",
+}
+
+
+def npm_download_command(spec: PackageSpec) -> list[str]:
+    """The npm command the download container runs: fills the npm cache with
+    the package and its dependencies. --ignore-scripts: no package code runs
+    (_run_download_container refuses a command without it)."""
+    command = ["npm", "install", "--ignore-scripts", "--no-audit", "--no-fund", "--save-exact",
+               "--cache", str(NPM_DOWNLOAD_CACHE)]
+    if NPM_DOWNLOAD_REGISTRY is not None:
+        command += ["--registry", NPM_DOWNLOAD_REGISTRY]
+    return command + [f"{spec.name}@{spec.version}"]
+
+
+def npm_download_container_command(spec: PackageSpec, folder: Path) -> tuple[str, list[str]]:
+    """(docker, args) of the download container for this scan (sandbox.npm_download_container_args)."""
+    docker = shutil.which("docker") or "docker"
+    name = re.sub(r"[^A-Za-z0-9_.-]", "-", f"{folder.name}-{spec.slug}-npm")
+    return docker, sandbox.npm_download_container_args(
+        folder, folder.stat().st_gid, NPM_DOWNLOAD_SCRIPT, npm_download_command(spec),
+        NPM_DOWNLOAD_ENV, NPM_DOWNLOAD_NETWORK, name)
+
+
+def _run_download_container(docker: str, args: list[str]) -> None:
+    """Run the npm download container; ScanError with npm's output if it fails.
+
+    Fail closed (#133): a command without --ignore-scripts is refused before
+    Docker starts. A container that runs too long is removed.
+    """
+    if "--ignore-scripts" not in args:
+        raise ScanError("npm download: refusing to run npm without --ignore-scripts")
+    name = args[args.index("--name") + 1]
+    try:
+        out = subprocess.run([docker, *args], stdin=subprocess.DEVNULL, capture_output=True,
+                             text=True, timeout=HOST_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        sandbox.remove_container(name)  # killing `docker run` doesn't stop the container
+        raise ScanError(f"npm download container took longer than {HOST_TIMEOUT_SECONDS} s") from None
+    except OSError as exc:
+        raise ScanError(f"could not start the npm download container: {exc}") from None
+    if out.returncode != 0:
+        log = (out.stdout + out.stderr).strip()[-INSTALL_LOG_CHARS:]
+        raise ScanError(f"npm install --ignore-scripts (download container) failed "
+                        f"(exit {out.returncode}): {log}")
 
 
 def npm_tarball_name(name: str, version: str) -> str:
@@ -369,13 +438,13 @@ def _download_npm(spec, folder, registry_dir) -> Prepared:
     """Fill folder/ with project/package.json (+ lockfile), npm-cache/ and, for a
     local registry, the tarball. Install scripts never run on the host."""
     project = folder / "project"
-    project.mkdir()
-    (folder / "npm-cache").mkdir()
     manifest = {"name": "sandglass-scan", "version": "0.0.0", "private": True}
 
     if registry_dir is not None:
-        # A local test package: no registry, no npm on the host. The install
-        # in the sandbox installs this tarball directly.
+        # A local test package: no registry, no npm, no download container.
+        # The install in the sandbox installs this tarball directly.
+        project.mkdir()
+        (folder / "npm-cache").mkdir()
         tarball = registry_dir / "npm" / npm_tarball_name(spec.name, spec.version)
         if not tarball.is_file():
             raise ScanError(f"{tarball.name} is not in {registry_dir / 'npm'}")
@@ -386,19 +455,20 @@ def _download_npm(spec, folder, registry_dir) -> Prepared:
         files = [folder / tarball.name]
         artifact, labels = files[0], {}
     else:
-        npm = shutil.which("npm")
-        if npm is None:
-            raise ScanError("npm is not installed on the host (needed to download npm packages)")
-        (project / "package.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-        _run_host(npm_download_command(npm, spec, folder / "npm-cache"),
-                  "npm install --ignore-scripts (on the host)", cwd=project)
-        # Only the cache and the lockfile go into the sandbox; the files npm
-        # unpacked here are deleted unread (they were never run). rmtree
-        # removes a symlink npm made, never what it points to.
-        shutil.rmtree(project / "node_modules", ignore_errors=True)
+        # The download container (#138) creates project/ (package.json, the
+        # lockfile) and npm-cache/ here; npm never runs (or unpacks anything)
+        # on the host. Group-writable (setgid: what it creates keeps this
+        # folder's group): the container's user gets this group as an extra
+        # one, so it can write here, and the host user can delete what it
+        # made. Other users can't write anywhere in the folder.
+        folder.chmod(0o2775)
+        _run_download_container(*npm_download_container_command(spec, folder))
         files, labels, artifact = _cache_tarballs(spec, folder)
         for tarball in files:  # the package and every dependency (#133)
-            check_archive(tarball)
+            try:
+                check_archive(tarball)
+            except ScanError as exc:  # name the package, not just the cache file's hash
+                raise ScanError(f"{labels[tarball]}: {exc}") from None
     # package.json from the checked tarball itself, never from a folder npm
     # unpacked on the host (a symlink there could point anywhere).
     package_json = _package_json_from_tarball(artifact)
@@ -423,7 +493,12 @@ def _cache_tarballs(spec: PackageSpec, folder: Path) -> tuple[list[Path], dict[P
     lockfile's "integrity" of every package says where it is. Returns (files,
     their names to show, the package's own tarball).
     """
-    lock = json.loads((folder / "project" / "package-lock.json").read_text(encoding="utf-8"))
+    lock_path = folder / "project" / "package-lock.json"
+    # The download container wrote this folder (#138): plain files only, never
+    # a symlink that would make the host read something else.
+    if not _plain_file_inside(lock_path, folder):
+        raise ScanError("the npm download left no package-lock.json (a plain file)")
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
     files, labels, artifact = [], {}, None
     for key, info in sorted(lock.get("packages", {}).items()):
         if not key:
@@ -435,8 +510,8 @@ def _cache_tarballs(spec: PackageSpec, folder: Path) -> tuple[list[Path], dict[P
         if "integrity" not in info:
             continue
         path = cache_content_path(folder / "npm-cache", info["integrity"])
-        if not path.is_file():
-            raise ScanError(f"{key} is not in the downloaded npm cache")
+        if not _plain_file_inside(path, folder):
+            raise ScanError(f"{key} is not in the downloaded npm cache (as a plain file)")
         files.append(path)
         labels[path] = f"{key.removeprefix('node_modules/')}@{info.get('version')} (npm cache)"
         if key == f"node_modules/{spec.name}":
@@ -444,6 +519,13 @@ def _cache_tarballs(spec: PackageSpec, folder: Path) -> tuple[list[Path], dict[P
     if artifact is None:
         raise ScanError(f"the lockfile doesn't list {spec.name}")
     return files, labels, artifact
+
+
+def _plain_file_inside(path: Path, folder: Path) -> bool:
+    """A regular file, not a symlink, and (following every folder on the way)
+    really inside `folder`: a symlinked folder can't lead the host elsewhere."""
+    return (not path.is_symlink() and path.is_file()
+            and path.resolve().is_relative_to(folder.resolve()))
 
 
 def cache_content_path(cache: Path, integrity: str) -> Path:

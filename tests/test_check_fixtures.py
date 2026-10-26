@@ -3,6 +3,7 @@
 No Docker: run_sandboxed is replaced by a function that returns reports.
 """
 
+import contextlib
 import importlib.util
 
 from sandglass import PROJECT_ROOT
@@ -25,6 +26,8 @@ def test_mixed_exec_and_file_violations_are_a_fail_not_a_crash(monkeypatch, caps
     # The scans (#19) too: no building, no Docker.
     monkeypatch.setattr(check_fixtures, "build_test_packages", lambda: None)
     monkeypatch.setattr(check_fixtures, "run_scan", lambda spec, policy, registry: fake_report(mixed))
+    # The local npm registry (#138) too: no Docker.
+    monkeypatch.setattr(check_fixtures, "local_npm_registry", lambda: contextlib.nullcontext([]))
     assert check_fixtures.main() == 1
     out = capsys.readouterr().out
     # Every fixture was still checked, and the summary was printed.

@@ -251,6 +251,52 @@ def scan_install_command(volume: str, download_dir: Path, script: str, script_ar
     return docker, args
 
 
+# The npm download container (#138): where its output folder is mounted.
+CONTAINER_OUT = PurePosixPath("/out")
+# Its HOME: an empty folder in its tmpfs, so no decoy (or real) credentials are near npm.
+DOWNLOAD_HOME = PurePosixPath("/tmp/home")
+
+
+def npm_download_container_args(out_dir: Path, out_group: int, script: str, npm_command: list[str],
+                                env: dict, network: str, name: str) -> list[str]:
+    """`docker run` arguments of the npm DOWNLOAD container (#138).
+
+    A separate, short-lived container, not the analysis sandbox: it only
+    downloads. It is the one Sandglass container with network access
+    (`network`, Docker's default bridge), and only for this step. npm runs
+    with --ignore-scripts, so no package code runs here either.
+
+    Hardening: non-root (the sandbox user), read-only root filesystem, every
+    capability dropped, no privilege gain (setuid), HOME an empty folder in
+    /tmp. The ONLY writable places are `out_dir` (at /out) and a tmpfs /tmp
+    with noexec. The project is not mounted. `script` is a fixed shell script
+    from scan.py; the npm command reaches it as "$@" arguments.
+
+    `out_group` (the output folder's group, the host user's) is added to the
+    user's groups: that is what lets it write into the folder on a Linux host
+    (the folder is group-writable), without making the folder writable for
+    every user.
+    """
+    env_args = [arg for key, value in env.items() for arg in ("-e", f"{key}={value}")]
+    return [
+        "run", "--rm",
+        "--name", name,              # so it can be removed if it runs too long
+        "--network", network,        # the download step only; the sandbox stays --network none
+        "--read-only",
+        "--tmpfs", "/tmp:rw,noexec,nosuid",
+        "--user", CONTAINER_USER,    # never root
+        "--group-add", str(out_group),
+        "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges",
+        "-e", f"HOME={DOWNLOAD_HOME}",
+        *env_args,
+        "-v", f"{out_dir}:{CONTAINER_OUT}",  # the one writable mount
+        "-w", "/tmp",
+        IMAGE,
+        "sh", "-c", script, "sandglass-download", *npm_command,
+    ]
+
+
 def scan_run_command(volume: str, server_path: str, runtime: str) -> tuple[str, list[str]]:
     """`docker run` that runs the installed package's server under strace.
 
