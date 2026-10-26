@@ -45,6 +45,16 @@ def test_every_hostile_fixture_is_protected():
         assert policy_name in check_fixtures.POLICIES
 
 
+def test_the_host_archive_checks_are_protected_and_in_place():
+    # (#133) named in CLAUDE.md, and still what the code does.
+    from sandglass import scan
+    for item in ("check_archive", "MAX_ARCHIVE_BYTES", "MAX_ARCHIVE_FILES", "--ignore-scripts"):
+        assert item in PROTECTED, f"{item!r} is not in CLAUDE.md's protected items"
+    assert (scan.MAX_ARCHIVE_BYTES, scan.MAX_ARCHIVE_FILES) == (500 * 1024 * 1024, 20_000)
+    source = (PROJECT_ROOT / "sandglass" / "scan.py").read_text(encoding="utf-8")
+    assert source.count("check_archive(") >= 4  # the definition, wheels, local tarball, npm cache
+
+
 def test_every_expectation_dict_is_protected():
     # A new EXPECTED_* dict must be added to the protected list too.
     for name in dir(check_fixtures):

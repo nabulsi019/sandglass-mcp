@@ -131,6 +131,108 @@ def write_metadata(ecosystem: str, source: Path, built: Path) -> Path:
     return path
 
 
+# ---------------------------------------------------------------------------
+# Hostile archives (#133): packages that would be unsafe to unpack. They have
+# no source folder: they are generated here, so a "../" member never exists
+# as a real file in the repository. `sandglass scan` must refuse each one on
+# the host, before the install (INCOMPLETE). Nothing in them is ever unpacked.
+# ---------------------------------------------------------------------------
+
+HOSTILE_ESCAPE_TARGETS = ("../../sandglass-escaped-traversal.txt", "/tmp/sandglass-escaped-absolute.txt")
+BOMB_BYTES = 520 * 1024 * 1024  # just over scan.MAX_ARCHIVE_BYTES once unpacked
+
+
+def _wheel_metadata(name: str, version: str) -> dict[str, bytes]:
+    """The dist-info files every wheel needs (no RECORD hashes: never installed)."""
+    dist_info = f"{name.replace('-', '_')}-{version}.dist-info"
+    return {
+        f"{dist_info}/METADATA": f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n".encode(),
+        f"{dist_info}/WHEEL": b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        f"{dist_info}/entry_points.txt": f"[console_scripts]\n{name} = x:main\n".encode(),
+        f"{dist_info}/RECORD": b"",
+    }
+
+
+def _zip_info(path: str, mode: int) -> zipfile.ZipInfo:
+    info = zipfile.ZipInfo(path, FIXED_DATE)
+    info.external_attr = mode << 16  # Unix type and permissions, as zip stores them
+    info.compress_type = zipfile.ZIP_DEFLATED
+    return info
+
+
+def build_symlink_wheel(out_dir: Path) -> Path:
+    """sandglass-test-symlink: a wheel whose module folder holds a symlink to
+    ~/.aws/credentials, outside the folder it would be unpacked into."""
+    out = out_dir / "sandglass_test_symlink-1.0.0-py3-none-any.whl"
+    with zipfile.ZipFile(out, "w") as whl:
+        whl.writestr(_zip_info("sandglass_test_symlink/__init__.py", 0o100644), b"")
+        # A zip symlink: file type 0o120000, the target is the member's content.
+        whl.writestr(_zip_info("sandglass_test_symlink/notes.txt", 0o120777),
+                     b"../../../../home/sandglass/.aws/credentials")
+        for path, data in _wheel_metadata("sandglass-test-symlink", "1.0.0").items():
+            whl.writestr(_zip_info(path, 0o100644), data)
+    return out
+
+
+def build_bomb_wheel(out_dir: Path) -> Path:
+    """sandglass-test-bomb: a wheel of a few hundred KB holding one file of
+    zeros that would unpack to more than 500 MB (a "zip bomb", gently)."""
+    out = out_dir / "sandglass_test_bomb-1.0.0-py3-none-any.whl"
+    chunk = bytes(1024 * 1024)
+    with zipfile.ZipFile(out, "w") as whl:
+        info = _zip_info("sandglass_test_bomb/zeros.bin", 0o100644)
+        with whl.open(info, "w", force_zip64=True) as data:  # streamed: never all in memory
+            for _ in range(BOMB_BYTES // len(chunk)):
+                data.write(chunk)
+        for path, content in _wheel_metadata("sandglass-test-bomb", "1.0.0").items():
+            whl.writestr(_zip_info(path, 0o100644), content)
+    return out
+
+
+def build_traversal_tarball(out_dir: Path) -> Path:
+    """sandglass-test-traversal: an npm tarball with a valid package.json, plus
+    a "../" member and an absolute member that would land outside its folder."""
+    out = out_dir / npm_tarball_name("sandglass-test-traversal", "1.0.0")
+    manifest = json.dumps({"name": "sandglass-test-traversal", "version": "1.0.0",
+                           "bin": {"sandglass-test-traversal": "server.js"}}).encode()
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        members = [("package/package.json", manifest), ("package/server.js", b"")]
+        members += [(name, b"written outside the package folder\n") for name in HOSTILE_ESCAPE_TARGETS]
+        for name, data in members:
+            info = tarfile.TarInfo(name)
+            info.size, info.mtime, info.mode = len(data), 0, 0o644
+            tar.addfile(info, io.BytesIO(data))
+    out.write_bytes(gzip.compress(buffer.getvalue(), mtime=0))
+    return out
+
+
+def write_hostile_metadata(ecosystem: str, name: str, built: Path) -> Path:
+    """Correct "published" hashes, so only the archive check can stop the scan."""
+    data = built.read_bytes()
+    if ecosystem == "pypi":
+        metadata = {"info": {"name": name, "version": "1.0.0"},
+                    "urls": [{"filename": built.name,
+                              "digests": {"sha256": hashlib.sha256(data).hexdigest()}}]}
+    else:
+        metadata = {"name": name, "version": "1.0.0",
+                    "dist": {"integrity": "sha512-" + base64.b64encode(hashlib.sha512(data).digest()).decode()}}
+    path = DIST / f"{ecosystem}-meta" / name / "1.0.0.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def build_hostile() -> list[Path]:
+    built = [build_symlink_wheel(DIST / "pypi"), build_bomb_wheel(DIST / "pypi"),
+             build_traversal_tarball(DIST / "npm")]
+    for path, (ecosystem, name) in zip(built, (("pypi", "sandglass-test-symlink"),
+                                               ("pypi", "sandglass-test-bomb"),
+                                               ("npm", "sandglass-test-traversal"))):
+        write_hostile_metadata(ecosystem, name, path)
+    return built
+
+
 def build_all() -> list[Path]:
     """Rebuild test_packages/dist/ from scratch; returns the files built."""
     built = []
@@ -142,7 +244,7 @@ def build_all() -> list[Path]:
             path = build(source, DIST / ecosystem)
             write_metadata(ecosystem, source, path)
             built.append(path)
-    return built
+    return built + build_hostile()
 
 
 def main() -> int:
