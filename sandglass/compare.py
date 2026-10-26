@@ -52,6 +52,12 @@ Rules (one place, so they're easy to explain):
                                                this at every startup)
     succeeded                               -> INCOMPLETE: the trace may be
                                                missing file access
+  Evasion (#84): clone/clone3 with CLONE_UNTRACED, ptrace, process_vm_readv/writev
+    any attempt, even refused -> VIOLATION "tried to evade tracing"
+    succeeded                 -> also INCOMPLETE (a child or memory strace can't see)
+  Syscall filter self-test (#84): the launcher's io_uring_setup and
+    CLONE_UNTRACED clone, before the sink is ready, must both fail with EPERM;
+    missing or not refused -> INCOMPLETE. Not otherwise reported.
 
 Phases (#18): every reported event gets a phase:
   install    `sandglass scan` only: the install's own trace, judged by
@@ -90,8 +96,46 @@ from sandglass.trace_parser import MAX_TRACE_BYTES, UNREADABLE, Event, exec_argv
 # Errors that mean "this exists but you're not allowed": a real access attempt.
 BLOCKED_ERRORS = {"EACCES", "EPERM"}
 
-IO_URING_INCOMPLETE = ("io_uring was available, file access may be missing from the trace; "
-                       "rerun on Docker 25+ or with a seccomp profile that blocks io_uring")
+IO_URING_INCOMPLETE = "io_uring was available, file access may be missing from the trace"
+EVADED_INCOMPLETE = ("a process got out of strace's sight (a CLONE_UNTRACED child, ptrace or "
+                     "another process's memory), so its actions may be missing from the trace")
+FILTER_INACTIVE = ("Sandglass's syscall filter is not active (#84): its self-test before the server "
+                   "started")
+EVADE_REASON = "tried to evade tracing"
+
+
+def _filter_self_test(events: list[Event], sink_pid: int | None) -> tuple[list[Event], str | None]:
+    """The launcher's self-test of the syscall filter (#84): (its events, problem or None).
+
+    Right after installing the filter, the launcher (the first process to
+    exec) tries io_uring_setup and a clone with CLONE_UNTRACED. Only the FIRST
+    of each, from the launcher, before the sink marks itself ready (so before
+    any server code ran) counts. Both must be there and both must have failed
+    with EPERM; anything else means the filter isn't doing its job.
+    """
+    launch = next((e for e in events if e.kind == "process" and e.succeeded), None)
+    if launch is None:
+        return [], None  # no launch at all: INCOMPLETE for that reason already
+    end = next((i for i, e in enumerate(events) if e.pid == sink_pid and e.kind == "probe"
+                and e.target == netsink.SINK_READY), len(events))
+    found = {}
+    for event in events[:end]:
+        if event.pid != launch.pid:
+            continue
+        if event.syscall == "io_uring_setup":
+            found.setdefault("io_uring_setup", event)
+        elif event.kind == "evasion" and event.syscall == "clone":
+            found.setdefault("clone(CLONE_UNTRACED)", event)
+    problems = []
+    for name in ("io_uring_setup", "clone(CLONE_UNTRACED)"):
+        event = found.get(name)
+        if event is None:
+            problems.append(f"{name} missing")
+        elif event.succeeded or event.error != "EPERM":
+            problems.append(f"{name} {'succeeded' if event.succeeded else 'failed with ' + str(event.error)}"
+                            " instead of being refused (EPERM)")
+    problem = f"{FILTER_INACTIVE}: {'; '.join(problems)}" if problems else None
+    return list(found.values()), problem
 
 
 def _is_under(path: str, roots: list) -> bool:
@@ -135,6 +179,8 @@ def _domain_allowed(host: str, policy: Policy) -> bool:
 
 
 PHASES = ("install", "startup", "tool-call", "unknown")
+# Event kinds counted in every report ("evasion": #84).
+EVENT_KINDS = ("file", "probe", "process", "network", "io_uring", "evasion", "exit")
 
 
 def _first_pid_to_stat(events: list[Event], path: str) -> int | None:
@@ -343,6 +389,8 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
     domains: list[dict] = []       # every request the sink recorded
     isolation = _isolation(events, sink_pid)  # the sink's own report of its check (#100)
     io_uring_used: list[Event] = []  # io_uring calls that succeeded (#75)
+    evaded: list[Event] = []         # evasions that worked (#84): a child or memory strace can't see
+    self_test, filter_problem = _filter_self_test(events, sink_pid)  # the syscall filter's (#84)
     unreadable: list[Event] = []     # file/stat events whose path strace couldn't read (#98)
     server_errors: list[str] = []    # the server's own error messages, via the launcher (#24)
     programs: list[dict] = []        # every successful exec, allowed or not (#120)
@@ -363,6 +411,9 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
             # it against any allow-list. From any pid; INCOMPLETE below.
             unreadable.append(event)
             continue
+
+        if any(event is own for own in self_test):
+            continue  # the launcher's filter self-test (#84), judged by _filter_self_test
 
         if event.pid == relay_pid and _is_relay_own(event, relay_exec):
             continue  # the relay's launch and markers; anything else it does is judged (#99)
@@ -461,6 +512,15 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
             reason = "io_uring blocked (file access through it would be invisible to strace)"
             bucket = "attempted"
 
+        elif event.kind == "evasion":
+            # (#84) Refused by the filter or not, trying is a violation: no
+            # MCP server needs an untraced child or another process's memory.
+            # If it worked, what followed is missing from the trace: INCOMPLETE below.
+            if event.succeeded:
+                evaded.append(event)
+            reason = EVADE_REASON
+            bucket = "violation"
+
         else:
             continue  # exit events are only used for the completeness check
 
@@ -491,6 +551,10 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
     if io_uring_used:
         incomplete.append(f"{IO_URING_INCOMPLETE} ({len(io_uring_used)} successful io_uring "
                           f"call(s), first: {io_uring_used[0].raw})")
+    if filter_problem and events:
+        incomplete.append(filter_problem)
+    if evaded:
+        incomplete.append(f"{EVADED_INCOMPLETE} ({len(evaded)} call(s), first: {evaded[0].raw})")
     if incomplete:
         verdict = "INCOMPLETE"
     elif violations:
@@ -510,7 +574,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
         "programs": programs,
         "event_counts": {
             kind: sum(1 for e in events if e.kind == kind)
-            for kind in ("file", "probe", "process", "network", "io_uring", "exit")
+            for kind in EVENT_KINDS
         },
     }
 
@@ -592,7 +656,7 @@ def compare_install(events: list[Event], policy: Policy, baseline: InstallBaseli
     write_ok = policy.write_allow + baseline.write_allow
     exec_ok = policy.exec_allow + baseline.exec_allow
     violations, attempted, probes, incomplete = [], [], {}, []
-    unreadable, io_uring_used, programs = [], [], []
+    unreadable, io_uring_used, programs, evaded = [], [], [], []
     launch: Event | None = None
 
     def readable(path: str) -> bool:
@@ -655,6 +719,12 @@ def compare_install(events: list[Event], policy: Policy, baseline: InstallBaseli
             else:
                 record(event, "io_uring blocked (file access through it would be invisible to strace)",
                        "attempted")
+        elif event.kind == "evasion":
+            # (#84) Same rule as the server's run. The install has no launcher,
+            # so nothing refuses these here: one that worked hid what followed.
+            record(event, f"install {EVADE_REASON}", "violation")
+            if event.succeeded:
+                evaded.append(event)
 
     if exit_code is None:
         incomplete.append("the install took too long and was stopped")
@@ -677,6 +747,9 @@ def compare_install(events: list[Event], policy: Policy, baseline: InstallBaseli
     if io_uring_used:
         incomplete.append(f"{IO_URING_INCOMPLETE} (during the install: {len(io_uring_used)} "
                           f"successful io_uring call(s), first: {io_uring_used[0].raw})")
+    if evaded:
+        incomplete.append(f"{EVADED_INCOMPLETE} (during the install: {len(evaded)} call(s), "
+                          f"first: {evaded[0].raw})")
 
     return {
         "incomplete_reasons": incomplete,
@@ -685,7 +758,7 @@ def compare_install(events: list[Event], policy: Policy, baseline: InstallBaseli
         "probes": sorted(probes.values(), key=lambda p: p["first_timestamp"]),
         "programs": programs,
         "event_counts": {kind: sum(1 for e in events if e.kind == kind)
-                         for kind in ("file", "probe", "process", "network", "io_uring", "exit")},
+                         for kind in EVENT_KINDS},
     }
 
 
@@ -777,7 +850,7 @@ def not_run(reason: str | None) -> dict:
         "verdict": "INCOMPLETE", "incomplete_reasons": [reason] if reason else [],
         "violations": [], "attempted": [], "probes": [], "domains": [],
         "network_isolation": None, "phase_note": "the server was not run", "programs": [],
-        "event_counts": {kind: 0 for kind in ("file", "probe", "process", "network", "io_uring", "exit")},
+        "event_counts": {kind: 0 for kind in EVENT_KINDS},
     }
 
 

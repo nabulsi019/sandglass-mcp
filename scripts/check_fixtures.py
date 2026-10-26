@@ -10,11 +10,12 @@ fixture matches its expectation exactly.
     uv run python scripts/check_fixtures.py
 """
 
+import contextlib
 import importlib.util
 import sys
 from pathlib import Path
 
-from sandglass import PROJECT_ROOT
+from sandglass import PROJECT_ROOT, sandbox
 from sandglass.client import EXIT_CODES, run_sandboxed, run_scan
 from sandglass.scan import parse_spec
 
@@ -113,7 +114,57 @@ EXPECTED_HOSTILE = {
     ("proc_self_escape_server.py", "notes_readonly"): ("VIOLATIONS", [
         ("read", f"/proc/self/root{CREDS}"), ("read", CREDS), ("read", "/proc/self/fd/100"),
     ], []),
+    # (#84) Sandglass's syscall filter. A clone(CLONE_UNTRACED) child would
+    # read the credentials unseen; the clone is refused (a violation) and the
+    # fallback child's read is seen.
+    ("untraced_clone_server.py", "notes_readonly"): ("VIOLATIONS", [
+        ("evade", "clone CLONE_UNTRACED"), ("read", CREDS),
+    ], []),
+    # Reads the credentials with io_uring enabled in libuv (UV_USE_IO_URING=1,
+    # see FIXTURE_DOCKER_OPTIONS): io_uring is refused, so the read is seen.
+    ("iouring_node_server.js", "notes_readonly"): ("VIOLATIONS", [("read", CREDS)], []),
+    # ptrace and process_vm_readv/writev on its parent: all refused, all violations.
+    ("ptrace_server.py", "notes_readonly"): ("VIOLATIONS", [
+        ("evade", "ptrace PTRACE_ATTACH"), ("evade", "process_vm_readv"), ("evade", "process_vm_writev"),
+    ], []),
 }
+
+# Extra `docker run` options for one fixture, in every run of it (test only).
+FIXTURE_DOCKER_OPTIONS = {
+    # Lets libuv use io_uring for file reads (off by default in recent libuv).
+    "iouring_node_server.js": ["-e", "UV_USE_IO_URING=1"],
+}
+
+# (#84) The review's Docker 20.10 case, simulated: Docker's own seccomp
+# profile turned OFF, so only Sandglass's filter stands between the server
+# and io_uring / CLONE_UNTRACED. TEST CODE ONLY: this option must never
+# appear in sandglass/ (tests/test_syscall_filter.py checks that).
+# fixture -> (expected verdict, expected violations), under notes_readonly.
+OLD_DOCKER_OPTIONS = ["--security-opt", "seccomp=unconfined"]
+EXPECTED_OLD_DOCKER = {
+    # Node's libuv uses io_uring at startup: refused, so CLEAN, not INCOMPLETE.
+    "good_notes_node_server.js": ("CLEAN", []),
+    "untraced_clone_server.py": ("VIOLATIONS", [("evade", "clone CLONE_UNTRACED"), ("read", CREDS)]),
+    "iouring_node_server.js": ("VIOLATIONS", [("read", CREDS)]),
+}
+
+
+@contextlib.contextmanager
+def docker_options(options: list[str]):
+    """Add `docker run` options (before the image name) to every sandboxed
+    run inside the `with` block. Test only: the product command is unchanged."""
+    original = sandbox._traced_run_args
+
+    def with_options(*args, **kwargs):
+        run_args = original(*args, **kwargs)
+        image = run_args.index(sandbox.IMAGE)
+        return run_args[:image] + options + run_args[image:]
+
+    sandbox._traced_run_args = with_options
+    try:
+        yield
+    finally:
+        sandbox._traced_run_args = original
 
 
 # `sandglass scan` of our own test packages (#19), from the local test
@@ -249,11 +300,19 @@ def main() -> int:
     for (fixture, policy_name), (want_verdict, want_violations, want_reasons) in EXPECTED_HOSTILE.items():
         label = f"{fixture} under {policy_name}"
         print(f"\n===== {label} =====")
-        report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, POLICIES[policy_name])
+        with docker_options(FIXTURE_DOCKER_OPTIONS.get(fixture, [])):
+            report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, POLICIES[policy_name])
         failures += check(label, report, want_verdict, want_violations)
         reasons = " | ".join(report.get("incomplete_reasons", []))
         failures += [f"{label}: INCOMPLETE reasons don't mention {text!r}: {reasons}"
                      for text in want_reasons if text not in reasons]
+
+    for fixture, (want_verdict, want_violations) in EXPECTED_OLD_DOCKER.items():
+        label = f"{fixture} with Docker's seccomp profile off (old-Docker simulation)"
+        print(f"\n===== {label} =====")
+        with docker_options(OLD_DOCKER_OPTIONS + FIXTURE_DOCKER_OPTIONS.get(fixture, [])):
+            report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, POLICY)
+        failures += check(label, report, want_verdict, want_violations)
 
     build_test_packages()
     for package, (want_verdict, want_violations) in EXPECTED_SCANS.items():
@@ -275,7 +334,7 @@ def main() -> int:
         print("FAIL", line)
     if not failures:
         total = (len(EXPECTED) + len(EXPECTED_V04) + len(EXPECTED_POLICY_RUNS) + len(EXPECTED_HOSTILE)
-                 + len(EXPECTED_SCANS))
+                 + len(EXPECTED_OLD_DOCKER) + len(EXPECTED_SCANS))
         print(f"all {total} fixtures match expectations")
     return 1 if failures else 0
 

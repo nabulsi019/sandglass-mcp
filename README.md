@@ -56,6 +56,9 @@ test_servers/        Fixture servers written for testing Sandglass. Not real tar
   aws_credentials_server.py  Same tool, but also reads ~/.aws/credentials (the sandbox's decoy)
   symlink_escape_server.py   Same tool, but reads ~/.aws/credentials through a symlink it makes in /tmp
   proc_self_escape_server.py Same tool, but reads ~/.aws/credentials through /proc/self/root and /proc/self/fd
+  untraced_clone_server.py   Same tool, but a clone(CLONE_UNTRACED) child (invisible to strace) reads ~/.aws/credentials
+  ptrace_server.py           Same tool, but tries ptrace and process_vm_readv/writev on its parent
+  iouring_node_server.js     Node twin that reads ~/.aws/credentials with io_uring enabled in libuv
   shell_command_server.py    Same tool, but also runs `/bin/sh -c true`
   undeclared_domain_server.py  Same tool, but also sends a GET to undeclared.example (local sink only)
   good_notes_node_server.js  Node.js twin of good_notes_server (hand-written MCP, no npm packages)
@@ -110,6 +113,10 @@ Expected verdicts:
 | symlink_escape_server under `policies/templates/no_network.v1.yaml` | VIOLATIONS | 2, both on `/home/sandglass/.aws/credentials`: the symlink to it made in `/tmp` (a link counts as a read of its target), and the read through that link (judged by the file really opened, #122) |
 | proc_self_escape_server under `policies/templates/no_network.v1.yaml` | VIOLATIONS | 3, all reads of `/home/sandglass/.aws/credentials`: through `/proc/self/root/...`, directly, and again through `/proc/self/fd/100` (each judged by the file really opened, #131) |
 | proc_self_escape_server under `policies/notes_readonly.yaml` | VIOLATIONS | 3 reads, named by the paths asked for: `/proc/self/root/home/sandglass/.aws/credentials`, `/home/sandglass/.aws/credentials`, `/proc/self/fd/100` |
+| untraced_clone_server | VIOLATIONS | 2: the refused `clone CLONE_UNTRACED` ("tried to evade tracing", #84), and the read of `/home/sandglass/.aws/credentials` by the ordinary child it falls back to |
+| iouring_node_server.js (run with `UV_USE_IO_URING=1`) | VIOLATIONS | 1: read of `/home/sandglass/.aws/credentials`; io_uring is refused, so libuv reads through its thread pool, visibly |
+| ptrace_server | VIOLATIONS | 3: `ptrace PTRACE_ATTACH`, `process_vm_readv`, `process_vm_writev` (all refused, #84) |
+| good_notes_node_server.js, untraced_clone_server, iouring_node_server.js with Docker's own seccomp profile **off** (old-Docker simulation, test code only) | CLEAN / VIOLATIONS / VIOLATIONS | the same as above: Sandglass's filter doesn't rely on Docker's |
 
 Every run must also show the sink reporting the isolation check as isolated (no route to the internet).
 
@@ -248,7 +255,7 @@ The client runs:
 docker run -i --rm --network none --read-only --tmpfs /tmp --user 10001:10001 \
   -e HOME=/home/sandglass -v <project>:/project:ro --mount type=tmpfs,destination=/project/reports,tmpfs-mode=0555 \
   -w /project sandglass-sandbox \
-  sh -c 'exec strace -f -tt -e trace=file,process,network,memfd_create,io_uring_setup,io_uring_enter,io_uring_register \
+  sh -c 'exec strace -f -tt -y -e trace=file,process,network,memfd_create,io_uring_setup,io_uring_enter,io_uring_register,ptrace,process_vm_readv,process_vm_writev \
          --kill-on-exit -o /proc/self/fd/2 \
          /opt/venv/bin/python -S -c "<launcher.py>" <server> "<netsink.py>" "<stdin_relay.py>" 3>/dev/null'
 ```
@@ -272,6 +279,45 @@ docker run -i --rm --network none --read-only --tmpfs /tmp --user 10001:10001 \
   from reopening strace's fds through `/proc/1/fd/`. Because of that, strace
   can't read the arguments of the very first exec; the report shows it as
   `<unreadable>`, and only the first exec counts as the server's launch.
+
+### Sandglass's syscall filter (#84)
+
+strace sees every syscall a process makes, but a few syscalls let a process
+act where strace can't see. Sandglass refuses those itself, with a seccomp
+filter, instead of relying on whatever Docker version is installed:
+
+| Syscall | Why it hides things | The filter returns |
+|---|---|---|
+| `io_uring_setup` / `enter` / `register` | the kernel opens and reads files for the process; no `openat` in the trace | `EPERM` |
+| `clone` with `CLONE_UNTRACED` | a child strace can't follow: none of its actions are traced | `EPERM` |
+| `clone3` | its flags are in memory the filter can't read (could hold `CLONE_UNTRACED`) | `ENOSYS`: glibc, Python and Node then use `clone` |
+| `ptrace` | tracing another process (and making it act), or stopping strace | `EPERM` |
+| `process_vm_readv` / `process_vm_writev` | reading or writing another process's memory, e.g. a Sandglass helper's | `EPERM` |
+
+Any syscall from another ABI (32-bit `int 0x80` on x86_64, x32) gets `EPERM`
+too, since the numbers above wouldn't match there.
+
+How: the launcher (`sandglass/launcher.py`), right after hiding the trace
+stream and before the sink, the relay or any server code, installs the
+filter on itself (`prctl(PR_SET_NO_NEW_PRIVS)`, then
+`SECCOMP_MODE_FILTER`, a 20-instruction BPF program written in Python with
+`ctypes`, for x86_64 and aarch64). A filter is inherited by every child and
+survives `exec`, so it covers the server and everything it starts, but not
+strace, the launcher's parent. Then it runs a **self-test**: it tries
+`io_uring_setup` and a `CLONE_UNTRACED` clone itself. Both must fail with
+`EPERM` in the trace, before the sink is ready; if either is missing or
+went through, the run is **INCOMPLETE** ("Sandglass's syscall filter is not
+active"), never CLEAN. On another CPU architecture the filter isn't
+installed, so the self-test makes every run INCOMPLETE.
+
+So Node.js servers work on any Docker version: libuv's io_uring attempts at
+startup are refused and listed as attempted, never INCOMPLETE. Any attempt
+to evade tracing (a `CLONE_UNTRACED` clone, `ptrace`, `process_vm_*`) by the
+server is a **violation**, "tried to evade tracing", even when refused; one
+that got through (no filter) also makes the run INCOMPLETE.
+`check_fixtures.py` also runs three fixtures with Docker's own seccomp
+profile turned off (`--security-opt seccomp=unconfined`, in the test script
+only, never in `sandglass/`), the review's Docker 20.10 case: same verdicts.
 
 ### Network: a local sink, no route out
 
@@ -313,7 +359,7 @@ domain name.
 ### Node.js servers
 
 A `.js` server runs with Debian's `node` (installed in the image, no npm).
-The launcher still runs first (trace hidden, sink started), then `exec`s
+The launcher still runs first (trace hidden, syscall filter installed, sink started), then `exec`s
 `/usr/bin/node <server.js>` in the same process. That one exec counts as part
 of the launch for `.js` servers only; any other exec is still a violation.
 
@@ -432,8 +478,10 @@ cp policies/templates/read_only_folder.v1.yaml policies/my_notes_server.yaml   #
 | File open that failed with `EACCES`/`EPERM` (exists, access blocked) | VIOLATION |
 | File open that failed otherwise (e.g. `ENOENT`) | listed under "attempted", verdict unchanged |
 | `memfd_create` (a file that lives only in memory; code in it can run without touching disk) | recorded as a write to `memfd:<name>`, so the same rules as a file write: VIOLATION if it succeeded |
-| `io_uring_setup`/`enter`/`register` that **failed** (e.g. `EPERM` from Docker's seccomp profile; Node's libuv tries this at every startup) | listed under "attempted", verdict unchanged |
+| `io_uring_setup`/`enter`/`register` that **failed** (`EPERM` from Sandglass's syscall filter; Node's libuv tries this at every startup) | listed under "attempted", verdict unchanged |
 | `io_uring_*` that **succeeded** | **INCOMPLETE**: the kernel does io_uring's file opens and reads itself, so strace can't see them and the trace may be missing file access |
+| `clone`/`clone3` with `CLONE_UNTRACED`, `ptrace`, `process_vm_readv`/`writev` (#84) | VIOLATION "tried to evade tracing", under any policy, even when refused; if it **succeeded**, also **INCOMPLETE** |
+| The syscall filter's self-test missing, or not refused | **INCOMPLETE** |
 | A file or stat call whose path strace **couldn't read** (shown as an address) | **INCOMPLETE**, from any process: it can't be judged, so it's never dropped |
 | `stat` / `access` / `readlink` (looking, not reading) | listed under "probes", grouped by path with a count per syscall; informational |
 | Any network attempt, even a failed one | VIOLATION |
@@ -471,9 +519,9 @@ session failed, no tool was exercised, the trace is missing or has no
 `+++ exited` line for the server (a truncated trace), the network sink didn't
 start, the sink didn't report the isolation check as isolated, or the stdin relay didn't
 start or ended before the client closed stdin (killed, crashed, or no exit
-record: the server may have tampered with it), an io_uring call succeeded
-(Docker 25+ blocks io_uring by default; see #84 for a seccomp profile that
-blocks it whatever the Docker version), or strace couldn't read the path of
+record: the server may have tampered with it), Sandglass's syscall filter
+failed its self-test, an io_uring call or an attempt to evade tracing
+succeeded (#84), or strace couldn't read the path of
 a file or stat call (it then prints a memory address instead; such an event
 is never dropped, because we can't tell what was touched).
 
@@ -552,6 +600,18 @@ below are from each project's own paper or documentation.
   in the JSON). A read of `/proc/self/status` isn't flagged by itself: many
   runtimes read it for ordinary reasons, and the policy decides, like for any
   other file.
+
+- **The syscall filter (#84) covers the server, not the install phase.**
+  The install container (`sandglass scan`) has no launcher, so nothing
+  refuses `CLONE_UNTRACED` or `ptrace` there (Docker 25+'s own profile still
+  refuses io_uring). They are still seen: strace records the call that
+  starts the hidden child, so an install that tries is a violation and,
+  if it worked, INCOMPLETE; what the hidden child then did is not seen.
+- **`/proc/<pid>/mem` is out of the filter's reach.** seccomp can't look at
+  the path an `open` is given, so opening another process's memory file
+  isn't refused by Sandglass. It is still an ordinary file open in the
+  trace, judged by the policy like any read or write (and strace's own
+  memory is protected by its non-readable binary, see above).
 
 - **The server's own stderr is discarded in `--sandbox` mode, to protect the
   trace** (#47). strace writes the trace to the container's stderr, so the

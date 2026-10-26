@@ -40,6 +40,14 @@ SINK_LINES = [
 ]
 
 
+# The launcher's self-test of Sandglass's syscall filter (#84), as in every
+# real trace: right after the launch (pid 8), before the sink, both refused.
+SELF_TEST = [
+    '8  10:00:00.000002 io_uring_setup(1, {flags=0, sq_thread_cpu=0, sq_thread_idle=0}) = -1 EPERM (Operation not permitted)',
+    '8  10:00:00.000003 clone(child_stack=NULL, flags=CLONE_UNTRACED|SIGCHLD) = -1 EPERM (Operation not permitted)',
+]
+
+
 # The stdin relay (sandglass/stdin_relay.py, #91): its exec and ready marker at
 # startup, its tool-call marker, and at the end its eof marker and clean exit.
 RELAY_START = [
@@ -53,17 +61,20 @@ RELAY_END = [
 ]
 
 
-def run(lines, session=SESSION_OK, sink=True, relay=True, policy=None):
+def run(lines, session=SESSION_OK, sink=True, relay=True, policy=None, self_test=True):
     """Compare a hand-written trace, with Sandglass's helpers added like in a
-    real run (unless sink=False / relay=False): the sink's and the relay's
-    startup lines right after the first line (the launch), then at the end the
-    relay's tool-call marker (unless the test placed its own TOOL_CALL), its
-    eof marker and its exit. So by default every event is in "startup"."""
+    real run (unless sink=False / relay=False / self_test=False): the filter
+    self-test, the sink's and the relay's startup lines right after the first
+    line (the launch), then at the end the relay's tool-call marker (unless
+    the test placed its own TOOL_CALL), its eof marker and its exit. So by
+    default every event is in "startup"."""
     if lines and relay:
         end = ([] if TOOL_CALL in lines else [TOOL_CALL]) + RELAY_END
         lines = lines[:1] + RELAY_START + lines[1:] + end
     if sink and lines:
         lines = lines[:1] + SINK_LINES + lines[1:]
+    if self_test and lines:  # True: the usual self-test; or a list of lines to use instead
+        lines = lines[:1] + (SELF_TEST if self_test is True else self_test) + lines[1:]
     return compare(parse_trace("\n".join(lines)), policy or sandbox_policy(), session)
 
 
@@ -379,8 +390,7 @@ def test_working_io_uring_makes_the_run_incomplete():
                   '8 10:00:00.4 io_uring_enter(5, 1, 1, IORING_ENTER_GETEVENTS, NULL, 8) = 1', EXITED])
     assert result["verdict"] == "INCOMPLETE"
     [reason] = [r for r in result["incomplete_reasons"] if "io_uring" in r]
-    assert reason.startswith("io_uring was available, file access may be missing from the trace; "
-                             "rerun on Docker 25+ or with a seccomp profile that blocks io_uring")
+    assert reason.startswith("io_uring was available, file access may be missing from the trace (")
     assert "2 successful io_uring call(s)" in reason and "io_uring_setup(4," in reason
     assert result["violations"] == [] and result["attempted"] == []
 
@@ -409,7 +419,8 @@ def test_base_image_is_pinned_to_a_debian_release():
 def test_strace_records_memfd_create_and_io_uring():
     _, args = sandbox.docker_command(SERVER)
     assert ("-e trace=file,process,network,memfd_create,"
-            "io_uring_setup,io_uring_enter,io_uring_register ") in " ".join(args)
+            "io_uring_setup,io_uring_enter,io_uring_register,"
+            "ptrace,process_vm_readv,process_vm_writev ") in " ".join(args)
 
 
 def test_docker_command_is_least_privilege():
