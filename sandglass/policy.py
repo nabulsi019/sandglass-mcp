@@ -21,7 +21,9 @@ is loaded automatically: system files the interpreter reads at startup. For a
 Node.js server (runtime="node") the Node baseline (node_debian.yaml) is loaded
 as well; the Python one is still needed for Sandglass's launcher, which runs
 before Node.
-runtime_allow and the baseline allow READS (and listings) only, never writes.
+runtime_allow and the baseline allow READS (and listings) only, never writes,
+except the baseline's exact entries (#142): write_exact (e.g. /dev/null) and
+exec_exact (one program with one exact argv, still listed as a program run).
 """
 
 import posixpath
@@ -63,6 +65,11 @@ class Policy:
     # Reads that are ALWAYS a violation, even under read_allow, runtime_allow
     # or the baseline: deny wins (#121). e.g. /home in a "read anywhere" template.
     read_deny: list[Path] = field(default_factory=list)
+    # (#142) Exact files the baseline may WRITE (e.g. /dev/null), never folders.
+    baseline_write_exact: list[str] = field(default_factory=list)
+    # (#142) Exact program runs the baseline allows: path, argv, and why.
+    # Still listed under "Programs run", with that reason as the note.
+    baseline_exec_exact: list[dict] = field(default_factory=list)
 
 
 INSTALL_BASELINE_FILE = BASELINES_DIR / "install.yaml"
@@ -180,6 +187,22 @@ def _path_list(data: dict, key: str, where: str, values: dict, in_sandbox: bool)
     return [_expand(item, values, in_sandbox) for item in items]
 
 
+def _exec_exact(baseline: dict, name: str) -> list[dict]:
+    """A baseline's exec_exact entries (#142): {path, argv, why}, all required.
+    The run must match the path AND the whole argv exactly."""
+    entries = []
+    for entry in _require(baseline, "exec_exact", list, "baseline."):
+        if not isinstance(entry, dict):
+            raise PolicyError("Every entry in 'baseline.exec_exact' must be a mapping")
+        path = _require(entry, "path", str, "baseline.exec_exact.")
+        argv = _require(entry, "argv", list, "baseline.exec_exact.")
+        if not all(isinstance(arg, str) for arg in argv):
+            raise PolicyError("'baseline.exec_exact.argv' must be a list of strings")
+        why = _require(entry, "why", str, "baseline.exec_exact.")
+        entries.append({"path": path, "argv": argv, "note": f"{why} (baseline: {name})"})
+    return entries
+
+
 def _domains(network: dict) -> list[str]:
     """network.allow_domains: optional list of host names. "example.com" means
     exactly that host; "*.example.com" means any subdomain of it."""
@@ -269,14 +292,21 @@ def load_policy(
         runtime_allow.append(PurePosixPath(package_dir))  # the installed package: reads only
 
     baseline_name, baseline_read_allow = None, []
+    baseline_write_exact, baseline_exec_exact = [], []
     if in_sandbox:
         if runtime not in BASELINE_FILES:
             raise PolicyError(f"Unknown runtime {runtime!r} (expected one of {sorted(BASELINE_FILES)})")
         names = []
         for baseline_file in BASELINE_FILES[runtime]:
             baseline = _read_yaml(baseline_file)
-            names.append(_require(baseline, "name", str, "baseline."))
+            name = _require(baseline, "name", str, "baseline.")
+            names.append(name)
             baseline_read_allow += _path_list(baseline, "read_allow", "baseline.", values, in_sandbox)
+            # Optional (#142): exact writes and exact program runs.
+            if "write_exact" in baseline:
+                baseline_write_exact += _strings(baseline, "write_exact", "baseline.")
+            if "exec_exact" in baseline:
+                baseline_exec_exact += _exec_exact(baseline, name)
         baseline_name = " + ".join(names)  # e.g. "python312_slim + node_debian"
 
     return Policy(
@@ -294,4 +324,6 @@ def load_policy(
         list_exact=list_exact,
         baseline_name=baseline_name,
         baseline_read_allow=baseline_read_allow,
+        baseline_write_exact=baseline_write_exact,
+        baseline_exec_exact=baseline_exec_exact,
     )

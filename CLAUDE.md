@@ -74,6 +74,11 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
     hanging_tool_server CLEAN under notes_readonly, with `hang` timed out,
     `read_note` ran, and the report saying Sandglass stopped the server; run
     with `FIXTURE_CALL_TIMEOUT_SECONDS`, test code only)
+  - every `EXPECTED_RUNTIME` entry in `scripts/check_fixtures.py` (#142:
+    runtime_noise_server CLEAN under notes_readonly, with `uname -p` in
+    "Programs run" and its baseline note; runtime_neighbours_server
+    VIOLATIONS, exactly the bind to 127.0.0.1:8080, the listen, the exec of
+    `uname -a` and the write to /dev/zero)
   - `EXPECTED_EXIT_CODES` in `scripts/check_fixtures.py` (the exit code of
     every verdict: 0 CLEAN, 1 VIOLATIONS, 3 INCOMPLETE; 2 is a usage error)
   - the sandbox hardening flags (--network none, --read-only, non-root user,

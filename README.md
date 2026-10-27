@@ -478,6 +478,31 @@ report names it.
 **never writes**. Only `write_allow` permits writes, so a server rewriting a
 library in `/opt/venv` or `/lib` is a violation.
 
+**Normal runtime behaviour** (#142). Real servers' libraries do a few things
+that are harmless, and these are not violations:
+
+- **Opening `/dev/null` read-write** (`write_exact` in the baseline): output
+  thrown away. That exact file only: `/dev/zero`, `/dev/mem` or anything else
+  under `/dev` still counts.
+- **Reading `/proc/sys/vm/overcommit_memory`**: glibc does this the first time
+  it shrinks a thread's heap. Reading it only: writing anywhere in `/proc/sys`
+  still counts, and other `/proc/sys` reads are up to the policy.
+- **`bind()` to `127.0.0.1` or `::1` with port 0, on a socket that never
+  listens or accepts**: urllib3 checking whether IPv6 works. A real port,
+  another address, a `listen()` (even on that socket), and anything the
+  socket connects to or sends still count. This rule is in `compare.py`
+  (`_is_ipv6_probe_bind`), not the baseline file.
+- **Running `/usr/bin/uname -p`** (`exec_exact` in the baseline): Python's
+  `platform.processor()`. Only that path with exactly that argv; it is still
+  listed under "Programs run", with the note "Python's platform module
+  (baseline: python312_slim)", and everything it does is traced and judged.
+  So "no other programs" in a policy means no programs besides the server
+  and this one baseline run, which the report always shows. `uname -a`, or
+  `uname` through a shell, is a violation.
+
+`test_servers/runtime_noise_server.py` does all four (CLEAN) and
+`runtime_neighbours_server.py` does the next step of each (VIOLATIONS).
+
 **`read_deny`** (optional, #121) lists paths that may never be read or
 listed, even if `read_allow`, `runtime_allow` or the baseline would allow
 them: **deny wins**. Same path rules as `read_allow` (prefix match; relative

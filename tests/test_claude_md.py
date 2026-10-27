@@ -44,6 +44,14 @@ def test_every_timeout_fixture_is_protected():
             f"EXPECTED_TIMEOUTS entry {fixture} is not in CLAUDE.md's protected items"
 
 
+def test_every_runtime_fixture_is_protected():
+    # (#142) the runtime noise fixture and its dangerous neighbours.
+    assert "`EXPECTED_RUNTIME`" in PROTECTED
+    for fixture in check_fixtures.EXPECTED_RUNTIME:
+        assert fixture.removesuffix(".py") in PROTECTED, \
+            f"EXPECTED_RUNTIME entry {fixture} is not in CLAUDE.md's protected items"
+
+
 def test_every_hostile_fixture_is_protected():
     # (#131 onwards) every hostile fixture, under every policy it runs with.
     for fixture, policy_name in check_fixtures.EXPECTED_HOSTILE:

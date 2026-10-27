@@ -163,6 +163,48 @@ def _is_address(target: str, host: str, port: int) -> bool:
     return f"sin_port=htons({port})" in target and f'inet_addr("{host}")' in target
 
 
+# (#142) strace -y prints the socket behind an fd: bind(3<socket:[22946]>, ...).
+SOCKET_INODE_RE = re.compile(r"\b(?:bind|listen|accept4?)\(\d+<socket:\[(\d+)\]>")
+# The two loopback addresses with port 0, as strace prints them.
+LOOPBACK_PORT0 = (('inet_addr("127.0.0.1")', "sin_port=htons(0)"),
+                  ('inet_pton(AF_INET6, "::1"', "sin6_port=htons(0)"))
+
+
+def _socket_inode(raw: str) -> str | None:
+    match = SOCKET_INODE_RE.search(raw)
+    return match[1] if match else None
+
+
+def _listening_sockets(events: list[Event]) -> set[str]:
+    """The sockets (by inode) that listen() or accept() anywhere in the trace."""
+    return {inode for e in events
+            if e.kind == "network" and e.syscall in ("listen", "accept", "accept4")
+            and (inode := _socket_inode(e.raw)) is not None}
+
+
+def _is_ipv6_probe_bind(event: Event, listening: set[str]) -> bool:
+    """A bind() to 127.0.0.1 or ::1 with port 0, on a socket that never
+    listens or accepts (#142). urllib3 does this to check whether IPv6 works:
+    such a socket can't receive anything. A real port, another address, or a
+    listen() on the same socket is still a violation, and so is anything the
+    socket then connects to or sends."""
+    if event.syscall != "bind":
+        return False
+    inode = _socket_inode(event.raw)
+    return (inode is not None and inode not in listening
+            and any(address in event.target and port in event.target
+                    for address, port in LOOPBACK_PORT0))
+
+
+def _baseline_exec(event: Event, policy: Policy) -> dict | None:
+    """The baseline's exec_exact entry this exec matches (#142): same path,
+    same whole argv. None if it doesn't match one exactly."""
+    for entry in policy.baseline_exec_exact:
+        if event.target == entry["path"] and exec_argv(event.raw) == entry["argv"]:
+            return entry
+    return None
+
+
 def _sink_request(target: str) -> tuple[str, str, int] | None:
     """(method, host, port) from a sink marker path like /sandglass-netsink/GET/example.com/80."""
     parts = target[len(netsink.SINK_MARKER_DIR) + 1:].split("/")
@@ -420,6 +462,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
     unreadable: list[Event] = []     # file/stat events whose path strace couldn't read (#98)
     server_errors: list[str] = []    # the server's own error messages, via the launcher (#24)
     programs: list[dict] = []        # every successful exec, allowed or not (#120)
+    listening = _listening_sockets(events)  # sockets that listen() or accept() (#142)
 
     for index, event in enumerate(events):
         if event.kind == "process" and event.succeeded:
@@ -430,6 +473,8 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
                 note = "Sandglass's network sink"
             elif event is relay_exec:
                 note = "Sandglass's stdin relay"
+            elif _baseline_exec(event, policy):
+                note = _baseline_exec(event, policy)["note"]  # e.g. uname -p (#142)
             programs.append(_program(event, phase_of(index), note))
 
         if event.kind in ("file", "probe") and event.target == UNREADABLE:
@@ -483,7 +528,8 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
 
             def allowed(path: str, mode=event.mode) -> bool:
                 if mode == "write":
-                    return _is_under(path, write_ok)
+                    # The baseline's write_exact (#142): that exact file only.
+                    return _is_under(path, write_ok) or path in policy.baseline_write_exact
                 if mode == "list":
                     # Exact entries match only the directory itself, never its children.
                     return readable(path) or (path in map(str, policy.list_exact)
@@ -524,6 +570,8 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
                 continue
             if _is_under(event.target, policy.exec_allow):
                 continue
+            if _baseline_exec(event, policy):
+                continue  # e.g. uname -p (#142): listed under "Programs run", not a violation
             reason = "process exec not in exec_allow"
             bucket = _bucket_for_failure_or_success(event)
 
@@ -536,6 +584,8 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
             if (event.syscall == "connect" and _is_address(event.target, netsink.SINK_HOST, netsink.SINK_PORT)
                     and (event.succeeded or event.error == "EINPROGRESS")):
                 continue
+            if _is_ipv6_probe_bind(event, listening):
+                continue  # urllib3 checking whether IPv6 works (#142)
             reason = "network activity while network.allow is false"
             bucket = "violation"  # attempts count, even failed ones
 
@@ -933,7 +983,9 @@ def build_report(server: str, timestamp: str, policy: Policy, session: dict,
         "verdict": result["verdict"],
         "incomplete_reasons": result["incomplete_reasons"],
         "package": package,
-        "policy": {k: (v if v is None or isinstance(v, (str, bool)) else [str(p) for p in v])
+        # Paths as text; the baseline's exec_exact entries (#142) stay mappings.
+        "policy": {k: (v if v is None or isinstance(v, (str, bool))
+                       else [p if isinstance(p, dict) else str(p) for p in v])
                    for k, v in asdict(policy).items()},
         "baseline": baseline,  # which container baseline was applied, and how
         "path_mapping": path_mapping,

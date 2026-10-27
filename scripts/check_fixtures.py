@@ -16,6 +16,7 @@ import contextlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -185,6 +186,31 @@ FIXTURE_CALL_TIMEOUT_SECONDS = 3
 EXPECTED_TIMEOUTS = {
     "hanging_tool_server.py": ("CLEAN", set(), {"hang": "timed out", "read_note": "ran"}, True),
 }
+
+# (#142) Normal runtime behaviour the python312_slim baseline covers, and its
+# dangerous neighbours, through the real tracer. Under notes_readonly.
+# fixture -> (expected verdict, expected violations, programs (argv, note)
+# that "Programs run" must list). A listen()'s target is its fd and backlog,
+# e.g. "8, 128"; the fd varies, so it's written "<fd>, 128" (see normalized).
+UNAME_NOTE = "Python's platform module (platform.processor()) (baseline: python312_slim)"
+EXPECTED_RUNTIME = {
+    # /dev/null O_RDWR, the overcommit_memory read, bind ::1 port 0, uname -p.
+    "runtime_noise_server.py": ("CLEAN", set(), [(["uname", "-p"], UNAME_NOTE)]),
+    # A real port with listen(), `uname -a`, a write to /dev/zero: 4 violations.
+    "runtime_neighbours_server.py": ("VIOLATIONS", {
+        (None, '{sa_family=AF_INET, sin_port=htons(8080), sin_addr=inet_addr("127.0.0.1")}'),
+        (None, "<fd>, 128"),
+        (None, "/usr/bin/uname"),
+        ("write", "/dev/zero"),
+    }, [(["uname", "-a"], None)]),
+}
+
+
+def normalized(report: dict) -> dict:
+    """The report with each listen()'s fd number replaced by <fd> (#142)."""
+    violations = [{**v, "target": re.sub(r"^\d+, ", "<fd>, ", v["target"])}
+                  if v.get("syscall") == "listen" else v for v in report["violations"]]
+    return {**report, "violations": violations}
 
 
 @contextlib.contextmanager
@@ -467,6 +493,14 @@ def main() -> int:
             report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, POLICY)
         failures += check(label, report, want_verdict, want_violations)
 
+    for fixture, (want_verdict, want_violations, want_programs) in EXPECTED_RUNTIME.items():
+        print(f"\n===== {fixture} =====")
+        report = normalized(run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, POLICY))
+        failures += check(fixture, report, want_verdict, want_violations)
+        programs = [(p["argv"], p["note"]) for p in report.get("programs", [])]
+        failures += [f"{fixture}: expected the program run {argv} with note {note!r}, got {programs}"
+                     for argv, note in want_programs if (argv, note) not in programs]
+
     for fixture, (want_verdict, want_violations, want_coverage, want_stopped) in EXPECTED_TIMEOUTS.items():
         print(f"\n===== {fixture} (call timeout {FIXTURE_CALL_TIMEOUT_SECONDS} s) =====")
         with call_timeout(FIXTURE_CALL_TIMEOUT_SECONDS):
@@ -522,8 +556,8 @@ def main() -> int:
         print("FAIL", line)
     if not failures:
         total = (len(EXPECTED) + len(EXPECTED_V04) + len(EXPECTED_POLICY_RUNS) + len(EXPECTED_HOSTILE)
-                 + len(EXPECTED_OLD_DOCKER) + len(EXPECTED_TIMEOUTS) + len(EXPECTED_SCANS)
-                 + len(EXPECTED_NPM_REGISTRY_SCANS))
+                 + len(EXPECTED_OLD_DOCKER) + len(EXPECTED_TIMEOUTS) + len(EXPECTED_RUNTIME)
+                 + len(EXPECTED_SCANS) + len(EXPECTED_NPM_REGISTRY_SCANS))
         print(f"all {total} fixtures match expectations")
     return 1 if failures else 0
 
