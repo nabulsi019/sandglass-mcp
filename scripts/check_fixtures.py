@@ -24,7 +24,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-from sandglass import PROJECT_ROOT, sandbox, scan
+from sandglass import PROJECT_ROOT, client, sandbox, scan
 from sandglass.client import EXIT_CODES, run_sandboxed, run_scan
 from sandglass.scan import npm_tarball_name, parse_spec
 
@@ -173,6 +173,29 @@ EXPECTED_OLD_DOCKER = {
     "untraced_clone_server.py": ("VIOLATIONS", [("evade", "clone CLONE_UNTRACED"), ("read", CREDS)]),
     "iouring_node_server.js": ("VIOLATIONS", [("read", CREDS)]),
 }
+
+
+# (#140) A tool that hangs: it times out, the next tool is still called, and
+# the stdin relay stops the server, which doesn't exit after eof (a stuck
+# thread). Under notes_readonly, with the call timeout shortened to
+# FIXTURE_CALL_TIMEOUT_SECONDS (test only; the product default stays 30 s).
+# fixture -> (expected verdict, expected violations, coverage status of each
+# tool, whether the report says Sandglass stopped the server)
+FIXTURE_CALL_TIMEOUT_SECONDS = 3
+EXPECTED_TIMEOUTS = {
+    "hanging_tool_server.py": ("CLEAN", set(), {"hang": "timed out", "read_note": "ran"}, True),
+}
+
+
+@contextlib.contextmanager
+def call_timeout(seconds: float):
+    """Shorten the per-tool timeout inside the `with` block. Test only."""
+    original = client.CALL_TIMEOUT_SECONDS
+    client.CALL_TIMEOUT_SECONDS = seconds
+    try:
+        yield
+    finally:
+        client.CALL_TIMEOUT_SECONDS = original
 
 
 @contextlib.contextmanager
@@ -444,6 +467,19 @@ def main() -> int:
             report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, POLICY)
         failures += check(label, report, want_verdict, want_violations)
 
+    for fixture, (want_verdict, want_violations, want_coverage, want_stopped) in EXPECTED_TIMEOUTS.items():
+        print(f"\n===== {fixture} (call timeout {FIXTURE_CALL_TIMEOUT_SECONDS} s) =====")
+        with call_timeout(FIXTURE_CALL_TIMEOUT_SECONDS):
+            report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, POLICY)
+        failures += check(fixture, report, want_verdict, want_violations)
+        got_coverage = {row["tool"]: row["status"]
+                        for row in (report.get("coverage") or {}).get("tools", [])}
+        if got_coverage != want_coverage:
+            failures.append(f"{fixture}: expected coverage {want_coverage}, got {got_coverage}")
+        if bool(report.get("server_stopped_note")) != want_stopped:
+            failures.append(f"{fixture}: expected server stopped by Sandglass: {want_stopped}, "
+                            f"got note {report.get('server_stopped_note')!r}")
+
     build_test_packages()
     for package, (want_verdict, want_violations) in EXPECTED_SCANS.items():
         print(f"\n===== scan {package} =====")
@@ -486,7 +522,8 @@ def main() -> int:
         print("FAIL", line)
     if not failures:
         total = (len(EXPECTED) + len(EXPECTED_V04) + len(EXPECTED_POLICY_RUNS) + len(EXPECTED_HOSTILE)
-                 + len(EXPECTED_OLD_DOCKER) + len(EXPECTED_SCANS) + len(EXPECTED_NPM_REGISTRY_SCANS))
+                 + len(EXPECTED_OLD_DOCKER) + len(EXPECTED_TIMEOUTS) + len(EXPECTED_SCANS)
+                 + len(EXPECTED_NPM_REGISTRY_SCANS))
         print(f"all {total} fixtures match expectations")
     return 1 if failures else 0
 

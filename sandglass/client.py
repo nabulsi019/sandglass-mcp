@@ -25,11 +25,13 @@ import json
 import re
 import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters, stdio_client
-from mcp.types import CallToolResult, TextContent, Tool
+from mcp.shared.exceptions import MCPError
+from mcp.types import REQUEST_TIMEOUT, CallToolResult, TextContent, Tool
 
 from sandglass import PROJECT_ROOT, sandbox, scan
 from sandglass.compare import (build_report, compare, compare_install, not_run, with_install,
@@ -41,11 +43,18 @@ from sandglass.trace_parser import parse_trace_file
 
 REPORTS_DIR = PROJECT_ROOT / "reports"
 
-# Upper bound for the whole MCP session, so a hung server can't hang us.
-SESSION_TIMEOUT_SECONDS = 120
-# Upper bound for one tool call; a call that takes longer is recorded as
-# FAILED and the next tool is still called (#23).
+# Total time budget for the tool calls (#140). Once it is used up, no more
+# tools are called; the ones left are reported "not called (time budget)".
+TIME_BUDGET_SECONDS = 120
+# Upper bound for one tool call (#23); a call that takes longer is recorded
+# as TIMED OUT and the next tool is still called (#140).
 CALL_TIMEOUT_SECONDS = 30
+# After a timed-out call, the server must answer a ping within this time, or
+# no more tools are called: a stuck server would time out every call (#140).
+PING_TIMEOUT_SECONDS = 5
+# Safety net on top of the budget, for a handshake or shutdown that hangs.
+# Hitting it is a session failure (INCOMPLETE).
+SESSION_GRACE_SECONDS = 30
 
 # --sandbox exit codes, so scripts and CI can check the verdict. INCOMPLETE
 # is 3, not 2: argparse exits with 2 on a usage error, and a script must be
@@ -98,10 +107,27 @@ def print_policy(policy: Policy, enforced: bool) -> None:
 
 def new_session_record() -> dict:
     """What run() fills in. tools: what the server listed; calls: tools that
-    were called (status OK, ERROR, UNEXPECTED, FAILED, or NO ANSWER if the
-    session ended during the call); skipped: tools we
-    couldn't build an input for."""
-    return {"tools": [], "calls": [], "skipped": []}
+    were called (status OK, ERROR, UNEXPECTED, TIMED OUT, FAILED, or NO ANSWER
+    if the session ended during the call); skipped: tools we couldn't build
+    an input for; not_called: tools left when the calls stopped (#140)."""
+    return {"tools": [], "calls": [], "skipped": [], "not_called": []}
+
+
+def is_timeout(exc: BaseException) -> bool:
+    """Did this call fail because it took longer than its timeout?"""
+    return isinstance(exc, MCPError) and exc.code == REQUEST_TIMEOUT
+
+
+async def server_answers_ping(session: ClientSession) -> bool:
+    """Any answer counts, even an MCP error such as method-not-found: the
+    server is still reading its messages. Only silence means it is stuck."""
+    try:
+        await asyncio.wait_for(session.send_ping(), PING_TIMEOUT_SECONDS)
+    except MCPError as exc:
+        return not is_timeout(exc)
+    except TimeoutError:
+        return False
+    return True
 
 
 async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr,
@@ -112,9 +138,11 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
     the strace trace, so run_sandboxed passes the trace file here.
     `session_record` is filled in as the session goes, so if the session
     fails half-way the caller still has everything recorded until then (#23).
+    The calls share TIME_BUDGET_SECONDS, counted from the start (#140).
     """
     if session_record is None:
         session_record = new_session_record()
+    deadline = time.monotonic() + TIME_BUDGET_SECONDS
 
     # stdio_client spawns the subprocess and gives us its stdin/stdout streams.
     async with stdio_client(params, errlog=errlog) as (read_stream, write_stream):
@@ -130,6 +158,7 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
                 session_record["tools"].append({"name": tool.name, "description": tool.description})
             print()
 
+            stop_reason = None  # set once no more tools may be called (#140)
             for tool in tools:
                 try:
                     args = build_safe_arguments(tool)
@@ -138,19 +167,34 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
                     print(f"Skipping {tool.name}: no valid input ({exc})")
                     session_record["skipped"].append({"tool": tool.name, "reason": f"no valid input: {exc}"})
                     continue
+                remaining = deadline - time.monotonic()
+                if stop_reason is None and remaining <= 0:
+                    stop_reason = "time budget"
+                if stop_reason is not None:
+                    # Never dropped silently: the report lists it as not called.
+                    print(f"Not calling {tool.name}: {stop_reason}")
+                    session_record["not_called"].append({"tool": tool.name, "reason": stop_reason})
+                    continue
                 print(f"Calling {tool.name}({args})")
                 # Recorded BEFORE the call, so a session that dies during it
                 # still shows the call was made and never answered (#23).
                 call = {"tool": tool.name, "arguments": args, "status": "NO ANSWER",
                         "result": "the session ended before the call returned"}
                 session_record["calls"].append(call)
+                timeout = min(CALL_TIMEOUT_SECONDS, remaining)
                 try:
-                    result = await session.call_tool(tool.name, args,
-                                                     read_timeout_seconds=CALL_TIMEOUT_SECONDS)
+                    result = await session.call_tool(tool.name, args, read_timeout_seconds=timeout)
                     call["status"], call["result"] = result_text(result)
-                except Exception as exc:  # e.g. this call timed out: record it, go on (#23)
-                    call["status"], call["result"] = "FAILED", describe_error(exc)
+                except Exception as exc:  # recorded, and the next tool is still called (#23)
+                    call["status"] = "TIMED OUT" if is_timeout(exc) else "FAILED"
+                    call["result"] = (f"no answer within {timeout:.0f} s" if is_timeout(exc)
+                                      else describe_error(exc))
                 print(f"  -> [{call['status']}] {call['result']}")
+                # The SDK has already sent a cancel for the timed-out call. A
+                # server that can't even answer a ping now would time out
+                # every remaining call, so stop here instead.
+                if call["status"] == "TIMED OUT" and not await server_answers_ping(session):
+                    stop_reason = f"server stopped responding after {tool.name} timed out"
     # Leaving the `async with` closes the server's stdin and waits for it to
     # exit. In the sandbox, that's what lets strace finish writing the trace.
     return session_record
@@ -212,8 +256,10 @@ def _trace_and_report(server: str, timestamp: str, command: str, args: list[str]
     session = new_session_record()  # filled in by run(), kept even if it fails half-way
     with open(trace_file, "w", encoding="utf-8") as trace_out:
         try:
+            # run() keeps to the time budget itself (#140); this is only the
+            # safety net for a handshake or shutdown that hangs.
             asyncio.run(asyncio.wait_for(run(params, server, trace_out, session),
-                                         SESSION_TIMEOUT_SECONDS))
+                                         TIME_BUDGET_SECONDS + SESSION_GRACE_SECONDS))
         except BaseException as exc:  # includes ExceptionGroup from anyio task groups
             if isinstance(exc, KeyboardInterrupt):
                 raise

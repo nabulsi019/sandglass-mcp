@@ -18,6 +18,10 @@ Markers (stat()s of paths under /sandglass-phase, which doesn't exist):
              connected (#24), e.g. it crashed at startup; the relay then
              exits too, so strace and the container end at once instead of
              waiting for the client's timeout
+  server-stopped  after eof, if the server is still running STOP_GRACE_SECONDS
+             later (#140), e.g. a tool stuck in a thread that the client's
+             cancel can't interrupt: the relay then kills the server, so
+             strace records its exit and the trace is complete
 
 Imported on the host too (compare.py uses the constants), so the actual work
 only happens under `if __name__ == "__main__"`.
@@ -31,9 +35,14 @@ RELAY_READY = f"{PHASE_MARKER_DIR}/ready"
 TOOL_CALL_MARKER = f"{PHASE_MARKER_DIR}/tool-call"
 EOF_MARKER = f"{PHASE_MARKER_DIR}/eof"
 SERVER_EXITED_MARKER = f"{PHASE_MARKER_DIR}/server-exited"
+SERVER_STOPPED_MARKER = f"{PHASE_MARKER_DIR}/server-stopped"
 # How often (seconds) the relay checks that the server is still running while
 # it waits for the client's next message.
 PARENT_CHECK_SECONDS = 0.5
+# After eof, how long (seconds) the server gets to exit on its own before the
+# relay kills it (#140). Shorter than the MCP client's own wait (2 s) after
+# closing stdin, so strace can finish the trace before the client gives up.
+STOP_GRACE_SECONDS = 1.0
 # The launcher hands the relay this fd; the relay writes one byte when ready.
 READY_FD = 3
 
@@ -97,6 +106,29 @@ def relay() -> None:
         _write_all(1, chunk)
 
     _record(EOF_MARKER)  # a normal end: the client closed stdin
+    os.close(1)  # the server's stdin: it sees eof too
+    _stop_server_if_stuck(parent)
+
+
+def _stop_server_if_stuck(parent: int) -> None:
+    """Give the server STOP_GRACE_SECONDS to exit after eof, then kill it (#140).
+
+    A tool stuck in a thread keeps a server running after its stdin closed,
+    and strace would never record its exit (the trace would look cut short).
+    """
+    import signal  # only here, like select
+    import time
+
+    deadline = time.monotonic() + STOP_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        if os.getppid() != parent:
+            return  # it exited on its own
+        time.sleep(0.05)
+    _record(SERVER_STOPPED_MARKER)
+    try:
+        os.kill(parent, signal.SIGKILL)
+    except OSError:
+        pass  # it exited just now
 
 
 if __name__ == "__main__":

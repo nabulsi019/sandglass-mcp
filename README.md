@@ -595,14 +595,25 @@ totals:
 
 - **ran**: the call returned a normal result;
 - **failed**: the call returned an MCP error (e.g. "not logged in"), raised,
-  took longer than 30 s, or got no answer before the session ended;
+  or got no answer before the session ended;
+- **timed out** (#140): no answer within 30 s; the server is then pinged, and
+  if it still answers (anything, even an error), the next tool is called;
+- **not called** (#140): the calls had stopped before this tool: the time
+  budget (120 s for all calls) was used up, or the server didn't answer the
+  ping after a timeout;
 - **skipped**: no valid input could be built from its schema, or the session
   ended before the tool was reached.
 
-A failing call doesn't stop the run: the next tool is still called.
-Coverage is reported, not judged; it doesn't change the verdict. A CLEAN
-verdict only covers what ran, so check this table: a tool that failed or was
-skipped did nothing we could observe.
+A failing or timed-out call doesn't stop the run: the next tool is still
+called. Coverage is reported, not judged; it doesn't change the verdict,
+except that a run where no call completed (every call timed out or got no
+answer) is INCOMPLETE. A CLEAN verdict only covers what ran, so check this
+table: a tool that failed, timed out, or was not called or skipped may not
+have done what it would normally do.
+
+If the server is still running 1 s after the client closed its stdin (e.g.
+a tool stuck in a thread), the stdin relay stops it, so the trace still ends
+with the server's exit. The report then says so.
 
 ## Tests
 

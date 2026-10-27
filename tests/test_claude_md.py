@@ -36,6 +36,14 @@ def test_every_v04_expectation_is_protected():
             assert short in PROTECTED, f"{name} entry {fixture} is not in CLAUDE.md's protected items"
 
 
+def test_every_timeout_fixture_is_protected():
+    # (#140) the hanging tool fixture, and the short call timeout it runs with.
+    assert "`EXPECTED_TIMEOUTS`" in PROTECTED and "`FIXTURE_CALL_TIMEOUT_SECONDS`" in PROTECTED
+    for fixture in check_fixtures.EXPECTED_TIMEOUTS:
+        assert fixture.removesuffix(".py") in PROTECTED, \
+            f"EXPECTED_TIMEOUTS entry {fixture} is not in CLAUDE.md's protected items"
+
+
 def test_every_hostile_fixture_is_protected():
     # (#131 onwards) every hostile fixture, under every policy it runs with.
     for fixture, policy_name in check_fixtures.EXPECTED_HOSTILE:
