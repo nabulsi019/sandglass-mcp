@@ -391,7 +391,8 @@ from the sink's records, a request may be missing, so the run is INCOMPLETE.
 The sink and the stdin relay run as the same user as the server, so an event
 in a helper's process isn't proof the helper's own code did it. Only an exact
 list of each helper's known events is skipped (its own launch, its markers,
-and for the sink its proxy socket and the isolation check). Anything else
+and for the sink its proxy socket, the isolation check and its read of
+/etc/resolv.conf before "ready"). Anything else
 from those processes is judged like the server's (#99).
 
 At startup the sink also tries to `connect()` to `1.1.1.1:443` (the
@@ -404,9 +405,39 @@ at all, which is what `--network none` gives) counts as isolated. If the sink
 reports anything else (connected, a timeout, a refusal...), reports nothing, or
 never starts, the verdict is INCOMPLETE.
 
+Also before it marks itself ready, the sink reads the container's
+`/etc/resolv.conf` and records each nameserver the same way
+(`/sandglass-resolver/nameserver/<address>`, then `/sandglass-resolver/done`;
+`/sandglass-resolver/unreadable` if it can't read the file) (#141). Only the
+sink's own read and markers before "ready" count; the report's Network
+section lists the nameservers, or says they are unknown.
+
 Limitation: a server that ignores the proxy variables and resolves names
-itself shows up only as a failed `connect()` (a violation), without the
-domain name.
+itself shows up only as failed `connect()`s (violations), without the
+domain name (#147).
+
+**Network violations are grouped** (#141). One server request can take
+dozens of steps (glibc asks the nscd socket, then each nameserver on port
+53, again for every retry), so the summary and the Markdown show one entry
+per:
+
+- **domain** asked of the sink, with its count;
+- **name lookups**: connects or sends to the nscd socket, or to port 53 at a
+  nameserver from the container's resolv.conf. The trace doesn't contain the
+  name looked up, so the entry says "domain not recorded (see #147)" and
+  never guesses one;
+- **direct DNS to `<address>:53`** for port 53 anywhere else: that bypasses
+  the system resolver. If the nameservers are unknown, every port-53 address
+  is its own entry, never merged into the lookups;
+- any other network event per (syscall, family, address, port).
+
+Files, programs and everything else stay one entry per event. The JSON
+keeps every raw event in `violations` (and every request in `domains`);
+`violation_groups` lists the entries, each with the indexes of its events.
+**"violations: N" counts raw events**, as before, and the summary adds the
+number of entries, e.g. `violations: 143 in 2 entries` for wikipedia-mcp
+(13 requests for `en.wikipedia.org` and 130 lookup steps). The verdict and
+the exit code don't depend on the grouping.
 
 ### Node.js servers
 
