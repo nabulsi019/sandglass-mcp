@@ -225,7 +225,14 @@ def _helper_exec(events: list[Event], pid: int | None) -> Event | None:
 
 
 RELAY_MARKERS = {stdin_relay.RELAY_READY, stdin_relay.TOOL_CALL_MARKER, stdin_relay.EOF_MARKER,
-                 stdin_relay.SERVER_EXITED_MARKER}
+                 stdin_relay.SERVER_EXITED_MARKER, stdin_relay.SERVER_STOPPED_MARKER}
+# In the report when the relay had to stop the server after eof (#140).
+SERVER_STOPPED_NOTE = ("the server did not exit after the client closed its stdin "
+                       f"(within {stdin_relay.STOP_GRACE_SECONDS:g} s); Sandglass stopped it")
+
+# Statuses of a call the server never answered (client.py, #140). Every other
+# status (OK, ERROR, UNEXPECTED) means the server answered: the call completed.
+NO_ANSWER_STATUSES = {"TIMED OUT", "NO ANSWER", "FAILED"}
 # The relay ends normally with one of these: the client closed stdin, or the
 # server exited while the client was still connected (#24).
 RELAY_NORMAL_ENDS = {stdin_relay.EOF_MARKER, stdin_relay.SERVER_EXITED_MARKER}
@@ -554,6 +561,10 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
 
         (violations if bucket == "violation" else attempted).append(_record(event, reason, phase_of(index)))
 
+    # (#140) Only the relay's own marker counts: the server could stat that path too (#99).
+    server_stopped = relay_pid is not None and any(
+        e.pid == relay_pid and e.kind == "probe" and e.target == stdin_relay.SERVER_STOPPED_MARKER
+        for e in events)
     incomplete = _incomplete_reasons(events, server_launch, session)
     startup_exit = _startup_exit_reason(events, server_launch, relay_pid, session, server_errors)
     if startup_exit:
@@ -608,6 +619,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
         "domains": domains,
         "network_isolation": isolation,
         "phase_note": phase_note,
+        "server_stopped": server_stopped,  # the relay killed it after eof (#140)
         "programs": programs,
         "event_counts": {
             kind: sum(1 for e in events if e.kind == kind)
@@ -621,8 +633,13 @@ def _incomplete_reasons(events: list[Event], server_launch: Event | None, sessio
     reasons = []
     if session.get("error"):
         reasons.append(f"MCP session failed: {session['error']}")
-    if not session.get("calls"):
+    calls = session.get("calls", [])
+    if not calls:
         reasons.append("no tools were exercised")
+    elif not any(c.get("status") not in NO_ANSWER_STATUSES for c in calls):
+        # (#140) Timed-out tools alone don't make a run INCOMPLETE, but at
+        # least one tool must have been answered.
+        reasons.append("no tool call completed (every call timed out or got no answer)")
     if not events:
         reasons.append("trace is missing or empty")
     elif server_launch is None:
@@ -823,20 +840,26 @@ def with_install(result: dict, install: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 COVERAGE_REASON_CHARS = 200  # error texts are cut to this length in the coverage table
+COVERAGE_STATUSES = ("ran", "failed", "timed out", "not called", "skipped")
 
 
 def coverage(session: dict) -> dict:
-    """One row per tool the server listed: ran / failed / skipped, plus totals.
+    """One row per tool the server listed, plus totals:
 
-      ran      the call returned a normal result
-      failed   the call returned an MCP error (isError), raised (e.g. timed
-               out), or got no answer before the session ended
-      skipped  no valid input could be built (#22), or the session ended first
+      ran         the call returned a normal result
+      failed      the call returned an MCP error (isError), raised, or got no
+                  answer before the session ended
+      timed out   no answer within the call's timeout (#140); the next tool
+                  was still called
+      not called  the calls had stopped first (#140): the time budget was
+                  used up, or the server stopped answering after a timeout
+      skipped     no valid input could be built (#22), or the session ended first
 
     Coverage is reported, not judged: it never changes the verdict.
     """
     calls = {c["tool"]: c for c in session.get("calls", [])}
     skipped = {s["tool"]: s["reason"] for s in session.get("skipped", [])}
+    not_called = {s["tool"]: s["reason"] for s in session.get("not_called", [])}
     rows = []
     for tool in session.get("tools", []):
         name = tool["name"]
@@ -844,18 +867,23 @@ def coverage(session: dict) -> dict:
             call = calls[name]
             if call["status"] == "OK":
                 rows.append({"tool": name, "status": "ran", "reason": None})
+            elif call["status"] == "TIMED OUT":
+                rows.append({"tool": name, "status": "timed out", "reason": call["result"]})
             else:
                 text = " ".join(str(call["result"]).split())[:COVERAGE_REASON_CHARS]
                 rows.append({"tool": name, "status": "failed", "reason": f"{call['status']}: {text}"})
         elif name in skipped:
             rows.append({"tool": name, "status": "skipped", "reason": skipped[name]})
+        elif name in not_called:
+            rows.append({"tool": name, "status": "not called", "reason": not_called[name]})
         else:
             why = f": {session['error']}" if session.get("error") else ""
             rows.append({"tool": name, "status": "skipped",
                          "reason": f"not called, the session ended first{why}"})
 
-    totals = {status: sum(1 for r in rows if r["status"] == status)
-              for status in ("ran", "failed", "skipped")}
+    # Totals keys use "_" for the statuses with a space: timed_out, not_called.
+    totals = {status.replace(" ", "_"): sum(1 for r in rows if r["status"] == status)
+              for status in COVERAGE_STATUSES}
     totals["total"] = len(rows)
     note = None
     if not rows:
@@ -919,6 +947,7 @@ def build_report(server: str, timestamp: str, policy: Policy, session: dict,
         "domains": result["domains"],
         "network_isolation": result["network_isolation"],
         "phase_note": result["phase_note"],
+        "server_stopped_note": SERVER_STOPPED_NOTE if result.get("server_stopped") else None,
         "programs": result.get("programs", []),  # every successful exec (#120)
         "tracing_note": TRACING_NOTE,  # a known limitation, in every report (#82)
         # What a scan did not check (#120). Fixture runs have no package.
@@ -954,6 +983,8 @@ def _markdown(r: dict) -> str:
         f" · Probes: {len(r['probes'])}",
         f"- Note: {r.get('tracing_note', TRACING_NOTE)}",
     ]
+    if r.get("server_stopped_note"):
+        out.append(f"- Note: {r['server_stopped_note']}.")
     if r["incomplete_reasons"]:
         out += ["", "## Why INCOMPLETE", ""]
         out += [f"- {reason}" for reason in r["incomplete_reasons"]]
@@ -1029,13 +1060,14 @@ def _package_section(r: dict) -> list[str]:
 
 
 def _coverage_section(r: dict) -> list[str]:
-    """Every listed tool as ran / failed / skipped, with the reason and totals (#23)."""
+    """Every listed tool with its coverage status, the reason and totals (#23, #140)."""
     cov = r.get("coverage")
     if cov is None:
         return []
     t = cov["totals"]
     lines = ["", "## Coverage", "",
-             f"Ran {t['ran']} · Failed {t['failed']} · Skipped {t['skipped']} · Total {t['total']}"
+             f"Ran {t['ran']} · Failed {t['failed']} · Timed out {t.get('timed_out', 0)}"
+             f" · Not called {t.get('not_called', 0)} · Skipped {t['skipped']} · Total {t['total']}"
              " (each tool is called once, with one input; see the README)", ""]
     if cov["note"]:
         return lines + [f"No tools: {cov['note']}."]

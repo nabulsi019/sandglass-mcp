@@ -32,7 +32,7 @@ def test_each_tool_gets_a_status_and_totals_add_up():
         {"tool": "never", "status": "skipped",
          "reason": "not called, the session ended first: TimeoutError: "},
     ]
-    assert cov["totals"] == {"ran": 1, "failed": 1, "skipped": 2, "total": 4}
+    assert cov["totals"] == {"ran": 1, "failed": 1, "timed_out": 0, "not_called": 0, "skipped": 2, "total": 4}
     assert cov["note"] is None
 
 
@@ -50,7 +50,7 @@ def test_long_errors_are_shortened():
 def test_markdown_has_a_coverage_section():
     md = report_markdown(run([LAUNCH, NOTE_READ, EXITED]))
     section = md[md.index("## Coverage"):md.index("## Network")]
-    assert "Ran 1 · Failed 0 · Skipped 0 · Total 1" in section
+    assert "Ran 1 · Failed 0 · Timed out 0 · Not called 0 · Skipped 0 · Total 1" in section
     assert "| `read_note` | ran |  |" in section
 
 
@@ -70,8 +70,8 @@ def test_a_failing_call_does_not_stop_the_other_tools(monkeypatch):
     assert statuses["ok_tool"] == ("ran", None)
     assert statuses["error_tool"][0] == "failed" and "not logged in" in statuses["error_tool"][1]
     assert statuses["pattern_tool"][0] == "skipped" and "pattern" in statuses["pattern_tool"][1]
-    # The timeout raised in the client; it's recorded as FAILED, not a crash.
-    assert statuses["slow_tool"][0] == "failed" and statuses["slow_tool"][1].startswith("FAILED: ")
+    # The timeout raised in the client; it's recorded as timed out (#140), not a crash.
+    assert statuses["slow_tool"] == ("timed out", "no answer within 1 s")
 
 
 def test_a_session_that_fails_half_way_keeps_what_ran(monkeypatch):

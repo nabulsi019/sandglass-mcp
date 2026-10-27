@@ -70,6 +70,10 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
     `--read-only`, `--cap-drop ALL`, no-new-privileges, only the scan's temp
     folder mounted, no project mount, `--ignore-scripts`; npm never runs on
     the host and node_modules never reaches it)
+  - every `EXPECTED_TIMEOUTS` entry in `scripts/check_fixtures.py` (#140:
+    hanging_tool_server CLEAN under notes_readonly, with `hang` timed out,
+    `read_note` ran, and the report saying Sandglass stopped the server; run
+    with `FIXTURE_CALL_TIMEOUT_SECONDS`, test code only)
   - `EXPECTED_EXIT_CODES` in `scripts/check_fixtures.py` (the exit code of
     every verdict: 0 CLEAN, 1 VIOLATIONS, 3 INCOMPLETE; 2 is a usage error)
   - the sandbox hardening flags (--network none, --read-only, non-root user,
