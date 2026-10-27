@@ -5,6 +5,13 @@
 # --sandbox mode and named in every report.
 #
 # READS ONLY: a write (or exec) under any of these paths is still a violation.
+# The only exceptions are the EXACT entries in write_exact and exec_exact
+# below (#142): one file each, one program with one argv, never a folder.
+#
+# Not a path, so not in this file (#142): a bind() to 127.0.0.1 or ::1 with
+# port 0, on a socket that never listen()s or accept()s, is not a violation.
+# That is urllib3 checking whether IPv6 works. See compare.py,
+# _is_ipv6_probe_bind.
 #
 # {multiarch} is the Debian multiarch triplet, asked from Python INSIDE the
 # container (aarch64-linux-gnu on Apple chips, x86_64-linux-gnu in CI).
@@ -26,9 +33,22 @@ read_allow:
   - /sys/fs/cgroup/cpu/cpu.cfs_quota_us   # cgroup v1 hosts: CPU quota (v1 version of cpu.max)
   - /sys/fs/cgroup/cpu/cpu.cfs_period_us  # cgroup v1 hosts: CPU quota period (same)
   - /dev/null                      # opened read-only during asyncio/anyio startup
+  - /proc/sys/vm/overcommit_memory # glibc, the first time it shrinks a thread's heap (one digit, #142)
   # The same files as above, where strace -y shows they really are (#122):
   # a read is judged by the requested AND the opened path.
   - /usr/lib/{multiarch}           # = /lib/{multiarch}: Debian's merged /usr makes /lib a link to usr/lib
   - /usr/share/zoneinfo/Etc/UTC    # = /etc/localtime, a link to the image's timezone (UTC)
   - /etc/ssl/openssl.cnf           # = /usr/lib/ssl/openssl.cnf, a link to Debian's OpenSSL config
   - /etc/ssl/certs/ca-certificates.crt  # = /usr/lib/ssl/cert.pem, a link to Debian's CA bundle
+
+# Exact files that may be WRITTEN (#142). Nothing inside them, no other file.
+write_exact:
+  - /dev/null                      # opened O_RDWR to throw output away (subprocess, git, markitdown)
+
+# Exact program runs (#142): the path AND the whole argv must match. Still
+# listed under "Programs run", with `why` as the note; anything else the
+# program then does is traced and judged like any other process.
+exec_exact:
+  - path: /usr/bin/uname
+    argv: [uname, -p]
+    why: "Python's platform module (platform.processor())"
