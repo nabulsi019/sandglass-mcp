@@ -34,7 +34,7 @@ from mcp.shared.exceptions import MCPError
 from mcp.types import REQUEST_TIMEOUT, CallToolResult, TextContent, Tool
 
 from sandglass import PROJECT_ROOT, sandbox, scan
-from sandglass.compare import (build_report, compare, compare_install, not_run, with_install,
+from sandglass.compare import (build_report, compare, compare_install, not_run, summary_lines, with_install,
                                write_reports)
 from sandglass.inputs import InputError, build_arguments
 from sandglass.policy import (BASELINE_FILES, Policy, PolicyError, check_scan_paths,
@@ -300,13 +300,9 @@ def _write_and_print(report: dict) -> dict:
     """Write the JSON + Markdown report and print the summary."""
     json_path, md_path = write_reports(report, REPORTS_DIR)
     print()
-    print(f"Verdict: {report['verdict']}  "
-          f"(violations: {len(report['violations'])}, attempted: {len(report['attempted'])}, "
-          f"probes: {len(report['probes'])})")
-    for reason in report["incomplete_reasons"]:
-        print(f"  incomplete: {reason}")
-    for v in report["violations"]:
-        print(f"  VIOLATION {v['syscall']} {v['target']} at {v['timestamp']}")
+    # Network events grouped per domain / lookup / address (#141), like the Markdown.
+    for line in summary_lines(report):
+        print(line)
     shown = [p.relative_to(PROJECT_ROOT) if p.is_relative_to(PROJECT_ROOT) else p
              for p in (json_path, md_path)]
     print(f"Report: {shown[0]}")

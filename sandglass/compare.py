@@ -94,7 +94,7 @@ from pathlib import Path
 
 from sandglass import launcher, netsink, sandbox, stdin_relay
 from sandglass.policy import InstallBaseline, Policy
-from sandglass.trace_parser import MAX_TRACE_BYTES, UNREADABLE, Event, exec_argv
+from sandglass.trace_parser import MAX_TRACE_BYTES, NETWORK_SYSCALLS, UNREADABLE, Event, exec_argv
 
 # Errors that mean "this exists but you're not allowed": a real access attempt.
 BLOCKED_ERRORS = {"EACCES", "EPERM"}
@@ -285,15 +285,21 @@ def _is_relay_own(event: Event, relay_exec: Event | None) -> bool:
     return event is relay_exec or (event.kind == "probe" and event.target in RELAY_MARKERS)
 
 
-def _is_sink_own(event: Event, sink_exec: Event | None) -> bool:
+def _is_sink_own(event: Event, sink_exec: Event | None, before_ready: bool) -> bool:
     """The sink's known events, apart from its request records (handled in compare()):
-    its launch, its ready marker, its proxy socket, and the isolation check
-    (its connect, and the marker reporting the outcome, read by _isolation)."""
+    its launch, its ready marker, its proxy socket, the isolation check (its
+    connect, and the marker reporting the outcome, read by _isolation), and
+    (#141) its read of /etc/resolv.conf before "ready" and the markers
+    reporting the nameservers (read by _resolvers)."""
     if event is sink_exec:
         return True
     if event.kind == "probe":
         return (event.target == netsink.SINK_READY
-                or event.target.startswith(netsink.ISOLATION_MARKER_DIR + "/"))
+                or event.target.startswith(netsink.ISOLATION_MARKER_DIR + "/")
+                or event.target.startswith(netsink.RESOLVER_MARKER_DIR + "/"))
+    if event.kind == "file":
+        return (before_ready and event.mode == "read" and event.target == netsink.RESOLVER_FILE
+                and event.opened in (None, netsink.RESOLVER_FILE))
     if event.kind != "network":
         return False
     if event.syscall == "bind":
@@ -306,6 +312,26 @@ def _is_sink_own(event: Event, sink_exec: Event | None) -> bool:
     if event.syscall == "connect":
         return _is_address(event.target, *netsink.ISOLATION_CHECK)
     return False
+
+
+def _resolvers(events: list[Event], sink_pid: int | None) -> list[str] | None:
+    """The container's nameservers, as the sink reported them (#141), or None
+    if they are unknown (no report before "ready", or the file was unreadable).
+    Only the sink's markers before its ready marker count, like _isolation."""
+    found = []
+    for event in events:
+        if event.pid != sink_pid or event.kind != "probe":
+            continue
+        if event.target == netsink.SINK_READY:
+            return None  # ready without a complete report
+        prefix = netsink.RESOLVER_MARKER_DIR + "/"
+        if event.target == prefix + "done":
+            return found
+        if event.target == prefix + "unreadable":
+            return None
+        if event.target.startswith(prefix + "nameserver/"):
+            found.append(event.target[len(prefix + "nameserver/"):])
+    return None
 
 
 def _isolation(events: list[Event], sink_pid: int | None) -> dict | None:
@@ -455,6 +481,9 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
     phase_of, phase_note = _phase_of(events, session, relay_pid)
     domains: list[dict] = []       # every request the sink recorded
     isolation = _isolation(events, sink_pid)  # the sink's own report of its check (#100)
+    resolvers = _resolvers(events, sink_pid)  # the container's nameservers, or None (#141)
+    sink_ready_index = next((i for i, e in enumerate(events) if e.pid == sink_pid and e.kind == "probe"
+                             and e.target == netsink.SINK_READY), len(events))
     io_uring_used: list[Event] = []  # io_uring calls that succeeded (#75)
     evaded: list[Event] = []         # evasions that worked (#84): a child or memory strace can't see
     unidentified: list[Event] = []   # sink records with no domain, when some domains are allowed (#136)
@@ -489,7 +518,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
         if event.pid == relay_pid and _is_relay_own(event, relay_exec):
             continue  # the relay's launch and markers; anything else it does is judged (#99)
 
-        if event.pid == sink_pid and _is_sink_own(event, sink_exec):
+        if event.pid == sink_pid and _is_sink_own(event, sink_exec, index < sink_ready_index):
             continue  # the sink's launch, ready marker, proxy socket, isolation check (#99)
 
         if (server_launch is not None and event.pid == server_launch.pid and event.kind == "probe"
@@ -668,6 +697,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
         "probes": sorted(probes.values(), key=lambda p: p["first_timestamp"]),
         "domains": domains,
         "network_isolation": isolation,
+        "resolvers": resolvers,  # None: unknown (#141)
         "phase_note": phase_note,
         "server_stopped": server_stopped,  # the relay killed it after eof (#140)
         "programs": programs,
@@ -943,6 +973,116 @@ def coverage(session: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Violation groups (#141): one entry per domain, per lookup, per address
+# ---------------------------------------------------------------------------
+
+# Where glibc asks the name service cache daemon (absent in the image) first.
+NSCD_SOCKETS = ("/var/run/nscd/socket", "/run/nscd/socket")
+NAME_LOOKUPS = "name lookups: domain not recorded (see #147)"
+SOCKADDR_RE = {
+    "AF_UNIX": re.compile(r'sa_family=AF_UNIX, sun_path="([^"]*)"'),
+    "AF_INET": re.compile(r'sa_family=AF_INET, sin_port=htons\((\d+)\), sin_addr=inet_addr\("([^"]+)"\)'),
+    "AF_INET6": re.compile(r'sa_family=AF_INET6, sin6_port=htons\((\d+)\),.*?inet_pton\(AF_INET6, "([^"]+)"'),
+}
+
+
+def _sockaddr(target: str) -> tuple[str, str, int | None] | None:
+    """(family, address, port) from strace's sockaddr text, or None.
+    An AF_UNIX socket has a path instead of an address, and no port."""
+    for family, pattern in SOCKADDR_RE.items():
+        match = pattern.search(target)
+        if match and family == "AF_UNIX":
+            return family, match[1], None
+        if match:
+            return family, match[2], int(match[1])
+    return None
+
+
+def _group_key(v: dict, index: int, resolvers: list[str] | None) -> tuple[tuple, str, str | None]:
+    """(key, label, breakdown line) of one violation record. Records with the
+    same key (always within one phase) form one entry."""
+    phase = v.get("phase")
+    if v["syscall"] == "proxy request":
+        return ("domain", phase, v["target"]), f"domain {v['target']}", None
+    if v["syscall"] not in NETWORK_SYSCALLS:
+        return ("event", index), "", None  # files, programs, evasions: one entry each
+    address = _sockaddr(v["target"])
+    error = f" ({v['error']})" if v.get("error") else ""
+    if address is None:
+        return ("network", phase, v["syscall"], v["target"]), f"{v['syscall']} {v['target']}", None
+    family, host, port = address
+    if family == "AF_UNIX" and host in NSCD_SOCKETS:
+        return ("name lookups", phase), NAME_LOOKUPS, f"nscd socket{error}"
+    if port == 53 and resolvers is not None and host in resolvers:
+        # The system resolver, from the container's resolv.conf: the trace
+        # doesn't contain the name looked up, so none is guessed.
+        return ("name lookups", phase), NAME_LOOKUPS, f"port 53 at {host}{error}"
+    if port == 53:
+        # Never merged with the resolver's lookups: DNS sent somewhere else,
+        # or (resolvers None) the resolver list couldn't be read.
+        label = (f"direct DNS to {host}:53 (bypasses the system resolver)" if resolvers is not None
+                 else f"port 53 to {host} (the container's resolver could not be read, so not "
+                      "grouped as name lookups)")
+        return ("dns", phase, host), label, None
+    where = f"{host}:{port}" if port is not None else host
+    return ("network", phase, v["syscall"], family, host, port), f"{v['syscall']} {family} {where}", None
+
+
+def group_violations(violations: list[dict], domains: list[dict],
+                     resolvers: list[str] | None) -> list[dict]:
+    """The violations as report entries (#141), in order of first appearance.
+
+    Network events are grouped: proxy requests per domain, the system
+    resolver's lookup steps as one "name lookups" entry, port 53 anywhere
+    else per address, any other network event per (syscall, family, address,
+    port). Everything else stays one entry per event. Each entry lists the
+    indexes of its events in `violations`, which is never changed: the
+    verdict, the counts and check_fixtures.py use the raw list.
+    `resolvers` None means the nameservers are unknown.
+    """
+    groups: dict[tuple, dict] = {}
+    for index, v in enumerate(violations):
+        key, label, part = _group_key(v, index, resolvers)
+        group = groups.get(key)
+        if group is None:
+            group = groups[key] = {"label": label, "phase": v.get("phase"), "count": 0,
+                                   "first": v["timestamp"], "last": v["timestamp"],
+                                   "events": [], "breakdown": {}}
+        group["count"] += 1
+        group["last"] = v["timestamp"]
+        group["events"].append(index)
+        if part:
+            group["breakdown"][part] = group["breakdown"].get(part, 0) + 1
+    for (kind, *rest), group in groups.items():
+        if kind == "domain":
+            # How the server asked for it, from the sink's records.
+            requests = [f"{d['method']} :{d['port']}" for d in domains
+                        if d["host"] == rest[1] and d.get("phase") == rest[0]]
+            group["breakdown"] = {r: requests.count(r) for r in dict.fromkeys(requests)}
+    return list(groups.values())
+
+
+def summary_lines(r: dict) -> list[str]:
+    """The terminal summary of a report (#141). "violations: N" is the number
+    of raw events, as in the JSON; the entries are the groups. An entry of one
+    event prints as it always did."""
+    groups = r["violation_groups"]
+    lines = [f"Verdict: {r['verdict']}  (violations: {len(r['violations'])} in {len(groups)} "
+             f"{'entry' if len(groups) == 1 else 'entries'}, attempted: {len(r['attempted'])}, "
+             f"probes: {len(r['probes'])})"]
+    lines += [f"  incomplete: {reason}" for reason in r["incomplete_reasons"]]
+    for group in groups:
+        if group["count"] == 1:
+            v = r["violations"][group["events"][0]]
+            lines.append(f"  VIOLATION {v['syscall']} {v['target']} at {v['timestamp']}")
+            continue
+        parts = ", ".join(f"{text} ×{n}" for text, n in group["breakdown"].items())
+        lines.append(f"  VIOLATION {group['label']} ×{group['count']}" + (f" ({parts})" if parts else "")
+                     + f", {group['first']} – {group['last']}, {group['phase']}")
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # Report writing
 # ---------------------------------------------------------------------------
 
@@ -993,11 +1133,15 @@ def build_report(server: str, timestamp: str, policy: Policy, session: dict,
         "exercised": session.get("calls", []),
         "tools": session.get("tools", []),
         "coverage": coverage(session),  # ran / failed / skipped per tool (#23)
-        "violations": result["violations"],
+        "violations": result["violations"],  # every event, never grouped
+        # The same violations as report entries (#141), for the summary and the Markdown.
+        "violation_groups": group_violations(result["violations"], result["domains"],
+                                             result.get("resolvers")),
         "attempted": result["attempted"],
         "probes": result["probes"],
         "domains": result["domains"],
         "network_isolation": result["network_isolation"],
+        "resolvers": result.get("resolvers"),  # the container's nameservers, None if unknown (#141)
         "phase_note": result["phase_note"],
         "server_stopped_note": SERVER_STOPPED_NOTE if result.get("server_stopped") else None,
         "programs": result.get("programs", []),  # every successful exec (#120)
@@ -1142,13 +1286,21 @@ def _network_section(r: dict) -> list[str]:
     else:
         lines.append(f"- Isolation check: connect to `{iso['target']}`: isolated ({iso['outcome']}):"
                      " no route to the internet")
+    resolvers = r.get("resolvers")
+    lines.append("- Nameservers in the container's resolv.conf: "
+                 + (", ".join(f"`{a}`" for a in resolvers) or "none" if resolvers is not None
+                    else "**unknown** (port 53 to any address is listed separately)"))
     lines += ["", "Domains the server asked the local sink for (nothing was sent anywhere):", ""]
     if not r.get("domains"):
         return lines + ["None."]
-    lines += ["| Domain | Port | Method | Allowed | Phase |", "|---|---|---|---|---|"]
+    # One row per identical request (#141); the JSON lists every one.
+    rows: dict[tuple, int] = {}
     for d in r["domains"]:
-        lines.append(f"| `{d['host']}` | {d['port']} | {d['method']} |"
-                     f" {'yes' if d['allowed'] else '**no**'} | {d.get('phase', '?')} |")
+        key = (d["host"], d["port"], d["method"], d["allowed"], d.get("phase", "?"))
+        rows[key] = rows.get(key, 0) + 1
+    lines += ["| Domain | Port | Method | Allowed | Phase | Requests |", "|---|---|---|---|---|---|"]
+    for (host, port, method, allowed, phase), count in rows.items():
+        lines.append(f"| `{host}` | {port} | {method} | {'yes' if allowed else '**no**'} | {phase} | {count} |")
     return lines
 
 
@@ -1159,11 +1311,16 @@ def _phase_sections(r: dict) -> list[str]:
     lines = ["", "## Violations by phase"]
     if r.get("phase_note"):
         lines += ["", f"Phases are unknown: {r['phase_note']}."]
+    groups = r.get("violation_groups")
+    if groups is None:  # a report from before #141: one entry per event
+        groups = [{"count": 1, "events": [i], "phase": v.get("phase")} for i, v in enumerate(r["violations"])]
     for phase in PHASES:
         records = [v for v in r["violations"] if v.get("phase") == phase]
         if phase == "unknown" and not records:
             continue  # only shown when the boundary was missing
-        section = _event_section(titles[phase], records, level="###")
+        section = _event_section(titles[phase], records, level="###",
+                                 groups=[g for g in groups if g["phase"] == phase],
+                                 violations=r["violations"])
         if phase == "install" and not records and not r.get("package"):
             section[-1:] = ["Nothing is installed in a fixture run; `sandglass scan` traces "
                             "the install of a package (see #16)."]
@@ -1307,11 +1464,33 @@ def _attempted_section(r: dict) -> list[str]:
     return lines
 
 
-def _event_section(title: str, records: list[dict], level: str = "##") -> list[str]:
+def _event_section(title: str, records: list[dict], level: str = "##",
+                   groups: list[dict] | None = None, violations: list[dict] | None = None) -> list[str]:
+    """Numbered events with their evidence. With `groups` (#141), one item per
+    entry: an entry of one event exactly as before, an entry of several as
+    one item with its count, breakdown and first evidence line."""
     lines = ["", f"{level} {title}", ""]
     if not records:
         return lines + ["None."]
-    for i, v in enumerate(records, 1):
+    if groups is None:
+        groups = [{"count": 1, "events": [i]} for i in range(len(records))]
+        violations = records
+    for i, group in enumerate(groups, 1):
+        v = violations[group["events"][0]]
+        if group["count"] > 1:
+            parts = ", ".join(f"{t} ×{n}" for t, n in group["breakdown"].items())
+            lines += [
+                f"{i}. **{group['label']}** ×{group['count']}" + (f" ({parts})" if parts else ""),
+                f"   - {v['reason']}; from {group['first']} to {group['last']} ({group['phase']})",
+                f"   - all {group['count']} events are in the JSON report's `violations`"
+                " (this entry's `events` in `violation_groups` gives their indexes)",
+                "   - first evidence:",
+                "",
+                "     ```",
+                f"     {v['evidence']}",
+                "     ```",
+            ]
+            continue
         status = "succeeded" if v["succeeded"] else f"failed ({v['error']})"
         lines += [
             f"{i}. **{v['reason']}**: `{v['target']}`",

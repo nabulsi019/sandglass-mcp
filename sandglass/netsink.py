@@ -32,6 +32,12 @@ ISOLATION_TIMEOUT = 2  # seconds
 # finished, by stat()ing <this>/<isolated|not-isolated>/<outcome>, before it
 # marks itself ready. compare.py reads only that, never the connect's errno.
 ISOLATION_MARKER_DIR = "/sandglass-isolation"
+# (#141) The nameservers in the container's /etc/resolv.conf, reported the
+# same way, also before "ready": <this>/nameserver/<address> for each, then
+# <this>/done (or <this>/unreadable if the file can't be read). compare.py
+# uses them to tell the system resolver's lookups from DNS sent elsewhere.
+RESOLVER_FILE = "/etc/resolv.conf"
+RESOLVER_MARKER_DIR = "/sandglass-resolver"
 # The launcher hands the sink this fd; the sink writes one byte when listening.
 READY_FD = 3
 
@@ -77,6 +83,36 @@ def _record(path: str) -> None:
         os.stat(path)
     except OSError:
         pass
+
+
+def nameservers(text: str) -> list[str]:
+    """The addresses on resolv.conf's "nameserver" lines, valid IPs only
+    (a zone like %eth0 is dropped), so nothing else gets into a marker path."""
+    import ipaddress
+
+    found = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "nameserver":
+            try:
+                found.append(str(ipaddress.ip_address(parts[1].split("%")[0])))
+            except ValueError:
+                pass
+    return found
+
+
+def report_resolvers() -> None:
+    """Record the container's nameservers in the trace (#141), or that the
+    file couldn't be read. Runs before "ready", so before any server code."""
+    try:
+        with open(RESOLVER_FILE, encoding="utf-8", errors="replace") as f:
+            text = f.read(65536)
+    except OSError:
+        _record(f"{RESOLVER_MARKER_DIR}/unreadable")
+        return
+    for address in nameservers(text):
+        _record(f"{RESOLVER_MARKER_DIR}/nameserver/{address}")
+    _record(f"{RESOLVER_MARKER_DIR}/done")
 
 
 def isolation_result(connect=None) -> tuple[str, str]:
@@ -159,6 +195,7 @@ def serve() -> None:
     # reported in the trace before "ready", so before any server code runs.
     result, outcome = isolation_result()
     _record(f"{ISOLATION_MARKER_DIR}/{result}/{outcome}")
+    report_resolvers()  # (#141) also before "ready"
 
     _record(SINK_READY)
     os.write(READY_FD, b"1")  # tell the launcher the sink is listening
