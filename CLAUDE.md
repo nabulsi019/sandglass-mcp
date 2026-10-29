@@ -79,6 +79,9 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
     "Programs run" and its baseline note; runtime_neighbours_server
     VIOLATIONS, exactly the bind to 127.0.0.1:8080, the listen, the exec of
     `uname -a` and the write to /dev/zero)
+  - every `EXPECTED_COVERAGE_SUMMARY` entry in `scripts/check_fixtures.py`
+    (#143: tool_error_server CLEAN under notes_readonly, with the coverage
+    summary "1 of 2 tools returned errors")
   - `EXPECTED_EXIT_CODES` in `scripts/check_fixtures.py` (the exit code of
     every verdict: 0 CLEAN, 1 VIOLATIONS, 3 INCOMPLETE; 2 is a usage error)
   - the sandbox hardening flags (--network none, --read-only, non-root user,

@@ -108,7 +108,8 @@ def print_policy(policy: Policy, enforced: bool) -> None:
 def new_session_record() -> dict:
     """What run() fills in. tools: what the server listed; calls: tools that
     were called (status OK, ERROR, UNEXPECTED, TIMED OUT, FAILED, or NO ANSWER
-    if the session ended during the call); skipped: tools we couldn't build
+    if the session ended during the call; a FAILED call that raised an MCP
+    error also has its "error_code", #143); skipped: tools we couldn't build
     an input for; not_called: tools left when the calls stopped (#140)."""
     return {"tools": [], "calls": [], "skipped": [], "not_called": []}
 
@@ -189,6 +190,11 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
                     call["status"] = "TIMED OUT" if is_timeout(exc) else "FAILED"
                     call["result"] = (f"no answer within {timeout:.0f} s" if is_timeout(exc)
                                       else describe_error(exc))
+                    if isinstance(exc, MCPError):
+                        # Kept for coverage (#143): an error response from the
+                        # server is "returned an error", not a failed call. The
+                        # status stays FAILED, so the verdict rules don't change.
+                        call["error_code"] = exc.code
                 print(f"  -> [{call['status']}] {call['result']}")
                 # The SDK has already sent a cancel for the timed-out call. A
                 # server that can't even answer a ping now would time out

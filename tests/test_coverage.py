@@ -27,12 +27,13 @@ def test_each_tool_gets_a_status_and_totals_add_up():
     cov = coverage(session)
     assert cov["tools"] == [
         {"tool": "ok", "status": "ran", "reason": None},
-        {"tool": "broken", "status": "failed", "reason": "ERROR: not logged in (401)"},
+        {"tool": "broken", "status": "returned an error", "reason": "ERROR: not logged in (401)"},
         {"tool": "odd", "status": "skipped", "reason": "no valid input: can't build a string matching pattern"},
         {"tool": "never", "status": "skipped",
          "reason": "not called, the session ended first: TimeoutError: "},
     ]
-    assert cov["totals"] == {"ran": 1, "failed": 1, "timed_out": 0, "not_called": 0, "skipped": 2, "total": 4}
+    assert cov["totals"] == {"ran": 1, "returned_error": 1, "failed": 0, "timed_out": 0, "not_called": 0,
+                             "skipped": 2, "total": 4}
     assert cov["note"] is None
 
 
@@ -50,7 +51,7 @@ def test_long_errors_are_shortened():
 def test_markdown_has_a_coverage_section():
     md = report_markdown(run([LAUNCH, NOTE_READ, EXITED]))
     section = md[md.index("## Coverage"):md.index("## Network")]
-    assert "Ran 1 · Failed 0 · Timed out 0 · Not called 0 · Skipped 0 · Total 1" in section
+    assert "Ran 1 · Returned an error 0 · Failed 0 · Timed out 0 · Not called 0 · Skipped 0 · Total 1" in section
     assert "| `read_note` | ran |  |" in section
 
 
@@ -68,7 +69,11 @@ def test_a_failing_call_does_not_stop_the_other_tools(monkeypatch):
     record = asyncio.run(client.run(params, "coverage_server"))
     statuses = {row["tool"]: (row["status"], row["reason"]) for row in coverage(record)["tools"]}
     assert statuses["ok_tool"] == ("ran", None)
-    assert statuses["error_tool"][0] == "failed" and "not logged in" in statuses["error_tool"][1]
+    # isError result and JSON-RPC error response: both are the server's answer (#143).
+    assert statuses["error_tool"][0] == "returned an error" and "not logged in" in statuses["error_tool"][1]
+    assert statuses["rejected_tool"][0] == "returned an error" and "rejected" in statuses["rejected_tool"][1]
+    # The raw status the verdict rules read is unchanged.
+    assert next(c for c in record["calls"] if c["tool"] == "rejected_tool")["status"] == "FAILED"
     assert statuses["pattern_tool"][0] == "skipped" and "pattern" in statuses["pattern_tool"][1]
     # The timeout raised in the client; it's recorded as timed out (#140), not a crash.
     assert statuses["slow_tool"] == ("timed out", "no answer within 1 s")

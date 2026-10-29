@@ -80,8 +80,8 @@ def test_coverage_totals_count_the_new_statuses():
               "calls": [{"tool": "a", "status": "OK", "result": "x"},
                         {"tool": "b", "status": "TIMED OUT", "result": "no answer within 30 s"}],
               "not_called": [{"tool": "c", "reason": "time budget"}]}
-    assert coverage(record)["totals"] == {"ran": 1, "failed": 0, "timed_out": 1, "not_called": 1,
-                                          "skipped": 0, "total": 3}
+    assert coverage(record)["totals"] == {"ran": 1, "returned_error": 0, "failed": 0, "timed_out": 1,
+                                          "not_called": 1, "skipped": 0, "total": 3}
 
 
 # --- the verdict ---------------------------------------------------------------

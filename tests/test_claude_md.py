@@ -52,6 +52,14 @@ def test_every_runtime_fixture_is_protected():
             f"EXPECTED_RUNTIME entry {fixture} is not in CLAUDE.md's protected items"
 
 
+def test_every_coverage_summary_fixture_is_protected():
+    # (#143) the tool error fixture and the summary it must show.
+    assert "`EXPECTED_COVERAGE_SUMMARY`" in PROTECTED
+    for fixture, (_, _, summary) in check_fixtures.EXPECTED_COVERAGE_SUMMARY.items():
+        assert fixture.removesuffix(".py") in PROTECTED and summary in PROTECTED, \
+            f"EXPECTED_COVERAGE_SUMMARY entry {fixture} is not in CLAUDE.md's protected items"
+
+
 def test_every_hostile_fixture_is_protected():
     # (#131 onwards) every hostile fixture, under every policy it runs with.
     for fixture, policy_name in check_fixtures.EXPECTED_HOSTILE:
