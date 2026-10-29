@@ -23,6 +23,7 @@ import argparse
 import asyncio
 import json
 import re
+import shlex
 import sys
 import tempfile
 import time
@@ -34,14 +35,17 @@ from mcp.shared.exceptions import MCPError
 from mcp.types import REQUEST_TIMEOUT, CallToolResult, TextContent, Tool
 
 from sandglass import PROJECT_ROOT, sandbox, scan
-from sandglass.compare import (build_report, compare, compare_install, not_run, summary_lines, with_install,
-                               write_reports)
+from sandglass.compare import (build_report, compare, compare_install, not_run, setup_line, summary_lines,
+                               with_install, write_reports)
 from sandglass.inputs import InputError, build_arguments
 from sandglass.policy import (BASELINE_FILES, Policy, PolicyError, check_scan_paths,
                               load_install_baseline, load_policy)
 from sandglass.trace_parser import parse_trace_file
 
 REPORTS_DIR = PROJECT_ROOT / "reports"
+# The work dir in every run's path mapping (#144).
+WORKDIR_MAPPING = {str(sandbox.CONTAINER_WORKDIR): "the server's working directory: "
+                                                   "an empty folder in the scratch /tmp (in memory)"}
 
 # Total time budget for the tool calls (#140). Once it is used up, no more
 # tools are called; the ones left are reported "not called (time budget)".
@@ -60,6 +64,60 @@ SESSION_GRACE_SECONDS = 30
 # is 3, not 2: argparse exits with 2 on a usage error, and a script must be
 # able to tell "you called it wrong" from "the run can't be trusted" (#124).
 EXIT_CODES = {"CLEAN": 0, "VIOLATIONS": 1, "INCOMPLETE": 3}
+
+# --env names the user may not set (#144), with the reason. "X*" is a prefix.
+# Compared upper-cased, so http_proxy is refused like HTTP_PROXY. The values
+# reach the whole container (sh and strace too), not only the server.
+REFUSED_ENV = [
+    (("PATH", "HOME"), "set by Sandglass (HOME is the decoy home)"),
+    (("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"), "set or removed by the launcher for the network sink"),
+    (("SANDGLASS_*",), "read by Sandglass's launcher"),
+    (("LD_*", "PYTHON*"), "read before the launcher hides the trace stream"),
+    (("NODE_OPTIONS",), "changes how Sandglass starts Node"),
+    (("DOCKER_*",), "read by the docker command on the host, which passes the values on"),
+    (("GCONV_PATH", "LOCPATH", "GLIBC_TUNABLES", "MALLOC_*", "IFS", "ENV", "BASH_ENV"),
+     "read by glibc or the shell before tracing starts"),
+]
+ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def env_refusal(name: str) -> str | None:
+    """Why Sandglass refuses this --env name, or None if it's allowed."""
+    upper = name.upper()
+    for names, reason in REFUSED_ENV:
+        for refused in names:
+            if upper == refused or (refused.endswith("*") and upper.startswith(refused[:-1])):
+                return reason
+    return None
+
+
+def parse_server_env(items: list[str]) -> dict[str, str]:
+    """--env KEY=VALUE items -> {KEY: VALUE} (#144). Raises ValueError with a
+    message for the usage error: no "=", a bad or repeated name, a refused name."""
+    env = {}
+    for item in items:
+        name, sep, value = item.partition("=")
+        if not sep:
+            raise ValueError(f"--env {item!r}: expected KEY=VALUE")
+        if not ENV_NAME_RE.fullmatch(name):
+            raise ValueError(f"--env {name!r}: not a valid variable name (letters, digits, _)")
+        if name in env:
+            raise ValueError(f"--env {name}: given twice")
+        reason = env_refusal(name)
+        if reason:
+            raise ValueError(f"--env {name}: refused, {reason} (see README)")
+        env[name] = value
+    return env
+
+
+def server_setup(command: list[str], server_args: list[str], server_env: dict) -> dict:
+    """The server setup for the report (#144): the arguments as given, the
+    environment's NAMES only (values are never recorded), the work dir, and a
+    command line that reproduces the run, with the values redacted."""
+    full = (command + [f"--server-arg={arg}" for arg in server_args]
+            + [f"--env={name}=<redacted>" for name in server_env])
+    return {"args": list(server_args), "env": list(server_env),
+            "workdir": str(sandbox.CONTAINER_WORKDIR), "command": shlex.join(full)}
 
 
 def build_safe_arguments(tool: Tool) -> dict:
@@ -216,8 +274,10 @@ def run_host(server_script: Path) -> None:
     asyncio.run(run(params, server_script.name))
 
 
-def run_sandboxed(server_script: Path, policy_path: Path) -> dict:
-    """Run the server in Docker under strace, compare, write and return the report."""
+def run_sandboxed(server_script: Path, policy_path: Path, server_args: list[str] = (),
+                  server_env: dict | None = None) -> dict:
+    """Run the server in Docker under strace, compare, write and return the report.
+    `server_args`, `server_env`: --server-arg and --env (#144), already checked."""
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     server = server_script.stem
 
@@ -229,32 +289,41 @@ def run_sandboxed(server_script: Path, policy_path: Path) -> dict:
                          in_sandbox=True, multiarch=multiarch, runtime=runtime)
     print_policy(policy, enforced=True)
 
-    command, args = sandbox.docker_command(server_script)
+    server_env = server_env or {}
+    setup = server_setup(["sandglass", str(server_script.relative_to(PROJECT_ROOT)),
+                          "--policy", str(policy_path), "--sandbox"], server_args, server_env)
+    command, args = sandbox.docker_command(server_script, server_args, list(server_env))
     path_mapping = {
         str(sandbox.CONTAINER_PROJECT): f"{PROJECT_ROOT} (read-only)",
         str(sandbox.CONTAINER_REPORTS): "hidden (empty read-only tmpfs)",
         str(sandbox.CONTAINER_VENV): "dependencies baked into the image",
         str(sandbox.CONTAINER_PYTHON_BASE): "Python from python:3.12-slim",
+        **WORKDIR_MAPPING,
     }
     return _trace_and_report(server, timestamp, command, args, policy, runtime, multiarch,
-                             path_mapping)
+                             path_mapping, setup=setup, server_env=server_env)
 
 
 def _trace_and_report(server: str, timestamp: str, command: str, args: list[str], policy: Policy,
                       runtime: str, multiarch: str, path_mapping: dict,
                       package: dict | None = None,
-                      cwd: str = str(sandbox.CONTAINER_PROJECT),
-                      install: dict | None = None) -> dict:
+                      install: dict | None = None, setup: dict | None = None,
+                      server_env: dict | None = None) -> dict:
     """Run the docker command under strace, compare, write and return the report.
 
-    Shared by fixture mode (run_sandboxed) and scan mode (run_scan). `cwd` is
-    the container's working directory, for the trace's relative paths.
-    `install` (scan mode, #16) is compare_install()'s result, added in front.
+    Shared by fixture mode (run_sandboxed) and scan mode (run_scan). The
+    server runs in sandbox.CONTAINER_WORKDIR, so the trace's relative paths
+    start there (#144). `install` (scan mode, #16) is compare_install()'s
+    result, added in front. `setup` is server_setup()'s record for the report;
+    `server_env` the --env values, given only to the docker command's own
+    environment (its -e NAME copies them into the container).
     """
+    if setup:
+        print(f"Server setup: {setup_line(setup)}")
     # Written on the HOST from the container's stderr (strace's output). The
     # container never sees this file: reports/ is hidden inside it.
     trace_file = _trace_dir(server, timestamp) / sandbox.TRACE_FILENAME
-    params = StdioServerParameters(command=command, args=args)
+    params = StdioServerParameters(command=command, args=args, env=server_env or None)
 
     # Any failure (image missing, server crash, timeout) is recorded, not
     # raised: the report must still be written, with verdict INCOMPLETE.
@@ -273,7 +342,7 @@ def _trace_and_report(server: str, timestamp: str, command: str, args: list[str]
             print(f"Session failed: {session['error']}")
 
     # Line by line, up to MAX_TRACE_BYTES: a huge trace can't use up memory (#83).
-    events, cut_short = parse_trace_file(trace_file, cwd=cwd)
+    events, cut_short = parse_trace_file(trace_file, cwd=str(sandbox.CONTAINER_WORKDIR))
     result = compare(events, policy, session, runtime=runtime, trace_cut_short=cut_short)
     if install is not None:
         result = with_install(result, install)
@@ -281,7 +350,7 @@ def _trace_and_report(server: str, timestamp: str, command: str, args: list[str]
     path_mapping = {**path_mapping,
                     "(container stderr)": f"strace output, saved on the host as {trace_file}"}
     report = build_report(server, timestamp, policy, session, result, trace_file,
-                          path_mapping, _baseline(policy, runtime, multiarch), package)
+                          path_mapping, _baseline(policy, runtime, multiarch), package, setup)
     return _write_and_print(report)
 
 
@@ -332,11 +401,18 @@ def _scan_policy(policy_path: Path, server_path: str, multiarch: str, runtime: s
 
 
 def run_scan(spec: scan.PackageSpec, policy_path: Path, registry_dir: Path | None = None,
-             entry: str | None = None) -> dict:
+             entry: str | None = None, server_args: list[str] = (),
+             server_env: dict | None = None) -> dict:
     """Download (host), install (sandbox), run and trace one package; return the report.
 
     Any failing step makes a report too, with verdict INCOMPLETE and the reason.
+    `server_args`, `server_env`: --server-arg and --env (#144), already checked.
     """
+    server_env = server_env or {}
+    setup = server_setup(["sandglass", "scan", str(spec), "--policy", str(policy_path)]
+                         + (["--entry", entry] if entry else [])
+                         + (["--registry-dir", str(registry_dir)] if registry_dir else []),
+                         server_args, server_env)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     multiarch = sandbox.detect_multiarch()
     runtime = "node" if spec.ecosystem == "npm" else "python"
@@ -396,27 +472,47 @@ def run_scan(spec: scan.PackageSpec, policy_path: Path, registry_dir: Path | Non
                 if exit_code != 0:  # failed or timed out: nothing to run
                     report = build_report(spec.slug, timestamp, policy, new_session_record(),
                                           with_install(not_run(None), install), None, {},
-                                          _baseline(policy, runtime, multiarch), package)
+                                          _baseline(policy, runtime, multiarch), package, setup)
                     return _write_and_print(report)
 
-                command, args = sandbox.scan_run_command(volume, server_path, runtime)
+                command, args = sandbox.scan_run_command(volume, server_path, runtime,
+                                                         server_args, list(server_env))
                 path_mapping = {
                     str(sandbox.CONTAINER_PACKAGE): "the installed package (a Docker volume, read-only)",
                     str(sandbox.CONTAINER_PROJECT): "not mounted: the project is never visible to a scan (#20)",
                     str(sandbox.CONTAINER_VENV): "Sandglass's dependencies, baked into the image",
                     str(sandbox.CONTAINER_PYTHON_BASE): "Python from python:3.12-slim",
+                    **WORKDIR_MAPPING,
                 }
                 return _trace_and_report(spec.slug, timestamp, command, args, policy, runtime,
-                                         multiarch, path_mapping, package,
-                                         cwd=str(sandbox.CONTAINER_PACKAGE), install=install)
+                                         multiarch, path_mapping, package, install=install,
+                                         setup=setup, server_env=server_env)
             finally:
                 sandbox.remove_volume(volume)
         except scan.ScanError as exc:
             print(f"Scan failed: {exc}")
             report = build_report(spec.slug, timestamp, policy, new_session_record(),
                                   not_run(str(exc)), None, {}, _baseline(policy, runtime, multiarch),
-                                  package)
+                                  package, setup)
             return _write_and_print(report)
+
+
+def add_setup_arguments(parser: argparse.ArgumentParser) -> None:
+    """--server-arg and --env (#144), for both `sandglass scan` and --sandbox."""
+    parser.add_argument("--server-arg", action="append", default=[], metavar="ARG",
+                        help="an argument for the server (repeatable, in order). Recorded in the "
+                             "report as given. One starting with '-' needs --server-arg=ARG")
+    parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
+                        help="an environment variable for the server (repeatable). Fake values "
+                             "only; the report records the name, never the value")
+
+
+def checked_env(parser: argparse.ArgumentParser, args: argparse.Namespace) -> dict[str, str]:
+    """--env as a dict, or a usage error (exit 2) naming the problem (#144)."""
+    try:
+        return parse_server_env(args.env)
+    except ValueError as exc:
+        parser.error(str(exc))
 
 
 def scan_main(argv: list[str]) -> None:
@@ -434,7 +530,9 @@ def scan_main(argv: list[str]) -> None:
     parser.add_argument("--registry-dir", type=Path,
                         help="a local folder of test packages (e.g. test_packages/dist) "
                              "to use instead of PyPI/npm")
+    add_setup_arguments(parser)
     args = parser.parse_args(argv)
+    server_env = checked_env(parser, args)
 
     try:
         spec = scan.parse_spec(args.package)
@@ -452,7 +550,7 @@ def scan_main(argv: list[str]) -> None:
     registry_dir = args.registry_dir.resolve() if args.registry_dir else None
 
     try:
-        report = run_scan(spec, args.policy, registry_dir, args.entry)
+        report = run_scan(spec, args.policy, registry_dir, args.entry, args.server_arg, server_env)
     except sandbox.SandboxError as exc:
         print(f"Sandbox error: {exc}", file=sys.stderr)
         sys.exit(EXIT_CODES["INCOMPLETE"])
@@ -473,7 +571,11 @@ def main() -> None:
     parser.add_argument("--policy", type=Path, help="policy YAML to load (required with --sandbox)")
     parser.add_argument("--sandbox", action="store_true",
                         help="run in Docker under strace and write a report")
+    add_setup_arguments(parser)
     args = parser.parse_args()
+    server_env = checked_env(parser, args)
+    if (args.server_arg or server_env) and not args.sandbox:
+        parser.error("--server-arg and --env need --sandbox")
 
     # The server path is a normal CLI argument, so it's relative to the CWD.
     # (Paths INSIDE the policy file are relative to the project root instead.)
@@ -487,7 +589,7 @@ def main() -> None:
         if not server_script.is_relative_to(PROJECT_ROOT):
             parser.error("--sandbox only mounts the project, so the server must be inside it")
         try:
-            report = run_sandboxed(server_script, args.policy)
+            report = run_sandboxed(server_script, args.policy, args.server_arg, server_env)
         except sandbox.SandboxError as exc:
             # No sandbox -> nothing observed -> never "clean".
             print(f"Sandbox error: {exc}", file=sys.stderr)

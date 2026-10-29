@@ -82,6 +82,13 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
   - every `EXPECTED_COVERAGE_SUMMARY` entry in `scripts/check_fixtures.py`
     (#143: tool_error_server CLEAN under notes_readonly, with the coverage
     summary "1 of 2 tools returned errors")
+  - every `EXPECTED_SERVER_SETUP` entry in `scripts/check_fixtures.py`, with
+    `SETUP_ARGS`, `SETUP_ENV` and `SETUP_POLICIES` (#144:
+    setup_required_server with its setup CLEAN under no_network.v1 and
+    VIOLATIONS under read_only_folder.v1, exactly the write of
+    /tmp/work/setup_note.txt; without its setup INCOMPLETE), the work dir
+    `/tmp/work` made by sh before strace starts, and the refused `--env`
+    names in `REFUSED_ENV` in `sandglass/client.py`
   - `EXPECTED_EXIT_CODES` in `scripts/check_fixtures.py` (the exit code of
     every verdict: 0 CLEAN, 1 VIOLATIONS, 3 INCOMPLETE; 2 is a usage error)
   - the sandbox hardening flags (--network none, --read-only, non-root user,
