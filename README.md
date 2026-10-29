@@ -650,8 +650,12 @@ each folder in `PATH`) is shown as one entry, "looked for npm in PATH
 totals:
 
 - **ran**: the call returned a normal result;
-- **failed**: the call returned an MCP error (e.g. "not logged in"), raised,
-  or got no answer before the session ended;
+- **returned an error** (#143): the server answered with an error: a result
+  with `isError` set (e.g. "not logged in"), or a JSON-RPC error response.
+  Only these two MCP signals count; a result's text is never read, since a
+  tool that worked can return text that mentions an error;
+- **failed**: the call raised (e.g. the connection closed), got an
+  unexpected result, or got no answer before the session ended;
 - **timed out** (#140): no answer within 30 s; the server is then pinged, and
   if it still answers (anything, even an error), the next tool is called;
 - **not called** (#140): the calls had stopped before this tool: the time
@@ -664,8 +668,14 @@ A failing or timed-out call doesn't stop the run: the next tool is still
 called. Coverage is reported, not judged; it doesn't change the verdict,
 except that a run where no call completed (every call timed out or got no
 answer) is INCOMPLETE. A CLEAN verdict only covers what ran, so check this
-table: a tool that failed, timed out, or was not called or skipped may not
-have done what it would normally do.
+table: a tool that returned an error, failed, timed out, or was not called
+or skipped may not have done what it would normally do.
+
+So the verdict line says it too (#143), in the terminal, at the top of the
+Markdown report and as `coverage_summary` in the JSON: any tool that didn't
+run normally is counted next to the verdict, e.g. `CLEAN (but 6 of 9 tools
+returned errors)` or `VIOLATIONS (and 1 of 4 tools timed out, 1 not
+called)`. The verdict word and the exit code don't change.
 
 If the server is still running 1 s after the client closed its stdin (e.g.
 a tool stuck in a thread), the stdin relay stops it, so the trace still ends

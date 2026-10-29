@@ -1,7 +1,7 @@
 """A tiny MCP server for tests/test_coverage.py (#23), run on the host, never sandboxed.
 
 One tool for each coverage outcome: one that works, one that returns an MCP
-error, one whose input schema we can't satisfy (a string pattern), and one
+error result, one that answers with a JSON-RPC error, one whose input schema we can't satisfy (a string pattern), and one
 slower than the test's per-call timeout. It touches no files and no network.
 """
 
@@ -10,6 +10,8 @@ from typing import Annotated
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.shared.exceptions import MCPError
+from mcp.types import INVALID_PARAMS
 from pydantic import Field
 
 server = MCPServer("coverage_server")
@@ -23,6 +25,11 @@ def ok_tool(name: str) -> str:
 @server.tool(description="Always returns an MCP error, like a tool that needs a real account.")
 def error_tool(name: str) -> str:
     raise ToolError("not logged in: this tool needs an account")
+
+
+@server.tool(description="Always answers with a JSON-RPC error response, not a result (#143).")
+def rejected_tool(name: str) -> str:
+    raise MCPError(code=INVALID_PARAMS, message="rejected: unknown name")
 
 
 @server.tool(description="Needs a three-letter code; Sandglass can't build one from a pattern.")

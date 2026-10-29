@@ -92,6 +92,8 @@ import re
 from dataclasses import asdict
 from pathlib import Path
 
+from mcp.types import CONNECTION_CLOSED, REQUEST_TIMEOUT
+
 from sandglass import launcher, netsink, sandbox, stdin_relay
 from sandglass.policy import InstallBaseline, Policy
 from sandglass.trace_parser import MAX_TRACE_BYTES, NETWORK_SYSCALLS, UNREADABLE, Event, exec_argv
@@ -920,20 +922,36 @@ def with_install(result: dict, install: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 COVERAGE_REASON_CHARS = 200  # error texts are cut to this length in the coverage table
-COVERAGE_STATUSES = ("ran", "failed", "timed out", "not called", "skipped")
+COVERAGE_STATUSES = ("ran", "returned an error", "failed", "timed out", "not called", "skipped")
+COVERAGE_KEYS = {"returned an error": "returned_error"}  # its key in the totals
+# MCP errors that are not an answer from the server: the SDK raises them
+# itself when the call timed out or the connection closed (#143).
+NOT_AN_ANSWER_CODES = {REQUEST_TIMEOUT, CONNECTION_CLOSED}
+
+
+def _returned_an_error(call: dict) -> bool:
+    """The server answered the call with an error (#143): a result with
+    isError set, or a JSON-RPC error response. Only these two MCP signals
+    count; the result's text is never read, since a tool that worked can
+    return text that mentions an error."""
+    if call["status"] == "ERROR":
+        return True
+    return call["status"] == "FAILED" and call.get("error_code") not in NOT_AN_ANSWER_CODES | {None}
 
 
 def coverage(session: dict) -> dict:
     """One row per tool the server listed, plus totals:
 
-      ran         the call returned a normal result
-      failed      the call returned an MCP error (isError), raised, or got no
-                  answer before the session ended
-      timed out   no answer within the call's timeout (#140); the next tool
-                  was still called
-      not called  the calls had stopped first (#140): the time budget was
-                  used up, or the server stopped answering after a timeout
-      skipped     no valid input could be built (#22), or the session ended first
+      ran                the call returned a normal result
+      returned an error  the server answered with an error (#143): isError
+                         set, or a JSON-RPC error response
+      failed             the call raised, got an unexpected result, or got no
+                         answer before the session ended
+      timed out          no answer within the call's timeout (#140); the next
+                         tool was still called
+      not called         the calls had stopped first (#140): the time budget
+                         was used up, or the server stopped answering after a timeout
+      skipped            no valid input could be built (#22), or the session ended first
 
     Coverage is reported, not judged: it never changes the verdict.
     """
@@ -951,7 +969,8 @@ def coverage(session: dict) -> dict:
                 rows.append({"tool": name, "status": "timed out", "reason": call["result"]})
             else:
                 text = " ".join(str(call["result"]).split())[:COVERAGE_REASON_CHARS]
-                rows.append({"tool": name, "status": "failed", "reason": f"{call['status']}: {text}"})
+                status = "returned an error" if _returned_an_error(call) else "failed"
+                rows.append({"tool": name, "status": status, "reason": f"{call['status']}: {text}"})
         elif name in skipped:
             rows.append({"tool": name, "status": "skipped", "reason": skipped[name]})
         elif name in not_called:
@@ -961,8 +980,10 @@ def coverage(session: dict) -> dict:
             rows.append({"tool": name, "status": "skipped",
                          "reason": f"not called, the session ended first{why}"})
 
-    # Totals keys use "_" for the statuses with a space: timed_out, not_called.
-    totals = {status.replace(" ", "_"): sum(1 for r in rows if r["status"] == status)
+    # Totals keys use "_" for the statuses with a space: timed_out, not_called;
+    # "returned an error" is returned_error.
+    totals = {COVERAGE_KEYS.get(status, status.replace(" ", "_")):
+              sum(1 for r in rows if r["status"] == status)
               for status in COVERAGE_STATUSES}
     totals["total"] = len(rows)
     note = None
@@ -970,6 +991,38 @@ def coverage(session: dict) -> dict:
         note = ("the server's tool list was never received" if session.get("error")
                 else "the server listed no tools")
     return {"tools": rows, "totals": totals, "note": note}
+
+
+# The coverage summary's wording (#143), in this order; only counts above 0 show.
+SUMMARY_WORDS = [("returned_error", "returned errors"), ("failed", "failed"),
+                 ("timed_out", "timed out"), ("not_called", "not called"), ("skipped", "skipped")]
+
+
+def coverage_summary(cov: dict | None) -> str | None:
+    """Every tool that didn't run normally, in one phrase for the verdict line
+    (#143), e.g. "6 of 9 tools returned errors" or "1 of 4 tools timed out,
+    1 not called". None if every tool ran, or if no tools were listed (the
+    coverage note and the INCOMPLETE reasons say why). Any count shows: a
+    CLEAN verdict only covers what ran."""
+    if not cov or not cov["tools"]:
+        return None
+    t = cov["totals"]
+    parts = [f"{t[key]} {words}" for key, words in SUMMARY_WORDS if t.get(key)]
+    if not parts:
+        return None
+    # The first part names the total: "6 of 9 tools returned errors".
+    count, words = parts[0].split(" ", 1)
+    parts[0] = f"{count} of {t['total']} {'tool' if t['total'] == 1 else 'tools'} {words}"
+    return ", ".join(parts)
+
+
+def verdict_line(r: dict) -> str:
+    """The verdict with its coverage summary (#143): "but" after CLEAN, "and"
+    otherwise. The verdict word itself never changes."""
+    summary = r.get("coverage_summary")
+    if not summary:
+        return r["verdict"]
+    return f"{r['verdict']} ({'but' if r['verdict'] == 'CLEAN' else 'and'} {summary})"
 
 
 # ---------------------------------------------------------------------------
@@ -1067,7 +1120,7 @@ def summary_lines(r: dict) -> list[str]:
     of raw events, as in the JSON; the entries are the groups. An entry of one
     event prints as it always did."""
     groups = r["violation_groups"]
-    lines = [f"Verdict: {r['verdict']}  (violations: {len(r['violations'])} in {len(groups)} "
+    lines = [f"Verdict: {verdict_line(r)}  (violations: {len(r['violations'])} in {len(groups)} "
              f"{'entry' if len(groups) == 1 else 'entries'}, attempted: {len(r['attempted'])}, "
              f"probes: {len(r['probes'])})"]
     lines += [f"  incomplete: {reason}" for reason in r["incomplete_reasons"]]
@@ -1117,10 +1170,13 @@ def build_report(server: str, timestamp: str, policy: Policy, session: dict,
     `package` (scan mode, #19): what was scanned, downloaded and installed.
     `trace_file` is None if the server never ran.
     """
+    cov = coverage(session)
     return {
         "server": server,
         "timestamp": timestamp,
         "verdict": result["verdict"],
+        # The tools that didn't run normally, shown next to the verdict (#143); None if all ran.
+        "coverage_summary": coverage_summary(cov),
         "incomplete_reasons": result["incomplete_reasons"],
         "package": package,
         # Paths as text; the baseline's exec_exact entries (#142) stay mappings.
@@ -1132,7 +1188,7 @@ def build_report(server: str, timestamp: str, policy: Policy, session: dict,
         "trace_file": str(trace_file) if trace_file else None,
         "exercised": session.get("calls", []),
         "tools": session.get("tools", []),
-        "coverage": coverage(session),  # ran / failed / skipped per tool (#23)
+        "coverage": cov,  # ran / returned an error / failed / ... per tool (#23, #143)
         "violations": result["violations"],  # every event, never grouped
         # The same violations as report entries (#141), for the summary and the Markdown.
         "violation_groups": group_violations(result["violations"], result["domains"],
@@ -1168,7 +1224,7 @@ def _markdown(r: dict) -> str:
     out = [
         f"# Sandglass report: {r['server']}",
         "",
-        f"**Verdict: {r['verdict']}**",
+        f"**Verdict: {r['verdict']}**" + verdict_line(r).removeprefix(r["verdict"]),
         "",
         f"- Run: `{r['timestamp']}`",
         f"- Policy: `{r['policy']['name']}`",
@@ -1262,7 +1318,8 @@ def _coverage_section(r: dict) -> list[str]:
         return []
     t = cov["totals"]
     lines = ["", "## Coverage", "",
-             f"Ran {t['ran']} · Failed {t['failed']} · Timed out {t.get('timed_out', 0)}"
+             f"Ran {t['ran']} · Returned an error {t.get('returned_error', 0)}"
+             f" · Failed {t['failed']} · Timed out {t.get('timed_out', 0)}"
              f" · Not called {t.get('not_called', 0)} · Skipped {t['skipped']} · Total {t['total']}"
              " (each tool is called once, with one input; see the README)", ""]
     if cov["note"]:

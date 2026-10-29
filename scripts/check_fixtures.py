@@ -193,6 +193,13 @@ EXPECTED_TIMEOUTS = {
 # that "Programs run" must list). A listen()'s target is its fd and backlog,
 # e.g. "8, 128"; the fd varies, so it's written "<fd>, 128" (see normalized).
 UNAME_NOTE = "Python's platform module (platform.processor()) (baseline: python312_slim)"
+# (#143) A tool that returned an error is shown next to the verdict, which
+# itself doesn't change. Under notes_readonly.
+# fixture -> (expected verdict, expected violations, expected coverage summary)
+EXPECTED_COVERAGE_SUMMARY = {
+    "tool_error_server.py": ("CLEAN", set(), "1 of 2 tools returned errors"),
+}
+
 EXPECTED_RUNTIME = {
     # /dev/null O_RDWR, the overcommit_memory read, bind ::1 port 0, uname -p.
     "runtime_noise_server.py": ("CLEAN", set(), [(["uname", "-p"], UNAME_NOTE)]),
@@ -514,6 +521,14 @@ def main() -> int:
             failures.append(f"{fixture}: expected server stopped by Sandglass: {want_stopped}, "
                             f"got note {report.get('server_stopped_note')!r}")
 
+    for fixture, (want_verdict, want_violations, want_summary) in EXPECTED_COVERAGE_SUMMARY.items():
+        print(f"\n===== {fixture} =====")
+        report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, POLICY)
+        failures += check(fixture, report, want_verdict, want_violations)
+        if report.get("coverage_summary") != want_summary:
+            failures.append(f"{fixture}: expected coverage summary {want_summary!r}, "
+                            f"got {report.get('coverage_summary')!r}")
+
     build_test_packages()
     for package, (want_verdict, want_violations) in EXPECTED_SCANS.items():
         print(f"\n===== scan {package} =====")
@@ -557,6 +572,7 @@ def main() -> int:
     if not failures:
         total = (len(EXPECTED) + len(EXPECTED_V04) + len(EXPECTED_POLICY_RUNS) + len(EXPECTED_HOSTILE)
                  + len(EXPECTED_OLD_DOCKER) + len(EXPECTED_TIMEOUTS) + len(EXPECTED_RUNTIME)
+                 + len(EXPECTED_COVERAGE_SUMMARY)
                  + len(EXPECTED_SCANS) + len(EXPECTED_NPM_REGISTRY_SCANS))
         print(f"all {total} fixtures match expectations")
     return 1 if failures else 0
