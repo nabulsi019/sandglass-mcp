@@ -37,7 +37,7 @@ from mcp.types import REQUEST_TIMEOUT, CallToolResult, TextContent, Tool
 from sandglass import PROJECT_ROOT, sandbox, scan
 from sandglass.compare import (build_report, compare, compare_install, not_run, setup_line, summary_lines,
                                with_install, write_reports)
-from sandglass.inputs import InputError, build_arguments
+from sandglass.inputs import DEFAULT_MODE, MODES, InputError, arguments_of, build_arguments, build_inputs
 from sandglass.policy import (BASELINE_FILES, Policy, PolicyError, check_scan_paths,
                               load_install_baseline, load_policy)
 from sandglass.trace_parser import parse_trace_file
@@ -110,20 +110,29 @@ def parse_server_env(items: list[str]) -> dict[str, str]:
     return env
 
 
-def server_setup(command: list[str], server_args: list[str], server_env: dict) -> dict:
+def server_setup(command: list[str], server_args: list[str], server_env: dict,
+                 inputs_mode: str = DEFAULT_MODE) -> dict:
     """The server setup for the report (#144): the arguments as given, the
-    environment's NAMES only (values are never recorded), the work dir, and a
-    command line that reproduces the run, with the values redacted."""
-    full = (command + [f"--server-arg={arg}" for arg in server_args]
+    environment's NAMES only (values are never recorded), the work dir, the
+    input mode (#145), and a command line that reproduces the run, with the
+    values redacted."""
+    full = (command + ["--inputs", inputs_mode] + [f"--server-arg={arg}" for arg in server_args]
             + [f"--env={name}=<redacted>" for name in server_env])
     return {"args": list(server_args), "env": list(server_env),
-            "workdir": str(sandbox.CONTAINER_WORKDIR), "command": shlex.join(full)}
+            "workdir": str(sandbox.CONTAINER_WORKDIR), "inputs": inputs_mode,
+            "command": shlex.join(full)}
 
 
 def build_safe_arguments(tool: Tool) -> dict:
     """Build a harmless, valid argument dict from the tool's JSON input schema
     (see sandglass/inputs.py). Raises InputError if the schema is unsupported."""
     return build_arguments(tool.input_schema)
+
+
+def build_tool_inputs(tool: Tool, inputs_mode: str = DEFAULT_MODE) -> dict:
+    """{argument: {"value", "source"}} for one call in the given input mode
+    (#145, see sandglass/inputs.py). Raises InputError like build_safe_arguments."""
+    return build_inputs(tool.input_schema, tool.description, inputs_mode)
 
 
 def result_text(result) -> tuple[str, str]:
@@ -168,8 +177,9 @@ def new_session_record() -> dict:
     were called (status OK, ERROR, UNEXPECTED, TIMED OUT, FAILED, or NO ANSWER
     if the session ended during the call; a FAILED call that raised an MCP
     error also has its "error_code", #143); skipped: tools we couldn't build
-    an input for; not_called: tools left when the calls stopped (#140)."""
-    return {"tools": [], "calls": [], "skipped": [], "not_called": []}
+    an input for; not_called: tools left when the calls stopped (#140);
+    inputs: per called tool, each argument's value and source (#145)."""
+    return {"tools": [], "calls": [], "skipped": [], "not_called": [], "inputs": {}}
 
 
 def is_timeout(exc: BaseException) -> bool:
@@ -190,7 +200,7 @@ async def server_answers_ping(session: ClientSession) -> bool:
 
 
 async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr,
-              session_record: dict | None = None) -> dict:
+              session_record: dict | None = None, inputs_mode: str = DEFAULT_MODE) -> dict:
     """Run one MCP session and return a record of what was exercised.
 
     `errlog` receives the subprocess's stderr. In the sandbox that stream is
@@ -198,6 +208,7 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
     `session_record` is filled in as the session goes, so if the session
     fails half-way the caller still has everything recorded until then (#23).
     The calls share TIME_BUDGET_SECONDS, counted from the start (#140).
+    `inputs_mode` (#145): how each tool's input is built (minimal, schema, described).
     """
     if session_record is None:
         session_record = new_session_record()
@@ -220,7 +231,8 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
             stop_reason = None  # set once no more tools may be called (#140)
             for tool in tools:
                 try:
-                    args = build_safe_arguments(tool)
+                    inputs = build_tool_inputs(tool, inputs_mode)
+                    args = arguments_of(inputs)
                 except InputError as exc:
                     # Not guessed: the tool isn't called, and the report says why.
                     print(f"Skipping {tool.name}: no valid input ({exc})")
@@ -235,6 +247,11 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
                     session_record["not_called"].append({"tool": tool.name, "reason": stop_reason})
                     continue
                 print(f"Calling {tool.name}({args})")
+                # Where each value came from (#145), e.g. timezone from its description.
+                session_record["inputs"][tool.name] = inputs
+                if inputs:
+                    print("  inputs from: " + ", ".join(f"{name} = {entry['source']}"
+                                                        for name, entry in inputs.items()))
                 # Recorded BEFORE the call, so a session that dies during it
                 # still shows the call was made and never answered (#23).
                 call = {"tool": tool.name, "arguments": args, "status": "NO ANSWER",
@@ -264,20 +281,21 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
     return session_record
 
 
-def run_host(server_script: Path) -> None:
+def run_host(server_script: Path, inputs_mode: str = DEFAULT_MODE) -> None:
     """Original behaviour: run the server directly, no tracing, no report."""
     # Start the server with the same Python interpreter running this client,
     # so it sees the same installed packages (the project's .venv). A .js
     # server runs with the `node` on your PATH.
     command = "node" if sandbox.runtime_for(server_script) == "node" else sys.executable
     params = StdioServerParameters(command=command, args=[str(server_script)])
-    asyncio.run(run(params, server_script.name))
+    asyncio.run(run(params, server_script.name, inputs_mode=inputs_mode))
 
 
 def run_sandboxed(server_script: Path, policy_path: Path, server_args: list[str] = (),
-                  server_env: dict | None = None) -> dict:
+                  server_env: dict | None = None, inputs_mode: str = DEFAULT_MODE) -> dict:
     """Run the server in Docker under strace, compare, write and return the report.
-    `server_args`, `server_env`: --server-arg and --env (#144), already checked."""
+    `server_args`, `server_env`: --server-arg and --env (#144), already checked.
+    `inputs_mode`: --inputs (#145)."""
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     server = server_script.stem
 
@@ -291,7 +309,7 @@ def run_sandboxed(server_script: Path, policy_path: Path, server_args: list[str]
 
     server_env = server_env or {}
     setup = server_setup(["sandglass", str(server_script.relative_to(PROJECT_ROOT)),
-                          "--policy", str(policy_path), "--sandbox"], server_args, server_env)
+                          "--policy", str(policy_path), "--sandbox"], server_args, server_env, inputs_mode)
     command, args = sandbox.docker_command(server_script, server_args, list(server_env))
     path_mapping = {
         str(sandbox.CONTAINER_PROJECT): f"{PROJECT_ROOT} (read-only)",
@@ -320,6 +338,7 @@ def _trace_and_report(server: str, timestamp: str, command: str, args: list[str]
     """
     if setup:
         print(f"Server setup: {setup_line(setup)}")
+        print(f"Inputs: {setup.get('inputs', DEFAULT_MODE)} mode")
     # Written on the HOST from the container's stderr (strace's output). The
     # container never sees this file: reports/ is hidden inside it.
     trace_file = _trace_dir(server, timestamp) / sandbox.TRACE_FILENAME
@@ -333,7 +352,9 @@ def _trace_and_report(server: str, timestamp: str, command: str, args: list[str]
         try:
             # run() keeps to the time budget itself (#140); this is only the
             # safety net for a handshake or shutdown that hangs.
-            asyncio.run(asyncio.wait_for(run(params, server, trace_out, session),
+            # The input mode is recorded in the setup (#145); fixture mode and scans always have one.
+            inputs_mode = (setup or {}).get("inputs", DEFAULT_MODE)
+            asyncio.run(asyncio.wait_for(run(params, server, trace_out, session, inputs_mode),
                                          TIME_BUDGET_SECONDS + SESSION_GRACE_SECONDS))
         except BaseException as exc:  # includes ExceptionGroup from anyio task groups
             if isinstance(exc, KeyboardInterrupt):
@@ -402,17 +423,18 @@ def _scan_policy(policy_path: Path, server_path: str, multiarch: str, runtime: s
 
 def run_scan(spec: scan.PackageSpec, policy_path: Path, registry_dir: Path | None = None,
              entry: str | None = None, server_args: list[str] = (),
-             server_env: dict | None = None) -> dict:
+             server_env: dict | None = None, inputs_mode: str = DEFAULT_MODE) -> dict:
     """Download (host), install (sandbox), run and trace one package; return the report.
 
     Any failing step makes a report too, with verdict INCOMPLETE and the reason.
     `server_args`, `server_env`: --server-arg and --env (#144), already checked.
+    `inputs_mode`: --inputs (#145).
     """
     server_env = server_env or {}
     setup = server_setup(["sandglass", "scan", str(spec), "--policy", str(policy_path)]
                          + (["--entry", entry] if entry else [])
                          + (["--registry-dir", str(registry_dir)] if registry_dir else []),
-                         server_args, server_env)
+                         server_args, server_env, inputs_mode)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     multiarch = sandbox.detect_multiarch()
     runtime = "node" if spec.ecosystem == "npm" else "python"
@@ -505,6 +527,10 @@ def add_setup_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
                         help="an environment variable for the server (repeatable). Fake values "
                              "only; the report records the name, never the value")
+    parser.add_argument("--inputs", choices=MODES, default=DEFAULT_MODE,
+                        help="how each tool's input is built (#145): minimal (required arguments, "
+                             "plain values), schema (the JSON schema only), described (the schema, "
+                             f"then examples in the descriptions). Default: {DEFAULT_MODE}")
 
 
 def checked_env(parser: argparse.ArgumentParser, args: argparse.Namespace) -> dict[str, str]:
@@ -550,7 +576,8 @@ def scan_main(argv: list[str]) -> None:
     registry_dir = args.registry_dir.resolve() if args.registry_dir else None
 
     try:
-        report = run_scan(spec, args.policy, registry_dir, args.entry, args.server_arg, server_env)
+        report = run_scan(spec, args.policy, registry_dir, args.entry, args.server_arg, server_env,
+                          args.inputs)
     except sandbox.SandboxError as exc:
         print(f"Sandbox error: {exc}", file=sys.stderr)
         sys.exit(EXIT_CODES["INCOMPLETE"])
@@ -589,7 +616,7 @@ def main() -> None:
         if not server_script.is_relative_to(PROJECT_ROOT):
             parser.error("--sandbox only mounts the project, so the server must be inside it")
         try:
-            report = run_sandboxed(server_script, args.policy, args.server_arg, server_env)
+            report = run_sandboxed(server_script, args.policy, args.server_arg, server_env, args.inputs)
         except sandbox.SandboxError as exc:
             # No sandbox -> nothing observed -> never "clean".
             print(f"Sandbox error: {exc}", file=sys.stderr)
@@ -598,7 +625,7 @@ def main() -> None:
 
     if args.policy:
         print_policy(load_policy(args.policy, server_script=server_script), enforced=False)
-    run_host(server_script)
+    run_host(server_script, args.inputs)
 
 
 if __name__ == "__main__":

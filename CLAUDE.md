@@ -89,6 +89,11 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
     /tmp/work/setup_note.txt; without its setup INCOMPLETE), the work dir
     `/tmp/work` made by sh before strace starts, and the refused `--env`
     names in `REFUSED_ENV` in `sandglass/client.py`
+  - every `EXPECTED_INPUT_MODES` entry in `scripts/check_fixtures.py` (#145:
+    described_input_server CLEAN under notes_readonly with `--inputs described`,
+    its timezone "America/New_York" from param-description, no coverage
+    summary; with `--inputs minimal` CLEAN with the coverage summary
+    "1 of 1 tool returned errors", its timezone "hello" from fallback)
   - `EXPECTED_EXIT_CODES` in `scripts/check_fixtures.py` (the exit code of
     every verdict: 0 CLEAN, 1 VIOLATIONS, 3 INCOMPLETE; 2 is a usage error)
   - the sandbox hardening flags (--network none, --read-only, non-root user,

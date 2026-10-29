@@ -100,7 +100,9 @@ def test_scan_passes_the_setup_on(monkeypatch):
     with pytest.raises(SystemExit):
         client.scan_main(["pypi:x@1.0", "--policy", str(POLICY), "--server-arg", "stdio",
                           "--server-arg=--db-path", "--env", "MEMORY_FILE_PATH=/tmp/work/m.jsonl"])
-    assert seen["args"][4:] == (["stdio", "--db-path"], {"MEMORY_FILE_PATH": "/tmp/work/m.jsonl"})
+    # Then the input mode (#145), the default when --inputs isn't given.
+    assert seen["args"][4:] == (["stdio", "--db-path"], {"MEMORY_FILE_PATH": "/tmp/work/m.jsonl"},
+                                "described")
 
 
 # --- the docker command: values never on a command line --------------------------
@@ -183,8 +185,9 @@ def test_the_client_gives_values_to_docker_through_its_environment(monkeypatch, 
     # The report: names only, never the value, and a command that reproduces the run.
     assert report["server_setup"] == {
         "args": ["--note-name", "setup_note"], "env": ["SETUP_TEST_TOKEN"], "workdir": "/tmp/work",
+        "inputs": "described",
         "command": "sandglass test_servers/setup_required_server.py --policy "
-                   f"{POLICY} --sandbox --server-arg=--note-name --server-arg=setup_note "
+                   f"{POLICY} --sandbox --inputs described --server-arg=--note-name --server-arg=setup_note "
                    "'--env=SETUP_TEST_TOKEN=<redacted>'"}
     assert report["path_mapping"]["/tmp/work"].startswith("the server's working directory")
     for path in tmp_path.glob("*_*.*"):
@@ -203,7 +206,7 @@ def test_markdown_header_shows_the_setup():
     md = _markdown(report)
     assert ('- Server setup: arguments `["stdio"]`, environment `MEMORY_FILE_PATH` (values not recorded),'
             ' work dir `/tmp/work`') in md
-    assert ("- Reproduce: `sandglass scan pypi:x@1.0 --policy p.yaml --server-arg=stdio "
+    assert ("- Reproduce: `sandglass scan pypi:x@1.0 --policy p.yaml --inputs described --server-arg=stdio "
             "'--env=MEMORY_FILE_PATH=<redacted>'`") in md
     assert "/tmp/work/m.jsonl" not in md and "/tmp/work/m.jsonl" not in json.dumps(report)
 

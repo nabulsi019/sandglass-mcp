@@ -1198,6 +1198,10 @@ def build_report(server: str, timestamp: str, policy: Policy, session: dict,
         "path_mapping": path_mapping,
         "trace_file": str(trace_file) if trace_file else None,
         "exercised": session.get("calls", []),
+        # How the inputs were built (#145): the mode, and per called tool each
+        # argument's {"value", "source"}, e.g. "param-description".
+        "input_mode": (server_setup or {}).get("inputs"),
+        "inputs": session.get("inputs", {}),
         "tools": session.get("tools", []),
         "coverage": cov,  # ran / returned an error / failed / ... per tool (#23, #143)
         "violations": result["violations"],  # every event, never grouped
@@ -1241,6 +1245,8 @@ def _markdown(r: dict) -> str:
         f"- Policy: `{r['policy']['name']}`",
         *([f"- Server setup: {setup_line(r['server_setup'])}",
            f"- Reproduce: `{r['server_setup']['command']}`"] if r.get("server_setup") else []),
+        *([f"- Inputs: `{r['input_mode']}` mode (where each value came from: \"Tools exercised\")"]
+          if r.get("input_mode") else []),
         f"- Baseline: `{r['baseline']['name']}` (`{r['baseline']['file']}`,"
         f" multiarch `{r['baseline']['multiarch']}`; reads only)",
         f"- Trace: `{r['trace_file']}`" if r["trace_file"] else "- Trace: none (the server was not run)",
@@ -1257,10 +1263,14 @@ def _markdown(r: dict) -> str:
 
     out += ["", "## Tools exercised", ""]
     if r["exercised"]:
-        out += ["| Tool | Input | Status | Result |", "|---|---|---|---|"]
+        out += ["| Tool | Input | Input sources | Status | Result |", "|---|---|---|---|---|"]
         for c in r["exercised"]:
             result = str(c["result"]).replace("|", "\\|").replace("\n", " ")
-            out.append(f"| `{c['tool']}` | `{json.dumps(c['arguments'])}` | {c['status']} | {result} |")
+            # Where each argument's value came from (#145), e.g. "`timezone`: param-description".
+            inputs = (r.get("inputs") or {}).get(c["tool"], {})
+            sources = ", ".join(f"`{name}`: {entry['source']}" for name, entry in inputs.items()) or "-"
+            arguments = json.dumps(c["arguments"]).replace("|", "\\|")
+            out.append(f"| `{c['tool']}` | `{arguments}` | {sources} | {c['status']} | {result} |")
     else:
         out.append("None.")
 
