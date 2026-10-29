@@ -219,6 +219,17 @@ EXPECTED_SERVER_SETUP = {
         "INCOMPLETE", set(), ["needs the arguments --note-name setup_note"]),
 }
 
+# (#145) The input modes: a tool that only works with the example in its
+# argument's description. Under notes_readonly.
+# (fixture, --inputs mode) -> (expected verdict, expected violations, expected
+# coverage summary (None: every tool ran), the timezone input and its source)
+EXPECTED_INPUT_MODES = {
+    ("described_input_server.py", "described"): (
+        "CLEAN", set(), None, {"value": "America/New_York", "source": "param-description"}),
+    ("described_input_server.py", "minimal"): (
+        "CLEAN", set(), "1 of 1 tool returned errors", {"value": "hello", "source": "fallback"}),
+}
+
 EXPECTED_RUNTIME = {
     # /dev/null O_RDWR, the overcommit_memory read, bind ::1 port 0, uname -p.
     "runtime_noise_server.py": ("CLEAN", set(), [(["uname", "-p"], UNAME_NOTE)]),
@@ -548,6 +559,20 @@ def main() -> int:
             failures.append(f"{fixture}: expected coverage summary {want_summary!r}, "
                             f"got {report.get('coverage_summary')!r}")
 
+    for (fixture, mode), (want_verdict, want_violations, want_summary, want_input) \
+            in EXPECTED_INPUT_MODES.items():
+        label = f"{fixture} with --inputs {mode}"
+        print(f"\n===== {label} =====")
+        report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, POLICY, [], {}, mode)
+        failures += check(label, report, want_verdict, want_violations)
+        if report.get("coverage_summary") != want_summary:
+            failures.append(f"{label}: expected coverage summary {want_summary!r}, "
+                            f"got {report.get('coverage_summary')!r}")
+        got_input = (report.get("inputs") or {}).get("timezone_offset", {}).get("timezone")
+        if report.get("input_mode") != mode or got_input != want_input:
+            failures.append(f"{label}: expected mode {mode} and input {want_input}, "
+                            f"got {report.get('input_mode')} {got_input}")
+
     for (fixture, policy_name, with_setup), (want_verdict, want_violations, want_reasons) \
             in EXPECTED_SERVER_SETUP.items():
         label = f"{fixture} under {policy_name}, {'with' if with_setup else 'without'} its setup"
@@ -608,7 +633,7 @@ def main() -> int:
     if not failures:
         total = (len(EXPECTED) + len(EXPECTED_V04) + len(EXPECTED_POLICY_RUNS) + len(EXPECTED_HOSTILE)
                  + len(EXPECTED_OLD_DOCKER) + len(EXPECTED_TIMEOUTS) + len(EXPECTED_RUNTIME)
-                 + len(EXPECTED_COVERAGE_SUMMARY) + len(EXPECTED_SERVER_SETUP)
+                 + len(EXPECTED_COVERAGE_SUMMARY) + len(EXPECTED_SERVER_SETUP) + len(EXPECTED_INPUT_MODES)
                  + len(EXPECTED_SCANS) + len(EXPECTED_NPM_REGISTRY_SCANS))
         print(f"all {total} fixtures match expectations")
     return 1 if failures else 0

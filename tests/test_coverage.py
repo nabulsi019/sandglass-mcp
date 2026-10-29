@@ -66,7 +66,9 @@ def test_a_failing_call_does_not_stop_the_other_tools(monkeypatch):
     # A real MCP session with the fake server, on the host (no Docker).
     monkeypatch.setattr(client, "CALL_TIMEOUT_SECONDS", 1)
     params = StdioServerParameters(command=sys.executable, args=[str(FAKE_SERVER)])
-    record = asyncio.run(client.run(params, "coverage_server"))
+    # The schema mode (#145) can't build pattern_tool's input, so it is skipped;
+    # the described mode tries a few strings against the pattern (see below).
+    record = asyncio.run(client.run(params, "coverage_server", inputs_mode="schema"))
     statuses = {row["tool"]: (row["status"], row["reason"]) for row in coverage(record)["tools"]}
     assert statuses["ok_tool"] == ("ran", None)
     # isError result and JSON-RPC error response: both are the server's answer (#143).
@@ -79,6 +81,18 @@ def test_a_failing_call_does_not_stop_the_other_tools(monkeypatch):
     assert statuses["slow_tool"] == ("timed out", "no answer within 1 s")
 
 
+def test_described_mode_calls_the_pattern_tool(monkeypatch):
+    # #145: "ABC" matches ^[A-Z]{3}$, so the default mode calls the tool the
+    # schema mode skips, and records where the value came from.
+    monkeypatch.setattr(client, "CALL_TIMEOUT_SECONDS", 1)
+    params = StdioServerParameters(command=sys.executable, args=[str(FAKE_SERVER)])
+    record = asyncio.run(client.run(params, "coverage_server"))
+    statuses = {row["tool"]: row["status"] for row in coverage(record)["tools"]}
+    assert statuses["pattern_tool"] == "ran"
+    assert record["inputs"]["pattern_tool"] == {"code": {"value": "ABC", "source": "pattern"}}
+    assert record["inputs"]["ok_tool"] == {"name": {"value": "hello", "source": "fallback"}}
+
+
 def test_a_session_that_fails_half_way_keeps_what_ran(monkeypatch):
     # run() fills the caller's record as it goes (#23), so a session timeout
     # after the first calls doesn't wipe them.
@@ -86,7 +100,9 @@ def test_a_session_that_fails_half_way_keeps_what_ran(monkeypatch):
     params = StdioServerParameters(command=sys.executable, args=[str(FAKE_SERVER)])
     record = client.new_session_record()
     try:
-        asyncio.run(asyncio.wait_for(client.run(params, "coverage_server", session_record=record), 2))
+        # Schema mode (#145): pattern_tool is skipped, so only ok_tool "ran".
+        asyncio.run(asyncio.wait_for(client.run(params, "coverage_server", session_record=record,
+                                                inputs_mode="schema"), 2))
     except TimeoutError:
         record["error"] = "TimeoutError: "
     cov = coverage(record)

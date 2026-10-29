@@ -1,7 +1,8 @@
 """A tiny MCP server for tests/test_coverage.py (#23), run on the host, never sandboxed.
 
 One tool for each coverage outcome: one that works, one that returns an MCP
-error result, one that answers with a JSON-RPC error, one whose input schema we can't satisfy (a string pattern), and one
+error result, one that answers with a JSON-RPC error, one whose input schema the
+schema mode can't satisfy (a string pattern; the described mode tries "ABC", #145), and one
 slower than the test's per-call timeout. It touches no files and no network.
 """
 
@@ -32,7 +33,7 @@ def rejected_tool(name: str) -> str:
     raise MCPError(code=INVALID_PARAMS, message="rejected: unknown name")
 
 
-@server.tool(description="Needs a three-letter code; Sandglass can't build one from a pattern.")
+@server.tool(description="Needs a three-letter code; the schema mode can't build one from a pattern (#145).")
 def pattern_tool(code: Annotated[str, Field(pattern="^[A-Z]{3}$")]) -> str:
     return code
 

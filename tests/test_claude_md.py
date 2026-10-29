@@ -60,6 +60,15 @@ def test_every_coverage_summary_fixture_is_protected():
             f"EXPECTED_COVERAGE_SUMMARY entry {fixture} is not in CLAUDE.md's protected items"
 
 
+def test_every_input_mode_fixture_is_protected():
+    # (#145) the described-input fixture in both modes, with its summary and inputs.
+    assert "`EXPECTED_INPUT_MODES`" in PROTECTED
+    for (fixture, mode), (_, _, summary, want_input) in check_fixtures.EXPECTED_INPUT_MODES.items():
+        assert fixture.removesuffix(".py") in PROTECTED and f"`--inputs {mode}`" in PROTECTED
+        assert summary is None or summary in PROTECTED
+        assert want_input["value"] in PROTECTED and want_input["source"] in PROTECTED
+
+
 def test_every_server_setup_fixture_is_protected():
     # (#144) the setup fixture, its setup, its policies, and the refused --env names.
     from sandglass import client

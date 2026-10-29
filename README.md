@@ -27,7 +27,7 @@ sandglass/
   trace_parser.py    strace output -> file / probe / process / network / exit events
   compare.py         Events vs policy -> verdict, violations, report files
   policy.py          Loads + validates a policy (and the container baseline)
-  inputs.py          Builds one valid tool input from a tool's JSON schema
+  inputs.py          Builds one valid tool input from a tool's JSON schema and descriptions
   scan.py            `sandglass scan`: package spec, download on the host, install in the sandbox
   baselines/
     python312_slim.yaml   System files python:3.12-slim-trixie reads at startup (reads only)
@@ -337,6 +337,42 @@ uv run sandglass scan npm:@modelcontextprotocol/server-memory@2.0.0 --policy pol
 uv run sandglass scan pypi:arxiv-mcp-server@0.8.2 --policy policies/templates/no_network.v1.yaml \
     --server-arg=--storage-path --server-arg /tmp/work/papers
 ```
+
+### Tool inputs: `--inputs minimal|schema|described` (#145)
+
+Each tool is called once, with one input built from its JSON schema and its
+descriptions (`sandglass/inputs.py`). Both `sandglass scan` and
+`sandglass <server> --sandbox` take `--inputs`:
+
+| Mode | Input |
+|---|---|
+| `minimal` | required arguments only, a plain value per type: `"hello"`, `0`, `false`, `[]`, `{}`. The naive baseline, for comparing modes. |
+| `schema` | the schema alone (#22): `const`/`enum`/`default`/`examples`, a value per format, numbers inside their bounds, nested objects filled in. A `pattern` skips the tool. |
+| `described` (default) | per argument, the first of: `const` > `enum` (first value) > `default` > `examples` > an example in the argument's description > a URL in the tool's description > a format hint > a string matching the `pattern` > the number bounds > the `schema` mode's value. |
+
+An example in a description is the first quoted token (`'...'`, `"..."` or
+`` `...` ``) after "e.g.", "eg.", "for example", "example:" or "such as", in
+the same sentence: `IANA timezone name (e.g., 'America/New_York')` gives
+`America/New_York`; for an array, `(e.g. ['cs.LG', 'cs.AI'])` gives
+`["cs.LG"]`. A token that is empty, has a newline or is over 200 characters
+is ignored, and so is one that isn't the argument's type (`'ten'` for an
+integer). A URL from the tool's description is only used for arguments
+named like `url`/`uri`/`link` or with format `uri`. Format hints: `date`
+2024-01-15, `date-time` 2024-01-15T12:00:00Z, `uri` https://example.com/,
+`email` user@example.com, `uuid` a fixed valid UUID, `time` 12:00. All of
+it is deterministic: no LLM, no network.
+
+The report records the mode in its header and in the reproduce command,
+and every argument's value with its source (`const`, `enum`, `default`,
+`examples`, `param-description`, `tool-description`, `format`, `pattern`,
+`bounds`, `fallback`) in the JSON's `inputs` and the "Tools exercised"
+table.
+
+**Safety:** description examples are the server's own text, so a hostile
+server can choose its own inputs. That is acceptable: Sandglass judges what
+the server *does*, not what it was asked. The values are only sent to the
+tool, never interpreted by Sandglass (no path is created, nothing is run),
+and are capped at 200 characters.
 
 ### What the sandbox does
 
@@ -846,11 +882,15 @@ below are from each project's own paper or documentation.
   (13, "trixie": strace 6.13, Node.js 20), so a rebuild can't silently switch
   release; moving to a new one means re-checking the baselines and the trace parser.
 - **Only one call per tool, with one example input.** The input is built
-  from the tool's JSON schema (`sandglass/inputs.py`, #22): the schema's own
-  `const`/`enum`/`default`/`examples` first, otherwise a simple value per type
-  (`"hello"` for strings, `1` for numbers, inside any min/max), nested objects
-  and arrays filled in, local `$ref`s followed. A tool whose schema we can't
-  satisfy (e.g. a string `pattern`) is skipped, not guessed. Behaviour behind
+  from the tool's JSON schema and, in the default `described` mode, the
+  examples its descriptions give (`sandglass/inputs.py`, #22, #145; see
+  "Tool inputs" above): the schema's own `const`/`enum`/`default`/`examples`
+  first, then description examples and hints, otherwise a simple value per
+  type (`"hello"` for strings, `1` for numbers, inside any min/max), nested
+  objects and arrays filled in, local `$ref`s followed. A tool whose schema
+  we can't satisfy (a string `pattern` none of a few fixed strings match) is
+  skipped, not guessed. An argument with no example (e.g. mcp-server-time's
+  `time`, "in 24-hour format (HH:MM)") still gets `"hello"`. Behaviour behind
   other inputs isn't exercised.
 
 ## Safety rules
