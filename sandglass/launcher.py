@@ -3,9 +3,11 @@
 sandbox.py reads this file ON THE HOST and passes its source to the traced
 Python as:
 
-    python -S -c <this source> <server.py> <netsink.py source> <stdin_relay.py source>
+    python -S -c <this source> <server.py> <netsink.py source> <stdin_relay.py source> [ARG...]
 
-so the container never has to read an extra file. In this order it:
+so the container never has to read an extra file. The ARGs (#144, --server-arg)
+are the server's own. It runs in /tmp/work, made by sh before tracing starts.
+In this order it:
 
   1. (#47) points the server's stderr (fd 2, the trace stream) at /dev/null
      (fd 3, opened by sh) and closes fd 3, so the server can't touch the trace;
@@ -230,8 +232,11 @@ def main() -> None:
 
     # Look like `python <server.py>` would. With -c, sys.path[0] is "" (the
     # cwd); replace it before importing anything non-frozen, or Python lists /project.
+    # Anything after the relay code is the server's own arguments (#144,
+    # --server-arg), passed on as given: the server sees `server ARG...`.
     server, sink_source, relay_source = sys.argv[1], sys.argv[2], sys.argv[3]
-    sys.argv = [server]
+    server_args = sys.argv[4:]
+    sys.argv = [server, *server_args]
     sys.path[0] = os.path.dirname(server)
 
     # 2. The network sink.
@@ -248,7 +253,7 @@ def main() -> None:
     # (`sandglass scan npm:...` says so with SANDGLASS_RUNTIME: an npm "bin"
     # file doesn't always end in .js.)
     if server.endswith(".js") or os.environ.get("SANDGLASS_RUNTIME") == "node":
-        os.execv(NODE, [NODE, server])
+        os.execv(NODE, [NODE, server, *server_args])
 
     # Python: packages, then the server.
     import site

@@ -1162,13 +1162,23 @@ def not_run(reason: str | None) -> dict:
     }
 
 
+def setup_line(setup: dict) -> str:
+    """The server setup in one line (#144): arguments as given, environment
+    names only (values are never recorded), the work dir."""
+    env = ", ".join(f"`{name}`" for name in setup["env"]) or "none"
+    return (f"arguments `{json.dumps(setup['args'])}`, environment {env} (values not recorded),"
+            f" work dir `{setup['workdir']}`")
+
+
 def build_report(server: str, timestamp: str, policy: Policy, session: dict,
                  result: dict, trace_file: Path | None, path_mapping: dict,
-                 baseline: dict, package: dict | None = None) -> dict:
+                 baseline: dict, package: dict | None = None,
+                 server_setup: dict | None = None) -> dict:
     """Assemble everything into the final report dict.
 
     `package` (scan mode, #19): what was scanned, downloaded and installed.
     `trace_file` is None if the server never ran.
+    `server_setup` (#144): the --server-arg/--env setup, env names only.
     """
     cov = coverage(session)
     return {
@@ -1179,6 +1189,7 @@ def build_report(server: str, timestamp: str, policy: Policy, session: dict,
         "coverage_summary": coverage_summary(cov),
         "incomplete_reasons": result["incomplete_reasons"],
         "package": package,
+        "server_setup": server_setup,  # arguments, env names (no values), work dir, command (#144)
         # Paths as text; the baseline's exec_exact entries (#142) stay mappings.
         "policy": {k: (v if v is None or isinstance(v, (str, bool))
                        else [p if isinstance(p, dict) else str(p) for p in v])
@@ -1228,6 +1239,8 @@ def _markdown(r: dict) -> str:
         "",
         f"- Run: `{r['timestamp']}`",
         f"- Policy: `{r['policy']['name']}`",
+        *([f"- Server setup: {setup_line(r['server_setup'])}",
+           f"- Reproduce: `{r['server_setup']['command']}`"] if r.get("server_setup") else []),
         f"- Baseline: `{r['baseline']['name']}` (`{r['baseline']['file']}`,"
         f" multiarch `{r['baseline']['multiarch']}`; reads only)",
         f"- Trace: `{r['trace_file']}`" if r["trace_file"] else "- Trace: none (the server was not run)",

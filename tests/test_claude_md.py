@@ -60,6 +60,19 @@ def test_every_coverage_summary_fixture_is_protected():
             f"EXPECTED_COVERAGE_SUMMARY entry {fixture} is not in CLAUDE.md's protected items"
 
 
+def test_every_server_setup_fixture_is_protected():
+    # (#144) the setup fixture, its setup, its policies, and the refused --env names.
+    from sandglass import client
+    for item in ("`EXPECTED_SERVER_SETUP`", "`SETUP_ARGS`", "`SETUP_ENV`", "`SETUP_POLICIES`",
+                 "`/tmp/work`", "`REFUSED_ENV`", "/tmp/work/setup_note.txt"):
+        assert item in PROTECTED, f"{item!r} is not in CLAUDE.md's protected items"
+    for fixture, policy_name, _ in check_fixtures.EXPECTED_SERVER_SETUP:
+        assert fixture.removesuffix(".py") in PROTECTED and policy_name in PROTECTED
+        assert policy_name in check_fixtures.SETUP_POLICIES
+    assert client.REFUSED_ENV  # the list exists where CLAUDE.md says
+    assert str(sandbox.CONTAINER_WORKDIR) == "/tmp/work"
+
+
 def test_every_hostile_fixture_is_protected():
     # (#131 onwards) every hostile fixture, under every policy it runs with.
     for fixture, policy_name in check_fixtures.EXPECTED_HOSTILE:

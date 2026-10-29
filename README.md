@@ -238,8 +238,8 @@ What happens (`sandglass/scan.py`):
    strace, with the same hardening and trace protection as a fixture. That
    volume is the container's **only** mount (#20): the Sandglass project is
    not mounted, so the package can't read Sandglass's code, policies or
-   reports (`/project/...` gives `ENOENT`). The working directory is
-   `/package`. The server is the package's console script (PyPI) or `bin`
+   reports (`/project/...` gives `ENOENT`). The server's working directory
+   is the empty `/tmp/work` (#144, see Server setup). The server is the package's console script (PyPI) or `bin`
    (npm); `--entry NAME` picks one if there are several.
    Reads inside `/package` (the package and its dependencies) are allowed
    automatically, like `{venv}` for fixtures; writes there are not. Use
@@ -286,6 +286,58 @@ through it (`EXPECTED_NPM_REGISTRY_SCANS`):
 It also checks that the download left only `npm-cache/`, `project/package.json`
 and `project/package-lock.json` in the temp folder.
 
+### Server setup: arguments, environment and a work folder (#144)
+
+Some servers need setup before they start or work. Both `sandglass scan`
+and `sandglass <server> --sandbox` take:
+
+- `--server-arg ARG` (repeatable, in order): an argument for the server. One
+  that starts with `-` must be written `--server-arg=--db-path`. Arguments
+  are passed as a list (never through a shell) and **recorded in the report
+  as given**, so put nothing secret there.
+- `--env KEY=VALUE` (repeatable): an environment variable for the server.
+  **Fake values only** (see Safety rules). The report records the name,
+  never the value; the value reaches Docker through its own environment
+  (`-e NAME`), so it isn't on any command line.
+
+Every run also has a **work folder**: `/tmp/work`, created empty (owned by
+the sandbox user) before tracing starts, inside the scratch `/tmp` that is
+already there; it is the server's working directory. There is no new mount,
+and `$HOME` stays the read-only decoy. Writes there are judged by the policy
+like any other: `no_network.v1` allows them (it allows `/tmp`),
+`read_only_folder.v1` reports them as violations.
+
+The report header shows the setup and a command that reproduces the run,
+e.g. `- Server setup: arguments ["stdio"], environment MEMORY_FILE_PATH
+(values not recorded), work dir /tmp/work`.
+
+`--env` refuses these names (exit code `2`), compared upper-cased, because
+the variables reach the whole container (the shell and strace too), not
+only the server:
+
+| Names | Why refused |
+|---|---|
+| `PATH`, `HOME` | set by Sandglass (`HOME` is the decoy home) |
+| `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` | set or removed by the launcher for the network sink |
+| `SANDGLASS_*` | read by Sandglass's launcher |
+| `LD_*`, `PYTHON*` | read before the launcher hides the trace stream |
+| `NODE_OPTIONS` | changes how Sandglass starts Node |
+| `DOCKER_*` | read by the docker command on the host, which passes the values on |
+| `GCONV_PATH`, `LOCPATH`, `GLIBC_TUNABLES`, `MALLOC_*`, `IFS`, `ENV`, `BASH_ENV` | read by glibc or the shell before tracing starts |
+
+Examples (servers from #25):
+
+```bash
+uv run sandglass scan pypi:excel-mcp-server@2.2.2 --policy policies/templates/no_network.v1.yaml \
+    --server-arg stdio --server-arg=--allow-dir --server-arg /tmp/work
+uv run sandglass scan pypi:mcp-server-sqlite@2025.4.25 --policy policies/templates/no_network.v1.yaml \
+    --server-arg=--db-path --server-arg /tmp/work/test.db
+uv run sandglass scan npm:@modelcontextprotocol/server-memory@2.0.0 --policy policies/templates/no_network.v1.yaml \
+    --env MEMORY_FILE_PATH=/tmp/work/memory.jsonl   # must be absolute: relative is the package folder
+uv run sandglass scan pypi:arxiv-mcp-server@0.8.2 --policy policies/templates/no_network.v1.yaml \
+    --server-arg=--storage-path --server-arg /tmp/work/papers
+```
+
 ### What the sandbox does
 
 The client runs:
@@ -294,10 +346,14 @@ The client runs:
 docker run -i --rm --network none --read-only --tmpfs /tmp --user 10001:10001 \
   -e HOME=/home/sandglass -v <project>:/project:ro --mount type=tmpfs,destination=/project/reports,tmpfs-mode=0555 \
   -w /project sandglass-sandbox \
-  sh -c 'exec strace -f -tt -y -e trace=file,process,network,memfd_create,io_uring_setup,io_uring_enter,io_uring_register,ptrace,process_vm_readv,process_vm_writev \
+  sh -c 'mkdir -m 0700 /tmp/work && cd /tmp/work && launcher="$1" && shift &&
+         exec strace -f -tt -y -e trace=file,process,network,memfd_create,io_uring_setup,io_uring_enter,io_uring_register,ptrace,process_vm_readv,process_vm_writev \
          --kill-on-exit -o /proc/self/fd/2 \
-         /opt/venv/bin/python -S -c "<launcher.py>" <server> "<netsink.py>" "<stdin_relay.py>" 3>/dev/null'
+         /opt/venv/bin/python -S -c "$launcher" "$@" 3>/dev/null' \
+  sandglass-launch "<launcher.py>" <server> "<netsink.py>" "<stdin_relay.py>" [--server-arg values...]
 ```
+
+(`--env` adds `-e NAME` for each name, without the value; see Server setup.)
 
 - `--network none`: no network. Connection attempts still show up in the trace.
 - `--read-only` + `--tmpfs /tmp`: the server can't modify the image; only `/tmp` is writable.
@@ -805,7 +861,8 @@ below are from each project's own paper or documentation.
 2. **Only use fake credentials.** Decoys like `test_servers/decoy_home/.fake_credentials`
    must contain obviously fake values (e.g. `FAKE_KEY_FOR_TESTING`).
 3. **Never put real secrets anywhere a tested server can reach**, including the
-   project folder (it is mounted into the container) and environment variables.
+   project folder (it is mounted into the container) and environment variables
+   (`--env` values are never recorded, but the server can read them).
 4. **Disclose real findings privately.** If you find a real server misbehaving,
    report it privately to its maintainers (security contact or private advisory)
    and give them time to fix it before you publish anything.

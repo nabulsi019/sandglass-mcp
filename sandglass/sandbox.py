@@ -8,6 +8,8 @@ strace. Inside the container:
     /home/sandglass   $HOME: a decoy with fake credentials, baked into the image
     /opt/venv         the project's dependencies, baked into the image
     /usr/local        the Python installation from python:3.12-slim
+    /tmp/work         the server's working directory (#144): an empty folder in
+                      the scratch /tmp, made before tracing starts
 
 Trace integrity: the trace is the evidence, so the server must not be able to
 read, change or delete it. There is no trace file in the container at all:
@@ -49,6 +51,10 @@ CONTAINER_USER = "10001:10001"
 # That user's home: a decoy with fake credentials, baked into the image from
 # sandbox/decoy_home/. The host's home is never mounted.
 CONTAINER_HOME = PurePosixPath("/home/sandglass")
+# The server's working directory (#144): a fresh, empty folder in the scratch
+# /tmp (already a tmpfs), so a server can write next to itself. No new mount,
+# and writes there are judged by the policy like any other.
+CONTAINER_WORKDIR = PurePosixPath("/tmp/work")
 
 # The launcher (sandglass/launcher.py) runs first inside the traced Python as
 # `python -S -c LAUNCHER <server>`: it hides the trace stream from the server,
@@ -109,11 +115,13 @@ def detect_multiarch() -> str:
     return multiarch
 
 
-def docker_command(server_script: Path) -> tuple[str, list[str]]:
+def docker_command(server_script: Path, server_args: list[str] = (),
+                   env_names: list[str] = ()) -> tuple[str, list[str]]:
     """Return (command, args) that run the server under strace in the sandbox.
 
     The trace comes out on the container's STDERR (see the module docstring);
-    the caller saves that stream to a file on the host.
+    the caller saves that stream to a file on the host. `server_args` and
+    `env_names`: the user's server setup (#144), see _traced_run_args.
     """
     docker = shutil.which("docker") or "docker"
     # strace flags:
@@ -129,22 +137,38 @@ def docker_command(server_script: Path) -> tuple[str, list[str]]:
         # Cover reports/ (old reports, traces) with an empty, read-only folder.
         "--mount", f"type=tmpfs,destination={CONTAINER_REPORTS},tmpfs-mode=0555",
     ]
-    return docker, _traced_run_args(str(to_container_path(server_script)), mounts)
+    return docker, _traced_run_args(str(to_container_path(server_script)), mounts,
+                                    server_args=server_args, env_names=env_names)
 
 
 def _traced_run_args(server_path: str, mounts: list[str], env: dict | None = None,
-                     workdir: PurePosixPath = CONTAINER_PROJECT) -> list[str]:
+                     workdir: PurePosixPath = CONTAINER_PROJECT, server_args: list[str] = (),
+                     env_names: list[str] = ()) -> list[str]:
     """`docker run` arguments that run one server under strace, hardened.
 
     Shared by the fixture mode (docker_command) and scan mode
-    (scan_run_command); only the mounts, the working directory and a few
-    environment variables differ.
+    (scan_run_command); only the mounts, `workdir` (Docker's -w) and a few
+    environment variables differ. Either way the server itself runs in
+    CONTAINER_WORKDIR (#144).
+
+    The user's server setup (#144): `server_args` go after the relay code, as
+    separate list items (never through a shell string), and the launcher
+    hands them to the server. `env_names` become `-e NAME` with no value:
+    Docker copies the value from its own environment, which the client sets,
+    so values never appear on a command line.
     """
+    # sh, before strace (so untraced): make the empty work folder, owned by
+    # the sandbox user, and go into it. Then "$1" is the launcher code and
+    # "$@" the server path, the sink code, the relay code and the server's
+    # arguments, each passed on exactly as given.
     # -y (#122): print the file behind each fd, so a successful open shows the
     # file it really opened (= 3</home/x>), even through a symlink.
-    strace = (f"exec strace -f -tt -y -e trace={TRACED_SYSCALLS} --kill-on-exit"
-              f" -o /proc/self/fd/2 {CONTAINER_PYTHON} -S -c \"$1\" \"$2\" \"$3\" \"$4\" 3>/dev/null")
+    strace = (f"mkdir -m 0700 {CONTAINER_WORKDIR} && cd {CONTAINER_WORKDIR} && "
+              "launcher=\"$1\" && shift && "
+              f"exec strace -f -tt -y -e trace={TRACED_SYSCALLS} --kill-on-exit"
+              f" -o /proc/self/fd/2 {CONTAINER_PYTHON} -S -c \"$launcher\" \"$@\" 3>/dev/null")
     env_args = [arg for name, value in (env or {}).items() for arg in ("-e", f"{name}={value}")]
+    env_args += [arg for name in env_names for arg in ("-e", name)]
     return [
         "run",
         "-i",                       # keep stdin open: it's the MCP stdio channel
@@ -159,9 +183,10 @@ def _traced_run_args(server_path: str, mounts: list[str], env: dict | None = Non
         "-w", str(workdir),
         IMAGE,
         # sh runs before strace, so it isn't traced. "$1".."$4" are the launcher
-        # code, the server path, the sink code and the relay code, as separate arguments.
+        # code, the server path, the sink code and the relay code, as separate
+        # arguments; the server's own arguments follow (#144).
         "sh", "-c", strace, "sandglass-launch",
-        LAUNCHER, server_path, NETSINK, STDIN_RELAY,
+        LAUNCHER, server_path, NETSINK, STDIN_RELAY, *server_args,
     ]
 
 
@@ -297,13 +322,15 @@ def npm_download_container_args(out_dir: Path, out_group: int, script: str, npm_
     ]
 
 
-def scan_run_command(volume: str, server_path: str, runtime: str) -> tuple[str, list[str]]:
+def scan_run_command(volume: str, server_path: str, runtime: str, server_args: list[str] = (),
+                     env_names: list[str] = ()) -> tuple[str, list[str]]:
     """`docker run` that runs the installed package's server under strace.
 
     The ONLY mount is the package's volume, READ-ONLY at /package (#20). The
     project is NOT mounted: a scanned package can't read Sandglass's code,
     policies, fixtures or reports (its launcher, sink and relay arrive as
-    arguments). The working directory is /package.
+    arguments). Docker starts in /package; the server runs in
+    CONTAINER_WORKDIR (#144). `server_args`, `env_names`: see _traced_run_args.
     """
     docker = shutil.which("docker") or "docker"
     mounts = ["-v", f"{volume}:{CONTAINER_PACKAGE}:ro"]
@@ -311,4 +338,5 @@ def scan_run_command(volume: str, server_path: str, runtime: str) -> tuple[str, 
     env = {"SANDGLASS_RUNTIME": runtime}
     if runtime == "python":
         env["SANDGLASS_SITE_DIR"] = str(CONTAINER_SITE)
-    return docker, _traced_run_args(server_path, mounts, env, workdir=CONTAINER_PACKAGE)
+    return docker, _traced_run_args(server_path, mounts, env, workdir=CONTAINER_PACKAGE,
+                                    server_args=server_args, env_names=env_names)

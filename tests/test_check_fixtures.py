@@ -22,7 +22,7 @@ def test_mixed_exec_and_file_violations_are_a_fail_not_a_crash(monkeypatch, caps
     # A regression: an exec (mode None) AND a file read in the same run.
     mixed = [{"mode": None, "target": "/bin/sh", "phase": "tool-call"},
              {"mode": "read", "target": "/lib/libx.so", "phase": "tool-call"}]
-    monkeypatch.setattr(check_fixtures, "run_sandboxed", lambda server, policy: fake_report(mixed))
+    monkeypatch.setattr(check_fixtures, "run_sandboxed", lambda server, policy, *setup: fake_report(mixed))
     # The scans (#19) too: no building, no Docker.
     monkeypatch.setattr(check_fixtures, "build_test_packages", lambda: None)
     monkeypatch.setattr(check_fixtures, "run_scan", lambda spec, policy, registry: fake_report(mixed))

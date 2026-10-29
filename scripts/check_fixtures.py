@@ -200,6 +200,25 @@ EXPECTED_COVERAGE_SUMMARY = {
     "tool_error_server.py": ("CLEAN", set(), "1 of 2 tools returned errors"),
 }
 
+# (#144) A server that needs an argument and an environment variable to start,
+# and writes a file into its working directory (/tmp/work). The write is
+# judged by the policy like any other. The env value is fake.
+SETUP_ARGS = ["--note-name", "setup_note"]
+SETUP_ENV = {"SETUP_TEST_TOKEN": "fake-token-for-tests"}
+SETUP_POLICIES = {
+    "no_network.v1": PROJECT_ROOT / "policies" / "templates" / "no_network.v1.yaml",
+    "read_only_folder.v1": PROJECT_ROOT / "policies" / "templates" / "read_only_folder.v1.yaml",
+}
+# (fixture, policy name, given the setup?) -> (expected verdict, expected
+# violations, texts the INCOMPLETE reasons must mention)
+EXPECTED_SERVER_SETUP = {
+    ("setup_required_server.py", "no_network.v1", True): ("CLEAN", set(), []),
+    ("setup_required_server.py", "read_only_folder.v1", True): (
+        "VIOLATIONS", {("write", "/tmp/work/setup_note.txt")}, []),
+    ("setup_required_server.py", "no_network.v1", False): (
+        "INCOMPLETE", set(), ["needs the arguments --note-name setup_note"]),
+}
+
 EXPECTED_RUNTIME = {
     # /dev/null O_RDWR, the overcommit_memory read, bind ::1 port 0, uname -p.
     "runtime_noise_server.py": ("CLEAN", set(), [(["uname", "-p"], UNAME_NOTE)]),
@@ -529,6 +548,23 @@ def main() -> int:
             failures.append(f"{fixture}: expected coverage summary {want_summary!r}, "
                             f"got {report.get('coverage_summary')!r}")
 
+    for (fixture, policy_name, with_setup), (want_verdict, want_violations, want_reasons) \
+            in EXPECTED_SERVER_SETUP.items():
+        label = f"{fixture} under {policy_name}, {'with' if with_setup else 'without'} its setup"
+        print(f"\n===== {label} =====")
+        args, env = (SETUP_ARGS, SETUP_ENV) if with_setup else ([], {})
+        report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, SETUP_POLICIES[policy_name], args, env)
+        failures += check(label, report, want_verdict, want_violations)
+        reasons = " | ".join(report.get("incomplete_reasons", []))
+        failures += [f"{label}: INCOMPLETE reasons don't mention {text!r}: {reasons}"
+                     for text in want_reasons if text not in reasons]
+        # The report names the env variables but never records a value.
+        setup = report.get("server_setup") or {}
+        if setup.get("args") != args or setup.get("env") != list(env):
+            failures.append(f"{label}: expected server setup {args} {list(env)}, got {setup}")
+        if any(value in json.dumps(report) for value in env.values()):
+            failures.append(f"{label}: an --env value appears in the report")
+
     build_test_packages()
     for package, (want_verdict, want_violations) in EXPECTED_SCANS.items():
         print(f"\n===== scan {package} =====")
@@ -572,7 +608,7 @@ def main() -> int:
     if not failures:
         total = (len(EXPECTED) + len(EXPECTED_V04) + len(EXPECTED_POLICY_RUNS) + len(EXPECTED_HOSTILE)
                  + len(EXPECTED_OLD_DOCKER) + len(EXPECTED_TIMEOUTS) + len(EXPECTED_RUNTIME)
-                 + len(EXPECTED_COVERAGE_SUMMARY)
+                 + len(EXPECTED_COVERAGE_SUMMARY) + len(EXPECTED_SERVER_SETUP)
                  + len(EXPECTED_SCANS) + len(EXPECTED_NPM_REGISTRY_SCANS))
         print(f"all {total} fixtures match expectations")
     return 1 if failures else 0
