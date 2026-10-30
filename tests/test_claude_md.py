@@ -82,6 +82,16 @@ def test_every_server_setup_fixture_is_protected():
     assert str(sandbox.CONTAINER_WORKDIR) == "/tmp/work"
 
 
+def test_every_environment_fixture_is_protected():
+    # (#146) both env fixtures, the names they must show, and how it's done.
+    for item in ("`EXPECTED_ENVIRONMENT`", "`PROXY_NAMES`", "`BASE_ENV_NAMES`",
+                 "`UNSET_BEFORE_TRACING`", "SANDGLASS"):
+        assert item in PROTECTED, f"{item!r} is not in CLAUDE.md's protected items"
+    for fixture in check_fixtures.EXPECTED_ENVIRONMENT:
+        assert fixture.removesuffix(".py") in PROTECTED
+    assert set(sandbox.UNSET_BEFORE_TRACING) == {"OLDPWD", "GPG_KEY", "PYTHON_VERSION", "PYTHON_SHA256"}
+
+
 def test_every_hostile_fixture_is_protected():
     # (#131 onwards) every hostile fixture, under every policy it runs with.
     for fixture, policy_name in check_fixtures.EXPECTED_HOSTILE:

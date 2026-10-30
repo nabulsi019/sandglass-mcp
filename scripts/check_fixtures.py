@@ -230,6 +230,20 @@ EXPECTED_INPUT_MODES = {
         "CLEAN", set(), "1 of 1 tool returned errors", {"value": "hello", "source": "fallback"}),
 }
 
+# (#146) The environment a server sees: no Sandglass name or value in it.
+# The fixture's one tool returns os.environ / process.env ("environ") and
+# /proc/self/environ ("proc_environ"). Under no_network.v1, both CLEAN.
+# fixture -> (names in "environ", names in "proc_environ"). A Python server
+# runs in the launcher's process, so /proc/self/environ is what it started
+# with: no proxy variables, which the launcher sets later. Node is exec'd
+# after that, so it starts with them.
+PROXY_NAMES = {"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"}
+BASE_ENV_NAMES = {"HOME", "HOSTNAME", "LANG", "PATH", "PWD", "PYTHONDONTWRITEBYTECODE"}
+EXPECTED_ENVIRONMENT = {
+    "env_report_server.py": (BASE_ENV_NAMES | PROXY_NAMES, BASE_ENV_NAMES),
+    "env_report_server.js": (BASE_ENV_NAMES | PROXY_NAMES, BASE_ENV_NAMES | PROXY_NAMES),
+}
+
 EXPECTED_RUNTIME = {
     # /dev/null O_RDWR, the overcommit_memory read, bind ::1 port 0, uname -p.
     "runtime_noise_server.py": ("CLEAN", set(), [(["uname", "-p"], UNAME_NOTE)]),
@@ -489,6 +503,28 @@ def check(fixture: str, report: dict, want_verdict: str, want_violations: set,
     return failures
 
 
+def environment_failures(label: str, report: dict, want_environ: set, want_proc_environ: set) -> list[str]:
+    """(#146) What the env fixture's tool returned: no "SANDGLASS" in any
+    name or value, "sandglass" in any case only in HOME's value (the decoy
+    home, protected), and exactly the expected names in both views."""
+    calls = report.get("exercised") or []
+    if len(calls) != 1 or calls[0]["status"] != "OK":
+        return [f"{label}: expected one successful report_environment call, got {calls}"]
+    if "SANDGLASS" in calls[0]["result"]:
+        return [f"{label}: 'SANDGLASS' appears in the server's environment"]
+    seen = json.loads(calls[0]["result"])
+    failures = []
+    for view, want in (("environ", want_environ), ("proc_environ", want_proc_environ)):
+        env = seen[view]
+        if set(env) != want:
+            failures.append(f"{label}: {view} names: expected {sorted(want)}, got {sorted(env)}")
+        tells = [name for name, value in env.items()
+                 if "sandglass" in name.lower() or ("sandglass" in value.lower() and name != "HOME")]
+        if tells:
+            failures.append(f"{label}: {view} mentions sandglass in {tells}")
+    return failures
+
+
 def main() -> int:
     failures = []
     # The exit code each verdict gives (#124); 2 stays argparse's usage error.
@@ -590,6 +626,13 @@ def main() -> int:
         if any(value in json.dumps(report) for value in env.values()):
             failures.append(f"{label}: an --env value appears in the report")
 
+    for fixture, (want_environ, want_proc_environ) in EXPECTED_ENVIRONMENT.items():
+        label = f"{fixture} under no_network.v1"
+        print(f"\n===== {label} =====")
+        report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, POLICIES["no_network.v1"])
+        failures += check(label, report, "CLEAN", set())
+        failures += environment_failures(label, report, want_environ, want_proc_environ)
+
     build_test_packages()
     for package, (want_verdict, want_violations) in EXPECTED_SCANS.items():
         print(f"\n===== scan {package} =====")
@@ -633,7 +676,8 @@ def main() -> int:
     if not failures:
         total = (len(EXPECTED) + len(EXPECTED_V04) + len(EXPECTED_POLICY_RUNS) + len(EXPECTED_HOSTILE)
                  + len(EXPECTED_OLD_DOCKER) + len(EXPECTED_TIMEOUTS) + len(EXPECTED_RUNTIME)
-                 + len(EXPECTED_COVERAGE_SUMMARY) + len(EXPECTED_SERVER_SETUP) + len(EXPECTED_INPUT_MODES)
+                 + len(EXPECTED_COVERAGE_SUMMARY) + len(EXPECTED_SERVER_SETUP)
+                 + len(EXPECTED_ENVIRONMENT) + len(EXPECTED_INPUT_MODES)
                  + len(EXPECTED_SCANS) + len(EXPECTED_NPM_REGISTRY_SCANS))
         print(f"all {total} fixtures match expectations")
     return 1 if failures else 0

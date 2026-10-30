@@ -3,10 +3,14 @@
 sandbox.py reads this file ON THE HOST and passes its source to the traced
 Python as:
 
-    python -S -c <this source> <server.py> <netsink.py source> <stdin_relay.py source> [ARG...]
+    python -S -c <this source> <server.py> <netsink.py source> <stdin_relay.py source>
+                 <runtime> <site dir> [ARG...]
 
-so the container never has to read an extra file. The ARGs (#144, --server-arg)
-are the server's own. It runs in /tmp/work, made by sh before tracing starts.
+so the container never has to read an extra file. <runtime> is "python" or
+"node", <site dir> where pip installed a scanned package ("" if none): both
+arguments, never environment variables, so the server's environment has no
+Sandglass name in it (#146). The ARGs (#144, --server-arg) are the server's
+own. It runs in /tmp/work, made by sh before tracing starts.
 In this order it:
 
   1. (#47) points the server's stderr (fd 2, the trace stream) at /dev/null
@@ -232,12 +236,18 @@ def main() -> None:
 
     # Look like `python <server.py>` would. With -c, sys.path[0] is "" (the
     # cwd); replace it before importing anything non-frozen, or Python lists /project.
-    # Anything after the relay code is the server's own arguments (#144,
-    # --server-arg), passed on as given: the server sees `server ARG...`.
-    server, sink_source, relay_source = sys.argv[1], sys.argv[2], sys.argv[3]
-    server_args = sys.argv[4:]
+    # Then the runtime ("python" or "node") and the site dir ("" if none),
+    # as arguments, not environment variables (#146). Anything after them is
+    # the server's own arguments (#144, --server-arg), passed on as given:
+    # the server sees `server ARG...`.
+    server, sink_source, relay_source, runtime, site_dir = sys.argv[1:6]
+    server_args = sys.argv[6:]
     sys.argv = [server, *server_args]
     sys.path[0] = os.path.dirname(server)
+    # (#146) No Sandglass name in the server's environment. Sandglass sets
+    # none (--env refuses them too); this is the safety net.
+    for name in [n for n in os.environ if n.upper().startswith("SANDGLASS")]:
+        del os.environ[name]
 
     # 2. The network sink.
     start_sink(sink_source)
@@ -250,9 +260,9 @@ def main() -> None:
     start_relay(relay_source)
 
     # 4. The server. Node: replace this process with node (same pid, same fds).
-    # (`sandglass scan npm:...` says so with SANDGLASS_RUNTIME: an npm "bin"
-    # file doesn't always end in .js.)
-    if server.endswith(".js") or os.environ.get("SANDGLASS_RUNTIME") == "node":
+    # (The runtime is passed, not guessed: an npm "bin" file doesn't always
+    # end in .js.)
+    if runtime == "node":
         os.execv(NODE, [NODE, server, *server_args])
 
     # Python: packages, then the server.
@@ -265,7 +275,6 @@ def main() -> None:
     # done here, after step 1, and not with PYTHONPATH: PYTHONPATH is read at
     # interpreter startup, so a package could shadow e.g. `encodings` and run
     # before the trace stream is hidden.
-    site_dir = os.environ.get("SANDGLASS_SITE_DIR")
     if site_dir:
         before = list(sys.path)
         site.addsitedir(site_dir)

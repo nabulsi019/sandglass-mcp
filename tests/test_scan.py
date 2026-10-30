@@ -301,11 +301,12 @@ def test_run_container_mounts_the_package_read_only():
     assert "--network none" in joined and "--read-only" in joined and "--user 10001:10001" in joined
     assert "vol1:/package:ro" in joined
     assert "--cap-add" not in joined and "--privileged" not in joined
-    assert env_of(args) == ["HOME=/home/sandglass", "SANDGLASS_RUNTIME=python",
-                            "SANDGLASS_SITE_DIR=/package/site"]
+    # The runtime and site dir are launcher arguments, not variables (#146).
+    assert env_of(args) == ["HOME=/home/sandglass"]
     # The traced command is the same as for fixtures (strace, fd 3 to /dev/null).
     assert "-o /proc/self/fd/2" in joined and "3>/dev/null" in joined
-    assert args[-3] == "/package/site/bin/x"
+    assert args[-5:] == ["/package/site/bin/x", sandbox.NETSINK, sandbox.STDIN_RELAY,
+                         "python", "/package/site"]
 
 
 def test_scan_mounts_only_the_package_never_the_project():
@@ -323,7 +324,8 @@ def test_scan_mounts_only_the_package_never_the_project():
 
 def test_npm_runs_with_node_and_no_site_dir():
     _, args = sandbox.scan_run_command("vol1", "/package/node_modules/x/cli", "node")
-    assert env_of(args) == ["HOME=/home/sandglass", "SANDGLASS_RUNTIME=node"]
+    assert env_of(args) == ["HOME=/home/sandglass"]
+    assert args[-2:] == ["node", ""]  # runtime, no site dir (#146)
 
 
 def test_launcher_adds_the_site_dir_after_the_fd_swap_not_via_pythonpath():
