@@ -1132,7 +1132,21 @@ def summary_lines(r: dict) -> list[str]:
         parts = ", ".join(f"{text} ×{n}" for text, n in group["breakdown"].items())
         lines.append(f"  VIOLATION {group['label']} ×{group['count']}" + (f" ({parts})" if parts else "")
                      + f", {group['first']} – {group['last']}, {group['phase']}")
+    if r.get("durations"):
+        lines.append(duration_line(r["durations"]))
     return lines
+
+
+DURATION_PHASES = ("download", "install", "run", "analysis")
+
+
+def duration_line(durations: dict) -> str:
+    """"Duration: 21.4 s (download 3.1, install 6.0, run 10.8, analysis 1.5)"
+    (#156). Phases that didn't happen (None) are left out of the line; the
+    JSON keeps them as null."""
+    phases = ", ".join(f"{name} {durations[name]:.1f}" for name in DURATION_PHASES
+                       if durations.get(name) is not None)
+    return f"Duration: {durations['total']:.1f} s" + (f" ({phases})" if phases else "")
 
 
 # ---------------------------------------------------------------------------
@@ -1189,6 +1203,9 @@ def build_report(server: str, timestamp: str, policy: Policy, session: dict,
         "coverage_summary": coverage_summary(cov),
         "incomplete_reasons": result["incomplete_reasons"],
         "package": package,
+        # Wall-clock seconds (#156): total and per phase, None if a phase didn't
+        # happen. Set when the report is written; never judged.
+        "durations": None,
         "server_setup": server_setup,  # arguments, env names (no values), work dir, command (#144)
         # Paths as text; the baseline's exec_exact entries (#142) stay mappings.
         "policy": {k: (v if v is None or isinstance(v, (str, bool))
@@ -1242,6 +1259,7 @@ def _markdown(r: dict) -> str:
         f"**Verdict: {r['verdict']}**" + verdict_line(r).removeprefix(r["verdict"]),
         "",
         f"- Run: `{r['timestamp']}`",
+        *([f"- {duration_line(r['durations'])}"] if r.get("durations") else []),
         f"- Policy: `{r['policy']['name']}`",
         *([f"- Server setup: {setup_line(r['server_setup'])}",
            f"- Reproduce: `{r['server_setup']['command']}`"] if r.get("server_setup") else []),
@@ -1347,10 +1365,15 @@ def _coverage_section(r: dict) -> list[str]:
              " (each tool is called once, with one input; see the README)", ""]
     if cov["note"]:
         return lines + [f"No tools: {cov['note']}."]
-    lines += ["| Tool | Status | Reason |", "|---|---|---|"]
+    # Each call's duration (#156), from the exercised calls; empty if not called
+    # or never answered.
+    seconds = {c["tool"]: c.get("seconds") for c in r.get("exercised", [])}
+    lines += ["| Tool | Status | Time | Reason |", "|---|---|---|---|"]
     for row in cov["tools"]:
         reason = (row["reason"] or "").replace("|", "\\|")
-        lines.append(f"| `{row['tool']}` | {row['status']} | {reason} |")
+        took = seconds.get(row["tool"])
+        time_text = "" if took is None else f"{took:.2f} s"
+        lines.append(f"| `{row['tool']}` | {row['status']} | {time_text} | {reason} |")
     return lines
 
 
