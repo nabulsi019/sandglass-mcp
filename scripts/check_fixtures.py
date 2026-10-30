@@ -500,7 +500,22 @@ def check(fixture: str, report: dict, want_verdict: str, want_violations: set,
     elif domains != EXPECTED_DOMAINS.get(fixture, []):
         failures.append(f"{fixture}: expected sink requests {EXPECTED_DOMAINS.get(fixture, [])}, "
                         f"got {domains}")
+    failures += duration_failures(fixture, report)
     return failures
+
+
+def duration_failures(fixture: str, report: dict) -> list[str]:
+    """(#156) Durations vary run to run, so only their shape is checked: the
+    total and every phase are present, each a number >= 0 or null (a phase
+    that didn't happen), and so is every call's duration."""
+    durations = report.get("durations") or {}
+    keys = ("total", "download", "install", "run", "analysis")
+    values = [durations.get(key, "missing") for key in keys]
+    values += [call.get("seconds") for call in report.get("exercised", [])]
+    bad = [v for v in values if not (v is None or (isinstance(v, (int, float)) and v >= 0))]
+    if bad or not isinstance(durations.get("total"), (int, float)):
+        return [f"{fixture}: durations not numbers >= 0 or null: {durations}"]
+    return []
 
 
 def environment_failures(label: str, report: dict, want_environ: set, want_proc_environ: set) -> list[str]:

@@ -21,6 +21,7 @@ With --sandbox (and for scan) the exit code is the verdict: 0 CLEAN,
 
 import argparse
 import asyncio
+import contextlib
 import json
 import re
 import shlex
@@ -258,6 +259,7 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
                         "result": "the session ended before the call returned"}
                 session_record["calls"].append(call)
                 timeout = min(CALL_TIMEOUT_SECONDS, remaining)
+                started = clock()
                 try:
                     result = await session.call_tool(tool.name, args, read_timeout_seconds=timeout)
                     call["status"], call["result"] = result_text(result)
@@ -270,6 +272,9 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
                         # server is "returned an error", not a failed call. The
                         # status stays FAILED, so the verdict rules don't change.
                         call["error_code"] = exc.code
+                # How long the call took (#156). A call the session never
+                # answered (NO ANSWER) has none.
+                call["seconds"] = round(clock() - started, 2)
                 print(f"  -> [{call['status']}] {call['result']}")
                 # The SDK has already sent a cancel for the timed-out call. A
                 # server that can't even answer a ping now would time out
@@ -279,6 +284,47 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
     # Leaving the `async with` closes the server's stdin and waits for it to
     # exit. In the sandbox, that's what lets strace finish writing the trace.
     return session_record
+
+
+# The clock for durations (#156): wall-clock, monotonic, on the host. A name
+# of its own so tests can replace it with a fake clock.
+clock = time.monotonic
+
+
+class Durations:
+    """Wall-clock durations of one run (#156), in seconds, measured on the host.
+
+    total     from the start of the run until the report is written
+    download  scan only: download, archive checks, hash check, entry point
+    install   scan only: the traced install in the sandbox
+    run       the server: startup and tool calls
+    analysis  trace parsing, compare, building the report (the install's
+              trace too); the report's own writing can't be inside it
+
+    A phase that didn't happen stays None, never 0. Durations are reported,
+    never judged: they vary run to run and don't touch the verdict.
+    """
+
+    PHASES = ("download", "install", "run", "analysis")
+
+    def __init__(self):
+        self.start = clock()
+        self.phases = dict.fromkeys(self.PHASES)  # None: didn't happen
+
+    @contextlib.contextmanager
+    def phase(self, name: str):
+        """Time the block and add it to `name`, even if the block raises
+        (a download stopped by the hash check still took that long)."""
+        start = clock()
+        try:
+            yield
+        finally:
+            self.phases[name] = (self.phases[name] or 0) + (clock() - start)
+
+    def record(self) -> dict:
+        """For the report: total and each phase, rounded to 2 decimals."""
+        return {"total": round(clock() - self.start, 2),
+                **{name: None if s is None else round(s, 2) for name, s in self.phases.items()}}
 
 
 def run_host(server_script: Path, inputs_mode: str = DEFAULT_MODE) -> None:
@@ -296,6 +342,7 @@ def run_sandboxed(server_script: Path, policy_path: Path, server_args: list[str]
     """Run the server in Docker under strace, compare, write and return the report.
     `server_args`, `server_env`: --server-arg and --env (#144), already checked.
     `inputs_mode`: --inputs (#145)."""
+    durations = Durations()  # no download or install phase in fixture mode (#156)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     server = server_script.stem
 
@@ -319,11 +366,11 @@ def run_sandboxed(server_script: Path, policy_path: Path, server_args: list[str]
         **WORKDIR_MAPPING,
     }
     return _trace_and_report(server, timestamp, command, args, policy, runtime, multiarch,
-                             path_mapping, setup=setup, server_env=server_env)
+                             path_mapping, durations, setup=setup, server_env=server_env)
 
 
 def _trace_and_report(server: str, timestamp: str, command: str, args: list[str], policy: Policy,
-                      runtime: str, multiarch: str, path_mapping: dict,
+                      runtime: str, multiarch: str, path_mapping: dict, durations: Durations,
                       package: dict | None = None,
                       install: dict | None = None, setup: dict | None = None,
                       server_env: dict | None = None) -> dict:
@@ -334,7 +381,8 @@ def _trace_and_report(server: str, timestamp: str, command: str, args: list[str]
     start there (#144). `install` (scan mode, #16) is compare_install()'s
     result, added in front. `setup` is server_setup()'s record for the report;
     `server_env` the --env values, given only to the docker command's own
-    environment (its -e NAME copies them into the container).
+    environment (its -e NAME copies them into the container). `durations`
+    gets the run and analysis phases (#156).
     """
     if setup:
         print(f"Server setup: {setup_line(setup)}")
@@ -348,7 +396,7 @@ def _trace_and_report(server: str, timestamp: str, command: str, args: list[str]
     # raised: the report must still be written, with verdict INCOMPLETE.
     # The container's stderr (the trace) goes straight into trace_file.
     session = new_session_record()  # filled in by run(), kept even if it fails half-way
-    with open(trace_file, "w", encoding="utf-8") as trace_out:
+    with durations.phase("run"), open(trace_file, "w", encoding="utf-8") as trace_out:
         try:
             # run() keeps to the time budget itself (#140); this is only the
             # safety net for a handshake or shutdown that hangs.
@@ -362,17 +410,18 @@ def _trace_and_report(server: str, timestamp: str, command: str, args: list[str]
             session["error"] = describe_error(exc)
             print(f"Session failed: {session['error']}")
 
-    # Line by line, up to MAX_TRACE_BYTES: a huge trace can't use up memory (#83).
-    events, cut_short = parse_trace_file(trace_file, cwd=str(sandbox.CONTAINER_WORKDIR))
-    result = compare(events, policy, session, runtime=runtime, trace_cut_short=cut_short)
-    if install is not None:
-        result = with_install(result, install)
+    with durations.phase("analysis"):
+        # Line by line, up to MAX_TRACE_BYTES: a huge trace can't use up memory (#83).
+        events, cut_short = parse_trace_file(trace_file, cwd=str(sandbox.CONTAINER_WORKDIR))
+        result = compare(events, policy, session, runtime=runtime, trace_cut_short=cut_short)
+        if install is not None:
+            result = with_install(result, install)
 
-    path_mapping = {**path_mapping,
-                    "(container stderr)": f"strace output, saved on the host as {trace_file}"}
-    report = build_report(server, timestamp, policy, session, result, trace_file,
-                          path_mapping, _baseline(policy, runtime, multiarch), package, setup)
-    return _write_and_print(report)
+        path_mapping = {**path_mapping,
+                        "(container stderr)": f"strace output, saved on the host as {trace_file}"}
+        report = build_report(server, timestamp, policy, session, result, trace_file,
+                              path_mapping, _baseline(policy, runtime, multiarch), package, setup)
+    return _write_and_print(report, durations)
 
 
 def _trace_dir(server: str, timestamp: str) -> Path:
@@ -392,8 +441,10 @@ def _baseline(policy: Policy, runtime: str, multiarch: str) -> dict:
     }
 
 
-def _write_and_print(report: dict) -> dict:
-    """Write the JSON + Markdown report and print the summary."""
+def _write_and_print(report: dict, durations: Durations) -> dict:
+    """Write the JSON + Markdown report and print the summary. The total
+    duration (#156) ends here, just before the report is written."""
+    report["durations"] = durations.record()
     json_path, md_path = write_reports(report, REPORTS_DIR)
     print()
     # Network events grouped per domain / lookup / address (#141), like the Markdown.
@@ -430,6 +481,7 @@ def run_scan(spec: scan.PackageSpec, policy_path: Path, registry_dir: Path | Non
     `server_args`, `server_env`: --server-arg and --env (#144), already checked.
     `inputs_mode`: --inputs (#145).
     """
+    durations = Durations()  # every phase can happen here (#156)
     server_env = server_env or {}
     setup = server_setup(["sandglass", "scan", str(spec), "--policy", str(policy_path)]
                          + (["--entry", entry] if entry else [])
@@ -455,19 +507,21 @@ def run_scan(spec: scan.PackageSpec, policy_path: Path, registry_dir: Path | Non
         folder = Path(tmp)
         folder.chmod(0o755)  # the install container's user must be able to read it
         try:
-            prepared = scan.download(spec, folder, multiarch, registry_dir)
-            package["files"] = scan.describe_files(prepared)  # each with its sha256
-            # The package hash (#21): compared with the registry's before any install.
-            package["hash"] = scan.verify_hash(prepared, registry_dir)
-            h = package["hash"]
-            print(f"Hash of {h['file']}: {h['ours']} ({'matches' if h['match'] else 'DOES NOT MATCH'}"
-                  f" {h['source']})")
-            if not h["match"]:
-                raise scan.ScanError(f"package hash mismatch: {h['file']} has {h['algorithm']} {h['ours']}, "
-                                     f"but {h['source']} publishes {h['published']}; not installed")
-            entry_name, server_path = scan.choose_entry(prepared, entry)
-            package["entry"] = {"name": entry_name, "path": server_path}
-            print(f"Entry point: {entry_name} -> {server_path}")
+            # The download phase (#156): download, archive checks, hash, entry point.
+            with durations.phase("download"):
+                prepared = scan.download(spec, folder, multiarch, registry_dir)
+                package["files"] = scan.describe_files(prepared)  # each with its sha256
+                # The package hash (#21): compared with the registry's before any install.
+                package["hash"] = scan.verify_hash(prepared, registry_dir)
+                h = package["hash"]
+                print(f"Hash of {h['file']}: {h['ours']} ({'matches' if h['match'] else 'DOES NOT MATCH'}"
+                      f" {h['source']})")
+                if not h["match"]:
+                    raise scan.ScanError(f"package hash mismatch: {h['file']} has {h['algorithm']} {h['ours']}, "
+                                         f"but {h['source']} publishes {h['published']}; not installed")
+                entry_name, server_path = scan.choose_entry(prepared, entry)
+                package["entry"] = {"name": entry_name, "path": server_path}
+                print(f"Entry point: {entry_name} -> {server_path}")
 
             policy = _scan_policy(policy_path, server_path, multiarch, runtime)
             print_policy(policy, enforced=True)
@@ -479,12 +533,14 @@ def run_scan(spec: scan.PackageSpec, policy_path: Path, registry_dir: Path | Non
                 install_trace = trace_dir / scan.INSTALL_TRACE_FILENAME
                 install_log = trace_dir / scan.INSTALL_LOG_FILENAME
                 print("Installing inside the sandbox (offline, traced)...")
-                exit_code = scan.install(prepared, volume, install_trace, install_log)
-                baseline = load_install_baseline(multiarch)
-                install_events, cut_short = parse_trace_file(install_trace,
-                                                             cwd=str(sandbox.CONTAINER_PACKAGE))
-                install = compare_install(install_events, policy, baseline, exit_code,
-                                          scan.log_tail(install_log), cut_short)
+                with durations.phase("install"):
+                    exit_code = scan.install(prepared, volume, install_trace, install_log)
+                with durations.phase("analysis"):  # the install's trace (#156)
+                    baseline = load_install_baseline(multiarch)
+                    install_events, cut_short = parse_trace_file(install_trace,
+                                                                 cwd=str(sandbox.CONTAINER_PACKAGE))
+                    install = compare_install(install_events, policy, baseline, exit_code,
+                                              scan.log_tail(install_log), cut_short)
                 package["install"] = {
                     "trace_file": str(install_trace), "log_file": str(install_log),
                     "exit_code": exit_code, "baseline": baseline.name,
@@ -492,10 +548,11 @@ def run_scan(spec: scan.PackageSpec, policy_path: Path, registry_dir: Path | Non
                 }
                 print(f"Install: exit {exit_code}, {len(install['violations'])} violation(s)")
                 if exit_code != 0:  # failed or timed out: nothing to run
-                    report = build_report(spec.slug, timestamp, policy, new_session_record(),
-                                          with_install(not_run(None), install), None, {},
-                                          _baseline(policy, runtime, multiarch), package, setup)
-                    return _write_and_print(report)
+                    with durations.phase("analysis"):
+                        report = build_report(spec.slug, timestamp, policy, new_session_record(),
+                                              with_install(not_run(None), install), None, {},
+                                              _baseline(policy, runtime, multiarch), package, setup)
+                    return _write_and_print(report, durations)
 
                 command, args = sandbox.scan_run_command(volume, server_path, runtime,
                                                          server_args, list(server_env))
@@ -507,7 +564,7 @@ def run_scan(spec: scan.PackageSpec, policy_path: Path, registry_dir: Path | Non
                     **WORKDIR_MAPPING,
                 }
                 return _trace_and_report(spec.slug, timestamp, command, args, policy, runtime,
-                                         multiarch, path_mapping, package, install=install,
+                                         multiarch, path_mapping, durations, package, install=install,
                                          setup=setup, server_env=server_env)
             finally:
                 sandbox.remove_volume(volume)
@@ -516,7 +573,8 @@ def run_scan(spec: scan.PackageSpec, policy_path: Path, registry_dir: Path | Non
             report = build_report(spec.slug, timestamp, policy, new_session_record(),
                                   not_run(str(exc)), None, {}, _baseline(policy, runtime, multiarch),
                                   package, setup)
-            return _write_and_print(report)
+            # No analysis phase: there was no trace to read (#156).
+            return _write_and_print(report, durations)
 
 
 def add_setup_arguments(parser: argparse.ArgumentParser) -> None:

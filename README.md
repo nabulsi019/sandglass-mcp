@@ -801,6 +801,18 @@ run normally is counted next to the verdict, e.g. `CLEAN (but 6 of 9 tools
 returned errors)` or `VIOLATIONS (and 1 of 4 tools timed out, 1 not
 called)`. The verdict word and the exit code don't change.
 
+**Durations** (#156). Every report records wall-clock time, measured on the
+host: the total, and each phase: **download** (scans: download, archive and
+hash checks), **install** (scans), **run** (the server's startup and tool
+calls) and **analysis** (reading the traces, comparing, building the
+report; writing the report itself isn't counted). A phase that didn't happen
+is `null` in `report["durations"]`, never 0: a fixture run has no download or
+install, and a scan stopped at the hash check has only a download. The
+Markdown header and the terminal summary show one line, e.g. `Duration:
+21.4 s (download 3.1, install 6.0, run 10.8, analysis 1.5)`, and the
+Coverage table shows each call's time next to its status. Durations vary
+from run to run and never affect the verdict or the exit code.
+
 If the server is still running 1 s after the client closed its stdin (e.g.
 a tool stuck in a thread), the stdin relay stops it, so the trace still ends
 with the server's exit. The report then says so.
