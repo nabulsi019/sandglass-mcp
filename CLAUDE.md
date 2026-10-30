@@ -94,6 +94,12 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
     its timezone "America/New_York" from param-description, no coverage
     summary; with `--inputs minimal` CLEAN with the coverage summary
     "1 of 1 tool returned errors", its timezone "hello" from fallback)
+  - every `EXPECTED_ENVIRONMENT` entry in `scripts/check_fixtures.py`, with
+    `PROXY_NAMES` and `BASE_ENV_NAMES` (#146: env_report_server and
+    env_report_server.js CLEAN under no_network.v1, with exactly those
+    variable names in both views and no "SANDGLASS" in any name or value),
+    the runtime and site dir passed to the launcher as arguments (never
+    `SANDGLASS_*` variables), and `UNSET_BEFORE_TRACING` in `sandglass/sandbox.py`
   - `EXPECTED_EXIT_CODES` in `scripts/check_fixtures.py` (the exit code of
     every verdict: 0 CLEAN, 1 VIOLATIONS, 3 INCOMPLETE; 2 is a usage error)
   - the sandbox hardening flags (--network none, --read-only, non-root user,

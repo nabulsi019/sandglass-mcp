@@ -382,11 +382,13 @@ The client runs:
 docker run -i --rm --network none --read-only --tmpfs /tmp --user 10001:10001 \
   -e HOME=/home/sandglass -v <project>:/project:ro --mount type=tmpfs,destination=/project/reports,tmpfs-mode=0555 \
   -w /project sandglass-sandbox \
-  sh -c 'mkdir -m 0700 /tmp/work && cd /tmp/work && launcher="$1" && shift &&
+  sh -c 'mkdir -m 0700 /tmp/work && cd /tmp/work &&
+         unset OLDPWD GPG_KEY PYTHON_VERSION PYTHON_SHA256 && launcher="$1" && shift &&
          exec strace -f -tt -y -e trace=file,process,network,memfd_create,io_uring_setup,io_uring_enter,io_uring_register,ptrace,process_vm_readv,process_vm_writev \
          --kill-on-exit -o /proc/self/fd/2 \
          /opt/venv/bin/python -S -c "$launcher" "$@" 3>/dev/null' \
-  sandglass-launch "<launcher.py>" <server> "<netsink.py>" "<stdin_relay.py>" [--server-arg values...]
+  sandglass-launch "<launcher.py>" <server> "<netsink.py>" "<stdin_relay.py>" <python|node> "<site dir or empty>" \
+  [--server-arg values...]
 ```
 
 (`--env` adds `-e NAME` for each name, without the value; see Server setup.)
@@ -449,6 +451,36 @@ that got through (no filter) also makes the run INCOMPLETE.
 `check_fixtures.py` also runs three fixtures with Docker's own seccomp
 profile turned off (`--security-opt seccomp=unconfined`, in the test script
 only, never in `sandglass/`), the review's Docker 20.10 case: same verdicts.
+
+### The server's environment (#146)
+
+A server sees exactly these environment variables (plus any `--env` names
+you give, #144):
+
+| Variable | Value | Where from |
+|---|---|---|
+| `PATH` | `/opt/venv/bin:/usr/local/bin:…` | the image |
+| `LANG` | `C.UTF-8` | the base image (`python:3.12-slim`) |
+| `PYTHONDONTWRITEBYTECODE` | `1` | the image (no `.pyc` writes in traces) |
+| `HOSTNAME` | the container id | Docker |
+| `HOME` | `/home/sandglass` | `docker run -e`: the decoy home |
+| `PWD` | `/tmp/work` | `sh`, the work folder |
+| `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, `https_proxy` | `http://127.0.0.1:18080` | the launcher: the network sink (below) |
+
+No variable name contains "Sandglass". The launcher's runtime and the
+scanned package's site folder are passed to it as arguments, not variables:
+for a Python server the launcher and the server are one process, and
+`/proc/self/environ` would keep a variable even after it was deleted. uv's
+build settings (`UV_*`) exist only while the image is built, and `sh`
+unsets the base image's build metadata (`GPG_KEY`, `PYTHON_VERSION`,
+`PYTHON_SHA256`) and `OLDPWD` before tracing starts.
+
+What still shows (on purpose, or not worth hiding): `HOME=/home/sandglass`
+(the decoy home is protected; renaming it is #159), and **a server can tell
+an HTTP proxy is configured on localhost**: it can read the variables,
+connect to the proxy or see its listener in `/proc/net/tcp`. Any port would
+be as visible, so it stays 18080. Other ways to notice the sandbox are in
+Known limitations.
 
 ### Network: a local sink, no route out
 
@@ -824,6 +856,13 @@ below are from each project's own paper or documentation.
   in the JSON). A read of `/proc/self/status` isn't flagged by itself: many
   runtimes read it for ordinary reasons, and the policy decides, like for any
   other file.
+- **A server can tell it's in the sandbox** in other cheap ways too (#159):
+  the Python launcher's `/proc/self/cmdline` (and the sink's and relay's)
+  contains Sandglass's source, `/etc/passwd` has a `sandglass` user and
+  `HOME` is `/home/sandglass`, and the proxy listens on 127.0.0.1:18080.
+  Its environment no longer names Sandglass (#146). Fully hiding a tracer
+  isn't possible; the aim is removing cheap tells, and "the server detects
+  the sandbox" stays a limitation of any dynamic analysis.
 
 - **The syscall filter (#84) covers the server, not the install phase.**
   The install container (`sandglass scan`) has no launcher, so nothing

@@ -138,37 +138,50 @@ def docker_command(server_script: Path, server_args: list[str] = (),
         "--mount", f"type=tmpfs,destination={CONTAINER_REPORTS},tmpfs-mode=0555",
     ]
     return docker, _traced_run_args(str(to_container_path(server_script)), mounts,
+                                    runtime_for(server_script),
                                     server_args=server_args, env_names=env_names)
 
 
-def _traced_run_args(server_path: str, mounts: list[str], env: dict | None = None,
+# Variables the image has that a server shouldn't see (#146): the base image's
+# build metadata, and the folder sh came from (/project or /package, which
+# would show it's a fixture run or a scan). sh unsets them before tracing.
+UNSET_BEFORE_TRACING = ("OLDPWD", "GPG_KEY", "PYTHON_VERSION", "PYTHON_SHA256")
+
+
+def _traced_run_args(server_path: str, mounts: list[str], runtime: str, site_dir: str = "",
                      workdir: PurePosixPath = CONTAINER_PROJECT, server_args: list[str] = (),
                      env_names: list[str] = ()) -> list[str]:
     """`docker run` arguments that run one server under strace, hardened.
 
     Shared by the fixture mode (docker_command) and scan mode
-    (scan_run_command); only the mounts, `workdir` (Docker's -w) and a few
-    environment variables differ. Either way the server itself runs in
-    CONTAINER_WORKDIR (#144).
+    (scan_run_command); only the mounts, `workdir` (Docker's -w) and
+    `site_dir` differ. Either way the server itself runs in CONTAINER_WORKDIR (#144).
 
-    The user's server setup (#144): `server_args` go after the relay code, as
-    separate list items (never through a shell string), and the launcher
-    hands them to the server. `env_names` become `-e NAME` with no value:
-    Docker copies the value from its own environment, which the client sets,
-    so values never appear on a command line.
+    `runtime` ("python" or "node") and `site_dir` (where pip installed a
+    scanned package, or "") are launcher ARGUMENTS, not environment
+    variables (#146): for a Python server the launcher and the server are one
+    process, and /proc/self/environ would keep a variable even after the
+    launcher deleted it.
+
+    The user's server setup (#144): `server_args` go after them, as separate
+    list items (never through a shell string), and the launcher hands them
+    to the server. `env_names` become `-e NAME` with no value: Docker copies
+    the value from its own environment, which the client sets, so values
+    never appear on a command line.
     """
     # sh, before strace (so untraced): make the empty work folder, owned by
-    # the sandbox user, and go into it. Then "$1" is the launcher code and
-    # "$@" the server path, the sink code, the relay code and the server's
-    # arguments, each passed on exactly as given.
+    # the sandbox user, go into it, and unset what the server shouldn't see.
+    # Then "$1" is the launcher code and "$@" the server path, the sink code,
+    # the relay code, the runtime, the site dir and the server's arguments,
+    # each passed on exactly as given.
     # -y (#122): print the file behind each fd, so a successful open shows the
     # file it really opened (= 3</home/x>), even through a symlink.
     strace = (f"mkdir -m 0700 {CONTAINER_WORKDIR} && cd {CONTAINER_WORKDIR} && "
+              f"unset {' '.join(UNSET_BEFORE_TRACING)} && "
               "launcher=\"$1\" && shift && "
               f"exec strace -f -tt -y -e trace={TRACED_SYSCALLS} --kill-on-exit"
               f" -o /proc/self/fd/2 {CONTAINER_PYTHON} -S -c \"$launcher\" \"$@\" 3>/dev/null")
-    env_args = [arg for name, value in (env or {}).items() for arg in ("-e", f"{name}={value}")]
-    env_args += [arg for name in env_names for arg in ("-e", name)]
+    env_args = [arg for name in env_names for arg in ("-e", name)]
     return [
         "run",
         "-i",                       # keep stdin open: it's the MCP stdio channel
@@ -182,11 +195,12 @@ def _traced_run_args(server_path: str, mounts: list[str], env: dict | None = Non
         *mounts,
         "-w", str(workdir),
         IMAGE,
-        # sh runs before strace, so it isn't traced. "$1".."$4" are the launcher
-        # code, the server path, the sink code and the relay code, as separate
-        # arguments; the server's own arguments follow (#144).
+        # sh runs before strace, so it isn't traced. "$1".."$6" are the launcher
+        # code, the server path, the sink code, the relay code, the runtime and
+        # the site dir, as separate arguments; the server's own arguments
+        # follow (#144).
         "sh", "-c", strace, "sandglass-launch",
-        LAUNCHER, server_path, NETSINK, STDIN_RELAY, *server_args,
+        LAUNCHER, server_path, NETSINK, STDIN_RELAY, runtime, site_dir, *server_args,
     ]
 
 
@@ -335,8 +349,7 @@ def scan_run_command(volume: str, server_path: str, runtime: str, server_args: l
     docker = shutil.which("docker") or "docker"
     mounts = ["-v", f"{volume}:{CONTAINER_PACKAGE}:ro"]
     # Read by the launcher after the fd swap (sandglass/launcher.py, step 4).
-    env = {"SANDGLASS_RUNTIME": runtime}
-    if runtime == "python":
-        env["SANDGLASS_SITE_DIR"] = str(CONTAINER_SITE)
-    return docker, _traced_run_args(server_path, mounts, env, workdir=CONTAINER_PACKAGE,
+    # An npm "bin" file doesn't always end in .js, so the runtime is passed.
+    site_dir = str(CONTAINER_SITE) if runtime == "python" else ""
+    return docker, _traced_run_args(server_path, mounts, runtime, site_dir, workdir=CONTAINER_PACKAGE,
                                     server_args=server_args, env_names=env_names)
