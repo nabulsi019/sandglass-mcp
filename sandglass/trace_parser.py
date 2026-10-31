@@ -24,7 +24,8 @@ Event kinds:
   process  execve/execveat: a program was launched
   network  connect/bind/listen/accept, and sendto/sendmsg/sendmmsg WITH a destination
   io_uring io_uring_setup/enter/register: file access strace can't see (#75)
-  evasion  clone/clone3 with CLONE_UNTRACED, ptrace, process_vm_readv/writev:
+  evasion  clone/clone3 with CLONE_UNTRACED, ptrace, process_vm_readv/writev,
+           pidfd_getfd, unshare, setns, userfaultfd (#155):
            ways out of strace's sight (#84), mode "evade"
   exit     a traced process exited ("+++ exited with 0 +++")
 """
@@ -77,8 +78,12 @@ IO_URING_SYSCALLS = {"io_uring_setup", "io_uring_enter", "io_uring_register"}
 # (sandglass/launcher.py) refuses: a child strace can't follow (clone or
 # clone3 with CLONE_UNTRACED), tracing another process (ptrace), and reading
 # or writing another process's memory (process_vm_readv/writev).
+# (#155) Also refused by the filter, and reported the same way: taking an fd
+# from another process (pidfd_getfd), new or other namespaces (unshare,
+# setns), and userfaultfd (stalling the kernel mid-syscall).
 # A plain clone (threads, fork) is not one of them and is skipped.
-EVASION_SYSCALLS = {"ptrace", "process_vm_readv", "process_vm_writev"}
+EVASION_SYSCALLS = {"ptrace", "process_vm_readv", "process_vm_writev",
+                    "pidfd_getfd", "unshare", "setns", "userfaultfd"}
 CLONE_SYSCALLS = {"clone", "clone3"}
 UNTRACED_FLAG = "CLONE_UNTRACED"
 

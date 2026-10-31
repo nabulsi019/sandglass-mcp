@@ -19,8 +19,25 @@ POLICY = load_policy(PROJECT_ROOT / "policies" / "templates" / "read_only_folder
                      container_script="/package/node_modules/x/server.js", package_dir="/package")
 BASELINE = load_install_baseline("x86_64-linux-gnu")
 
-# The installer's shell (strace can't read the first exec's arguments) ...
-START = "8     10:00:00.000001 execve(0x7ffdc67270d0, 0x7ffdc6728518, 0x7ffdc6728548) = 0"
+
+
+def filter_start(pid: int, second: str = "10:00:00") -> list[str]:
+    """(#155) How every install starts: Sandglass's syscall filter (strace
+    can't read the first exec's arguments), its self-test (both refused),
+    then its exec of the installer's shell, all in one pid."""
+    return [
+        f"{pid}     {second}.000001 execve(0x7ffdc67270d0, 0x7ffdc6728518, 0x7ffdc6728548) = 0",
+        f"{pid}     {second}.000002 io_uring_setup(1, {{flags=0, sq_thread_cpu=0, sq_thread_idle=0}})"
+        " = -1 EPERM (Operation not permitted)",
+        f"{pid}     {second}.000003 clone(child_stack=NULL, flags=CLONE_UNTRACED|SIGCHLD)"
+        " = -1 EPERM (Operation not permitted)",
+        f'{pid}     {second}.000004 execve("/bin/sh", ["/bin/sh", "-c", "exec 2>&1; cp /download/project/p'
+        '"..., "sandglass-installer"], 0x7ffd /* 9 vars */) = 0',
+    ]
+
+
+# The filter, then the installer's shell ...
+START = "\n".join(filter_start(8))
 # ... npm doing its job ...
 NPM = [
     '8     10:00:00.1 execve("/usr/bin/cp", ["cp", "/download/project/package.json", "/package/"], 0x5 /* 9 vars */) = 0',
@@ -180,8 +197,12 @@ def test_install_runs_under_strace_and_never_holds_the_trace_stream(tmp_path):
     traced = args[args.index("-c") + 1]
     assert "exec strace -f -tt -y -e trace=" in traced and "--kill-on-exit" in traced
     assert "-o /proc/self/fd/2" in traced
-    # The traced shell's first act: its stderr (the trace stream) becomes stdout.
-    assert '/bin/sh -c "exec 2>&1; $script"' in traced
+    assert traced.endswith('"$@"')
+    # (#155) strace runs Sandglass's syscall filter, which execs the installer's
+    # shell; the shell's first act: its stderr (the trace stream) becomes stdout.
+    command = args[args.index("sandglass-install") + 1:]
+    assert command[:5] == sandbox.filtered([])
+    assert command[5:] == ["/bin/sh", "-c", "exec 2>&1; " + scan.NPM_INSTALL_SCRIPT, "sandglass-installer"]
     assert "--network none" in joined and "--read-only" in joined and "--user 10001:10001" in joined
     assert "--cap-add" not in joined and "--privileged" not in joined
     assert [args[i + 1] for i, a in enumerate(args) if a == "-v"] == [

@@ -420,7 +420,8 @@ def test_strace_records_memfd_create_and_io_uring():
     _, args = sandbox.docker_command(SERVER)
     assert ("-e trace=file,process,network,memfd_create,"
             "io_uring_setup,io_uring_enter,io_uring_register,"
-            "ptrace,process_vm_readv,process_vm_writev ") in " ".join(args)
+            "ptrace,process_vm_readv,process_vm_writev,"
+            "pidfd_getfd,unshare,setns,userfaultfd ") in " ".join(args)  # (#155)
 
 
 def test_docker_command_is_least_privilege():

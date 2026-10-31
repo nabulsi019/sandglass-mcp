@@ -50,7 +50,10 @@ def test_read_only_root_and_no_extra_privileges(tmp_path):
 
 def test_npm_runs_with_ignore_scripts(tmp_path):
     args = _args(tmp_path)
-    npm = args[args.index("sandglass-download") + 1:]
+    command = args[args.index("sandglass-download") + 1:]
+    # (#155) npm runs through Sandglass's syscall filter, as an argv list.
+    assert command[:5] == sandbox.filtered([])
+    npm = command[5:]
     assert npm[:2] == ["npm", "install"] and "--ignore-scripts" in npm
     assert "--no-audit" in npm and "--no-fund" in npm
     assert npm[-1] == "sandglass-test-notes@1.0.0"

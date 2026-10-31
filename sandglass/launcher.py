@@ -17,8 +17,9 @@ In this order it:
      (fd 3, opened by sh) and closes fd 3, so the server can't touch the trace;
   1b. (#84) installs Sandglass's syscall filter (seccomp) on itself, so it
      covers everything started from here on (not strace, our parent), and
-     runs its self-test: io_uring, CLONE_UNTRACED clones, ptrace and
-     process_vm_* are refused, whatever Docker's own profile allows;
+     runs its self-test: io_uring, CLONE_UNTRACED clones, ptrace,
+     process_vm_*, pidfd_getfd, unshare, setns and userfaultfd (#155) are
+     refused, whatever Docker's own profile allows;
   2. (#13) starts the local network sink (sandglass/netsink.py) as its own
      process and waits until it listens, then points HTTP(S)_PROXY at it;
   3. (#91) starts the stdin relay (sandglass/stdin_relay.py) as its own
@@ -30,6 +31,10 @@ In this order it:
      stay closed and compare.py sees one extra exec it treats as the launch.
      If a Python server dies with an exception, its message is put into the
      trace (record_server_error, #24), since its stderr is /dev/null.
+
+With `--filter-then-exec PROGRAM [ARG...]` instead (#155) it only installs
+the same filter, runs the same self-test and execs PROGRAM: see
+filter_then_exec, for the install phase and the npm download container.
 
 Until step 4 only frozen stdlib modules (os, sys, runpy, site) are used, so no
 package code runs while the trace stream is still reachable. (Step 1b imports
@@ -106,18 +111,26 @@ def start_relay(source: str) -> None:
 SYSCALLS = {
     "x86_64": {"io_uring_setup": 425, "io_uring_enter": 426, "io_uring_register": 427,
                "ptrace": 101, "process_vm_readv": 310, "process_vm_writev": 311,
+               "pidfd_getfd": 438, "unshare": 272, "setns": 308, "userfaultfd": 323,
                "clone": 56, "clone3": 435},
     "aarch64": {"io_uring_setup": 425, "io_uring_enter": 426, "io_uring_register": 427,
                 "ptrace": 117, "process_vm_readv": 270, "process_vm_writev": 271,
+                "pidfd_getfd": 438, "unshare": 97, "setns": 268, "userfaultfd": 282,
                 "clone": 220, "clone3": 435},
 }
 # seccomp_data.arch for each (AUDIT_ARCH_*). A syscall made through another
 # ABI (e.g. 32-bit int 0x80 on x86_64) has another arch and other numbers.
 AUDIT_ARCH = {"x86_64": 0xC000003E, "aarch64": 0xC00000B7}
 # Refused with EPERM: io_uring (its file access is invisible to strace),
-# tracing or reading/writing another process's memory.
+# tracing or reading/writing another process's memory, and (#155):
+#   pidfd_getfd  copies an open fd out of another process (e.g. strace's)
+#   unshare      new namespaces (a user namespace gives root-like powers in it)
+#   setns        joins another namespace, outside what the sandbox shows
+#   userfaultfd  lets a process stall the kernel mid-syscall (race tricks
+#                against the tracer reading its arguments)
 BLOCKED = ("io_uring_setup", "io_uring_enter", "io_uring_register",
-           "ptrace", "process_vm_readv", "process_vm_writev")
+           "ptrace", "process_vm_readv", "process_vm_writev",
+           "pidfd_getfd", "unshare", "setns", "userfaultfd")
 CLONE_UNTRACED = 0x00800000  # a child strace can't follow: EPERM
 SIGCHLD = 17
 EPERM, ENOSYS = 1, 38
@@ -219,6 +232,25 @@ def filter_self_test() -> None:
         os.waitpid(pid, 0)
 
 
+# (#155) The second way to run this file: `python -S -c <this source>
+# --filter-then-exec PROGRAM [ARG...]`. It installs the same filter on
+# itself, runs the same self-test, then execs PROGRAM with its arguments
+# (an argv list, never a shell string). Used for the install phase (under
+# strace, so the installer and its children get the filter, strace doesn't)
+# and the npm download container. No fd swap: that is the server's run only.
+FILTER_THEN_EXEC = "--filter-then-exec"
+
+
+def filter_then_exec(argv: list[str]) -> None:
+    """Install the syscall filter, run its self-test, then exec argv (#155).
+    A bare program name is looked up in PATH (os.execvp)."""
+    cwd_entry = sys.path.pop(0)  # like main(): only the stdlib can provide ctypes
+    install_syscall_filter()
+    filter_self_test()
+    sys.path.insert(0, cwd_entry)
+    os.execvp(argv[0], argv)
+
+
 def main() -> None:
     # 1. The server must never hold the trace stream.
     os.dup2(3, 2)
@@ -315,4 +347,7 @@ def clean_message(message: str) -> str:
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:2] == [FILTER_THEN_EXEC]:
+        filter_then_exec(sys.argv[2:])  # (#155) install phase, npm download container
+    else:
+        main()
