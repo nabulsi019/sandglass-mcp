@@ -52,6 +52,16 @@ def test_every_runtime_fixture_is_protected():
             f"EXPECTED_RUNTIME entry {fixture} is not in CLAUDE.md's protected items"
 
 
+def test_every_process_fingerprint_fixture_is_protected():
+    # (#159) the process list fixture, and the helpers started by path.
+    for item in ("`EXPECTED_PROCESS_FINGERPRINTS`", "`/usr/local/lib/mcp-runtime/`"):
+        assert item in PROTECTED, f"{item!r} is not in CLAUDE.md's protected items"
+    for fixture in check_fixtures.EXPECTED_PROCESS_FINGERPRINTS:
+        assert fixture.removesuffix(".py") in PROTECTED
+    args = sandbox.docker_command(PROJECT_ROOT / "test_servers" / "good_notes_server.py")[1]
+    assert "sandglass" not in " ".join(args[args.index(sandbox.IMAGE) + 1:]).lower()
+
+
 def test_every_missing_program_fixture_is_protected():
     # (#148) the missing-program fixture and the exact reason it must give.
     assert "`EXPECTED_MISSING_PROGRAM`" in PROTECTED
@@ -139,7 +149,7 @@ def test_the_install_filter_is_protected_and_in_place():
     assert {"pidfd_getfd", "unshare", "setns", "userfaultfd"} <= set(launcher.BLOCKED)
     assert launcher.FILTER_THEN_EXEC == "--filter-then-exec"
     _, args = sandbox.scan_install_command("v", PROJECT_ROOT, scan.NPM_INSTALL_SCRIPT, [])
-    assert args[args.index("sandglass-install") + 1:][:5] == sandbox.filtered([])
+    assert args[args.index("install") + 1:][:4] == sandbox.filtered([])
 
 
 def test_the_sink_accounting_is_protected():

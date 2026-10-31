@@ -1,12 +1,12 @@
 """Runs first inside the sandbox, before the server. Not a module you run yourself.
 
-sandbox.py reads this file ON THE HOST and passes its source to the traced
-Python as:
+The Dockerfile copies it into the image at a neutral path (#159), with the
+sink and the relay next to it, and strace starts it as:
 
-    python -S -c <this source> <server.py> <netsink.py source> <stdin_relay.py source>
-                 <runtime> <site dir> [ARG...]
+    python -S /usr/local/lib/mcp-runtime/run.py <server.py> <runtime> <site dir> [ARG...]
 
-so the container never has to read an extra file. <runtime> is "python" or
+so no process's command line (/proc/<pid>/cmdline, readable by the server)
+carries Sandglass's source or name. <runtime> is "python" or
 "node", <site dir> where pip installed a scanned package ("" if none): both
 arguments, never environment variables, so the server's environment has no
 Sandglass name in it (#146). The ARGs (#144, --server-arg) are the server's
@@ -20,9 +20,10 @@ In this order it:
      runs its self-test: io_uring, CLONE_UNTRACED clones, ptrace,
      process_vm_*, pidfd_getfd, unshare, setns and userfaultfd (#155) are
      refused, whatever Docker's own profile allows;
-  2. (#13) starts the local network sink (sandglass/netsink.py) as its own
-     process and waits until it listens, then points HTTP(S)_PROXY at it;
-  3. (#91) starts the stdin relay (sandglass/stdin_relay.py) as its own
+  2. (#13) starts the local network sink (sandglass/netsink.py, in the image
+     as sink.py) as its own process and waits until it listens, then points
+     HTTP(S)_PROXY at it;
+  3. (#91) starts the stdin relay (sandglass/stdin_relay.py, relay.py) as its own
      process and makes its output the server's stdin, so the trace marks
      where the tool calls start;
   4. runs the server: a .py server as __main__ in this same Python, after
@@ -51,6 +52,11 @@ SINK_READY_FD = 3
 RELAY_READY_FD = 3
 PYTHON = "/opt/venv/bin/python"
 NODE = "/usr/bin/node"  # must match sandglass/sandbox.py CONTAINER_NODE
+# (#159) Where the Dockerfile puts this file (run.py), the sink and the relay:
+# a neutral path, so no command line names Sandglass. Must match sandbox.py.
+RUNTIME_DIR = "/usr/local/lib/mcp-runtime"
+SINK_SCRIPT = f"{RUNTIME_DIR}/sink.py"
+RELAY_SCRIPT = f"{RUNTIME_DIR}/relay.py"
 # (#24) A Python server that dies with an exception: the launcher stat()s
 # <this>/<message> (it doesn't exist), so the message lands in the trace.
 SERVER_ERROR_DIR = "/sandglass-server-error"
@@ -58,15 +64,16 @@ SERVER_ERROR_DIR = "/sandglass-server-error"
 MESSAGE_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,:;=_-+'()[]")
 
 
-def start_sink(source: str) -> None:
-    """Start netsink.py as a separate process and wait until it's listening.
+def start_sink() -> None:
+    """Start netsink.py (SINK_SCRIPT) as a separate process and wait until it's listening.
 
     Separate process, not a thread: the server can't patch its memory to stop
     it recording. posix_spawn, not os.fork(): on Python 3.12, os.fork() reads
     /proc/self/stat (thread count), which would show up in every trace.
+    -I: no script folder or cwd on sys.path; -S: stdlib only.
     """
     ready_r, ready_w = os.pipe()
-    os.posix_spawn(PYTHON, [PYTHON, "-I", "-S", "-c", source], {}, file_actions=[
+    os.posix_spawn(PYTHON, [PYTHON, "-I", "-S", SINK_SCRIPT], {}, file_actions=[
         (os.POSIX_SPAWN_CLOSE, 0),                        # not the MCP stdin...
         (os.POSIX_SPAWN_CLOSE, 1),                        # ...or stdout
         (os.POSIX_SPAWN_DUP2, ready_w, SINK_READY_FD),    # "I'm listening" pipe
@@ -76,8 +83,8 @@ def start_sink(source: str) -> None:
     os.close(ready_r)
 
 
-def start_relay(source: str) -> None:
-    """Start stdin_relay.py as a separate process and make it the server's stdin.
+def start_relay() -> None:
+    """Start stdin_relay.py (RELAY_SCRIPT) as a separate process and make it the server's stdin.
 
     The relay keeps the client's stdin (fd 0); its stdout (fd 1) becomes a
     pipe, and the read end of that pipe becomes this process's fd 0. os.pipe()
@@ -85,7 +92,7 @@ def start_relay(source: str) -> None:
     """
     stdin_r, stdin_w = os.pipe()
     ready_r, ready_w = os.pipe()
-    os.posix_spawn(PYTHON, [PYTHON, "-I", "-S", "-c", source], {}, file_actions=[
+    os.posix_spawn(PYTHON, [PYTHON, "-I", "-S", RELAY_SCRIPT], {}, file_actions=[
         (os.POSIX_SPAWN_DUP2, stdin_w, 1),                # relay's output -> server's stdin
         (os.POSIX_SPAWN_DUP2, ready_w, RELAY_READY_FD),   # "I'm running" pipe
     ])
@@ -232,7 +239,7 @@ def filter_self_test() -> None:
         os.waitpid(pid, 0)
 
 
-# (#155) The second way to run this file: `python -S -c <this source>
+# (#155) The second way to run this file: `python -S run.py
 # --filter-then-exec PROGRAM [ARG...]`. It installs the same filter on
 # itself, runs the same self-test, then execs PROGRAM with its arguments
 # (an argv list, never a shell string). Used for the install phase (under
@@ -245,6 +252,7 @@ def filter_then_exec(argv: list[str]) -> None:
     """Install the syscall filter, run its self-test, then exec argv (#155).
     A bare program name is looked up in PATH (os.execvp)."""
     cwd_entry = sys.path.pop(0)  # like main(): only the stdlib can provide ctypes
+    # (that entry is this script's folder; with `python -c` it was the cwd)
     install_syscall_filter()
     filter_self_test()
     sys.path.insert(0, cwd_entry)
@@ -258,22 +266,23 @@ def main() -> None:
 
     # 1b. (#84) Sandglass's syscall filter, then its self-test. After the fd
     # swap (protected, unchanged), before the sink, the relay or the server.
-    # They import ctypes (stdlib): sys.path[0], the cwd here, is taken off
-    # first, so only the standard library can be found (no listing of the
-    # cwd, and nothing in the project or package folder can stand in for ctypes).
+    # They import ctypes (stdlib): sys.path[0], this script's folder (#159),
+    # is taken off first, so only the standard library can be found (nothing
+    # in the project or package folder can stand in for ctypes).
     cwd_entry = sys.path.pop(0)
     install_syscall_filter()
     filter_self_test()
     sys.path.insert(0, cwd_entry)
 
-    # Look like `python <server.py>` would. With -c, sys.path[0] is "" (the
-    # cwd); replace it before importing anything non-frozen, or Python lists /project.
+    # Look like `python <server.py>` would: sys.path[0] is this script's
+    # folder; replace it with the server's before importing anything non-frozen.
     # Then the runtime ("python" or "node") and the site dir ("" if none),
     # as arguments, not environment variables (#146). Anything after them is
     # the server's own arguments (#144, --server-arg), passed on as given:
-    # the server sees `server ARG...`.
-    server, sink_source, relay_source, runtime, site_dir = sys.argv[1:6]
-    server_args = sys.argv[6:]
+    # the server sees `server ARG...`. (#159) The sink and relay are files
+    # in the image now, not source passed as arguments.
+    server, runtime, site_dir = sys.argv[1:4]
+    server_args = sys.argv[4:]
     sys.argv = [server, *server_args]
     sys.path[0] = os.path.dirname(server)
     # (#146) No Sandglass name in the server's environment. Sandglass sets
@@ -282,14 +291,14 @@ def main() -> None:
         del os.environ[name]
 
     # 2. The network sink.
-    start_sink(sink_source)
+    start_sink()
     for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
         os.environ[name] = SINK_URL
     for name in ("NO_PROXY", "no_proxy"):
         os.environ.pop(name, None)
 
     # 3. The stdin relay, which marks the start of the tool calls.
-    start_relay(relay_source)
+    start_relay()
 
     # 4. The server. Node: replace this process with node (same pid, same fds).
     # (The runtime is passed, not guessed: an npm "bin" file doesn't always

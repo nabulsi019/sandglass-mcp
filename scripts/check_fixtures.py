@@ -268,6 +268,15 @@ EXPECTED_MISSING_PROGRAM = {
         "the server needs a program the sandbox doesn't have: sandglass-missing-program"]),
 }
 
+# (#159) The command line of every process the server can see: no
+# "sandglass", in any case, in any argv. Under no_network.v1 (reads anywhere
+# but /home and /root, so reading /proc is allowed).
+# fixture -> (expected verdict, expected violations, the fewest processes it
+# must see: the launcher (its own process), the sink and the relay)
+EXPECTED_PROCESS_FINGERPRINTS = {
+    "process_list_server.py": ("CLEAN", set(), 3),
+}
+
 EXPECTED_RUNTIME = {
     # /dev/null O_RDWR, the overcommit_memory read, bind ::1 port 0, uname -p.
     "runtime_noise_server.py": ("CLEAN", set(), [(["uname", "-p"], UNAME_NOTE)]),
@@ -590,6 +599,22 @@ def environment_failures(label: str, report: dict, want_environ: set, want_proc_
     return failures
 
 
+def process_failures(label: str, report: dict, fewest: int) -> list[str]:
+    """(#159) What the process list fixture's tool returned: at least `fewest`
+    processes, and "sandglass" in no argv, in any case."""
+    calls = report.get("exercised") or []
+    if len(calls) != 1 or calls[0]["status"] != "OK":
+        return [f"{label}: expected one successful list_processes call, got {calls}"]
+    processes = json.loads(calls[0]["result"])
+    failures = []
+    if len(processes) < fewest:
+        failures.append(f"{label}: expected at least {fewest} processes, saw {processes}")
+    tells = {pid: argv for pid, argv in processes.items() if "sandglass" in json.dumps(argv).lower()}
+    if tells:
+        failures.append(f"{label}: 'sandglass' in the command line of {tells}")
+    return failures
+
+
 def main() -> int:
     failures = []
     # The exit code each verdict gives (#124); 2 stays argparse's usage error.
@@ -706,6 +731,13 @@ def main() -> int:
         failures += check(label, report, "CLEAN", set())
         failures += environment_failures(label, report, want_environ, want_proc_environ)
 
+    for fixture, (want_verdict, want_violations, fewest) in EXPECTED_PROCESS_FINGERPRINTS.items():
+        label = f"{fixture} under no_network.v1"
+        print(f"\n===== {label} =====")
+        report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, POLICIES["no_network.v1"])
+        failures += check(label, report, want_verdict, want_violations)
+        failures += process_failures(label, report, fewest)
+
     build_test_packages()
     for package, (want_verdict, want_violations) in EXPECTED_SCANS.items():
         print(f"\n===== scan {package} =====")
@@ -767,7 +799,7 @@ def main() -> int:
     if not failures:
         total = (len(EXPECTED) + len(EXPECTED_V04) + len(EXPECTED_POLICY_RUNS) + len(EXPECTED_HOSTILE)
                  + len(EXPECTED_OLD_DOCKER) + len(EXPECTED_TIMEOUTS) + len(EXPECTED_RUNTIME)
-                 + len(EXPECTED_MISSING_PROGRAM)
+                 + len(EXPECTED_MISSING_PROGRAM) + len(EXPECTED_PROCESS_FINGERPRINTS)
                  + len(EXPECTED_COVERAGE_SUMMARY) + len(EXPECTED_SERVER_SETUP)
                  + len(EXPECTED_ENVIRONMENT) + len(EXPECTED_INPUT_MODES)
                  + len(EXPECTED_SCANS) + len(EXPECTED_NPM_REGISTRY_SCANS)

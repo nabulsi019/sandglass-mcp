@@ -113,6 +113,11 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
     variable names in both views and no "SANDGLASS" in any name or value),
     the runtime and site dir passed to the launcher as arguments (never
     `SANDGLASS_*` variables), and `UNSET_BEFORE_TRACING` in `sandglass/sandbox.py`
+  - every `EXPECTED_PROCESS_FINGERPRINTS` entry in `scripts/check_fixtures.py`
+    (#159: process_list_server CLEAN under no_network.v1, seeing at least 3
+    processes and no "sandglass" in any case in any argv), and the helpers
+    started by path from `/usr/local/lib/mcp-runtime/` (never their source
+    or "sandglass" on a command line)
   - every `EXPECTED_MISSING_PROGRAM` entry in `scripts/check_fixtures.py`
     (#148: missing_program_server INCOMPLETE under notes_readonly, no
     violations, with exactly the reason "the server needs a program the

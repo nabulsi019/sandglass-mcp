@@ -305,8 +305,7 @@ def test_run_container_mounts_the_package_read_only():
     assert env_of(args) == ["HOME=/home/sandglass"]
     # The traced command is the same as for fixtures (strace, fd 3 to /dev/null).
     assert "-o /proc/self/fd/2" in joined and "3>/dev/null" in joined
-    assert args[-5:] == ["/package/site/bin/x", sandbox.NETSINK, sandbox.STDIN_RELAY,
-                         "python", "/package/site"]
+    assert args[-4:] == ["launch", "/package/site/bin/x", "python", "/package/site"]
 
 
 def test_scan_mounts_only_the_package_never_the_project():

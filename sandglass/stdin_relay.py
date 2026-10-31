@@ -1,7 +1,8 @@
 """The stdin relay: marks in the trace where the tool calls start (#91).
 
 Started by the launcher inside the sandbox, as its own process:
-`python -I -S -c <this source>`, like the network sink (sandglass/netsink.py).
+`python -I -S /usr/local/lib/mcp-runtime/relay.py` (#159), like the network
+sink (sandglass/netsink.py).
 
 It sits between the client and the server: it reads the client's MCP messages
 from its stdin (fd 0) and copies every byte, unchanged, to its stdout (fd 1),

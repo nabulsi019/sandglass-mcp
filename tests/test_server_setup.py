@@ -111,17 +111,18 @@ def test_env_names_only_and_args_after_the_relay():
     args = sandbox.docker_command(SERVER, ["--note-name", "a b"], ["SETUP_TEST_TOKEN"])[1]
     env = [args[i + 1] for i, a in enumerate(args) if a == "-e"]
     assert env == ["HOME=/home/sandglass", "SETUP_TEST_TOKEN"]  # no "=value"
-    assert args[-8:] == [sandbox.LAUNCHER, "/project/test_servers/setup_required_server.py",
-                         sandbox.NETSINK, sandbox.STDIN_RELAY, "python", "", "--note-name", "a b"]
+    # (#159) The launcher, sink and relay are files in the image, not arguments.
+    assert args[-6:] == ["launch", "/project/test_servers/setup_required_server.py",
+                         "python", "", "--note-name", "a b"]
     scan_args = sandbox.scan_run_command("v", "/package/x", "node", ["stdio"], ["K"])[1]
-    assert scan_args[-4:] == [sandbox.STDIN_RELAY, "node", "", "stdio"]
+    assert scan_args[-5:] == ["launch", "/package/x", "node", "", "stdio"]
     assert [scan_args[i + 1] for i, a in enumerate(scan_args) if a == "-e"] == \
         ["HOME=/home/sandglass", "K"]
 
 
 def test_without_setup_the_command_only_gains_the_work_folder():
     args = sandbox.docker_command(SERVER)[1]
-    assert args[-3:] == [sandbox.STDIN_RELAY, "python", ""]  # runtime and site dir (#146)
+    assert args[-3:] == ["/project/test_servers/setup_required_server.py", "python", ""]  # (#146)
     script = args[args.index("sh") + 2]
     assert script.startswith("mkdir -m 0700 /tmp/work && cd /tmp/work && ")
     # The hardening flags are unchanged (the docker options, before the image name).
@@ -150,9 +151,9 @@ def test_the_shell_passes_arguments_on_unchanged(tmp_path):
     out = subprocess.run(["sh", "-c", script, *args[i + 3:]], capture_output=True, text=True,
                          cwd=tmp_path, env={"PATH": f"{fake_bin}:/usr/bin:/bin"}, check=True)
     seen = json.loads(out.stdout)
-    python_args = seen["argv"][seen["argv"].index("-c") + 1:]
-    assert python_args == [sandbox.LAUNCHER, "/project/test_servers/setup_required_server.py",
-                           sandbox.NETSINK, sandbox.STDIN_RELAY, "python", "", *tricky]
+    python_args = seen["argv"][seen["argv"].index("-S") + 1:]
+    assert python_args == [str(sandbox.CONTAINER_LAUNCHER), "/project/test_servers/setup_required_server.py",
+                           "python", "", *tricky]
     assert Path(seen["cwd"]).resolve() == workdir.resolve()
     assert oct(workdir.stat().st_mode & 0o777) == "0o700"
     assert not list(tmp_path.glob("pwned*")) and not list(workdir.glob("pwned*"))
@@ -160,7 +161,7 @@ def test_the_shell_passes_arguments_on_unchanged(tmp_path):
 
 def test_the_launcher_hands_the_arguments_to_python_and_node():
     main = sandbox.LAUNCHER[sandbox.LAUNCHER.index("def main()"):]
-    assert "server_args = sys.argv[6:]" in main  # after the runtime and site dir (#146)
+    assert "server_args = sys.argv[4:]" in main  # after the runtime and site dir (#146, #159)
     assert "sys.argv = [server, *server_args]" in main
     assert "os.execv(NODE, [NODE, server, *server_args])" in main
     # Still after the fd swap and the filter (protected order, unchanged).

@@ -1,4 +1,5 @@
-# Only pyproject.toml, uv.lock and sandbox/ are needed to build the image.
+# Only pyproject.toml, uv.lock, sandbox/ and three files of sandglass/ (the
+# launcher, sink and relay, #159) are needed to build the image.
 .venv/
 .git/
 reports/
