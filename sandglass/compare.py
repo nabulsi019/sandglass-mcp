@@ -25,6 +25,17 @@ Rules (one place, so they're easy to explain):
     a record with no readable domain (#136) -> "unidentified connection to
       the sink": VIOLATION if no domain is allowed, INCOMPLETE if some are
     successful connects to the sink != the sink's records (#136) -> INCOMPLETE
+  DNS (#147): resolv.conf names only the DNS recorder (sandglass/dnssink.py,
+  127.0.0.1:53), which records every name looked up and answers NXDOMAIN.
+    a recorded name not in network.allow_domains -> VIOLATION ("dns query",
+      grouped with the sink's requests for the same domain)
+    a lookup step to 127.0.0.1:53 -> like any network event, except when
+      some domains are allowed: then exempt, like a connect to the sink
+    the recorder never started, stopped before the server, or recorded no
+      name although lookups reached it -> INCOMPLETE
+    The recorder is trusted like the sink: the first process to stat its
+    ready marker; only its launch, ready marker, sockets on 127.0.0.1:53 and
+    replies to loopback are skipped as its own.
   The sink (the first process to stat its "ready" marker, which the launcher
   waits for before any server code runs) and the stdin relay (found the same
   way, from its own "ready" marker) are Sandglass's helpers. Only an exact
@@ -98,7 +109,7 @@ from pathlib import Path
 
 from mcp.types import CONNECTION_CLOSED, REQUEST_TIMEOUT
 
-from sandglass import launcher, netsink, sandbox, stdin_relay
+from sandglass import dnssink, launcher, netsink, sandbox, stdin_relay
 from sandglass.policy import InstallBaseline, Policy
 from sandglass.trace_parser import MAX_TRACE_BYTES, NETWORK_SYSCALLS, UNREADABLE, Event, exec_argv
 
@@ -323,6 +334,78 @@ def _is_sink_own(event: Event, sink_exec: Event | None, before_ready: bool) -> b
     return False
 
 
+# (#147) The DNS recorder (sandglass/dnssink.py), trusted like the sink: only
+# the first process to stat its ready marker, and only an exact list of its
+# own events is skipped; anything else from its pid is judged.
+DNS_REASON = "looked up a domain not in network.allow_domains (DNS)"
+DNS_UNREADABLE = "(unreadable DNS query)"  # a query the recorder couldn't parse
+
+
+def _is_dns_own(event: Event, dns_exec: Event | None) -> bool:
+    """The DNS recorder's known events, apart from its query markers: its
+    launch, its ready marker, its two sockets on 127.0.0.1:53 (bind, listen,
+    accept from loopback) and its UDP replies to loopback clients."""
+    if event is dns_exec:
+        return True
+    if event.kind == "probe":
+        return event.target == dnssink.DNS_READY
+    if event.kind != "network":
+        return False
+    if event.syscall == "bind":
+        return _is_address(event.target, dnssink.DNS_HOST, dnssink.DNS_PORT)
+    if event.syscall == "listen":
+        return True
+    if event.syscall in ("accept", "accept4"):
+        return not event.succeeded or f'inet_addr("{dnssink.DNS_HOST}")' in event.target
+    if event.syscall in ("sendto", "sendmsg"):
+        return f'inet_addr("{dnssink.DNS_HOST}")' in event.target  # a reply, to the container's loopback
+    return False
+
+
+def _dns_query(target: str) -> tuple[str, str] | None:
+    """(type, name) from a recorder marker like /sandglass-dns/AAAA/example.com,
+    or None if the path isn't one. An unreadable query gives DNS_UNREADABLE."""
+    prefix = dnssink.DNS_MARKER_DIR + "/"
+    if not target.startswith(prefix) or target == dnssink.DNS_READY:
+        return None
+    qtype, sep, name = target[len(prefix):].partition("/")
+    if not sep or not name or "/" in name:
+        return None
+    if qtype == dnssink.INVALID:
+        return "?", DNS_UNREADABLE
+    return qtype, name
+
+
+def _to_dns_recorder(event: Event) -> bool:
+    """A connect or send to 127.0.0.1:53: a lookup step towards the recorder."""
+    return (event.kind == "network" and event.syscall in ("connect", "sendto", "sendmsg", "sendmmsg")
+            and _is_address(event.target, dnssink.DNS_HOST, dnssink.DNS_PORT))
+
+
+def _dns_problems(events: list[Event], dns_pid: int | None, server_launch: Event | None,
+                  dns_names: list[dict]) -> list[str]:
+    """(#147) Fail closed: what makes the recorded names untrustworthy, as
+    INCOMPLETE reasons. Names looked up while the recorder wasn't there are
+    missing from the report, so the run can't be called complete."""
+    if not events:
+        return []
+    if dns_pid is None:
+        return ["the DNS recorder never started, so names the server looked up can't be recorded"]
+    problems = []
+    dns_exit = next((i for i, e in enumerate(events) if e.kind == "exit" and e.pid == dns_pid), None)
+    server_exit = next((i for i, e in enumerate(events) if server_launch is not None
+                        and e.kind == "exit" and e.pid == server_launch.pid), None)
+    if dns_exit is not None and (server_exit is None or dns_exit < server_exit):
+        problems.append(f"the DNS recorder stopped before the server did ({events[dns_exit].target}); "
+                        "names looked up after that weren't recorded")
+    lookups = sum(1 for e in events if e.pid != dns_pid and _to_dns_recorder(e)
+                  and (e.succeeded or e.error == "EINPROGRESS"))
+    if lookups and not dns_names:
+        problems.append(f"name lookups reached the DNS recorder ({lookups} connect(s) or send(s) to "
+                        f"{dnssink.DNS_HOST}:{dnssink.DNS_PORT}) but it recorded no name")
+    return problems
+
+
 def _resolvers(events: list[Event], sink_pid: int | None) -> list[str] | None:
     """The container's nameservers, as the sink reported them (#141), or None
     if they are unknown (no report before "ready", or the file was unreadable).
@@ -502,12 +585,20 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
     server_errors: list[str] = []    # the server's own error messages, via the launcher (#24)
     programs: list[dict] = []        # every successful exec, allowed or not (#120)
     listening = _listening_sockets(events)  # sockets that listen() or accept() (#142)
+    # (#147) The DNS recorder: the first process to stat its ready marker.
+    dns_pid = _first_pid_to_stat(events, dnssink.DNS_READY)
+    dns_exec = _helper_exec(events, dns_pid)
+    dns_ready_index = next((i for i, e in enumerate(events) if e.pid == dns_pid and e.kind == "probe"
+                            and e.target == dnssink.DNS_READY), len(events))
+    dns_names: list[dict] = []  # every query the recorder recorded: name, type, phase
 
     for index, event in enumerate(events):
         if event.kind == "process" and event.succeeded:
             note = None
             if server_launch is None:
                 note = "Sandglass's launcher, which then starts the server"
+            elif event is dns_exec:
+                note = "Sandglass's DNS recorder"
             elif event is sink_exec:
                 note = "Sandglass's network sink"
             elif event is relay_exec:
@@ -530,6 +621,25 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
 
         if event.pid == sink_pid and _is_sink_own(event, sink_exec, index < sink_ready_index):
             continue  # the sink's launch, ready marker, proxy socket, isolation check (#99)
+
+        if event.pid == dns_pid and _is_dns_own(event, dns_exec):
+            continue  # (#147) the recorder's launch, ready marker, sockets and replies
+
+        query = (_dns_query(event.target) if event.pid == dns_pid and event.kind == "probe"
+                 and index > dns_ready_index else None)
+        if query is not None:
+            # (#147) A name the server looked up, as the DNS recorder recorded it.
+            qtype, name = query
+            dns_names.append({"name": name, "qtype": qtype, "phase": phase_of(index),
+                              "allowed": _domain_allowed(name, policy) and name != DNS_UNREADABLE,
+                              "timestamp": event.timestamp})
+            if dns_names[-1]["allowed"]:
+                continue
+            record = _record(Event("domain", "dns query", event.pid, event.timestamp, name, "domain",
+                                   True, None, event.raw), DNS_REASON, phase_of(index))
+            record["qtype"] = qtype
+            violations.append(record)
+            continue
 
         if (server_launch is not None and event.pid == server_launch.pid and event.kind == "probe"
                 and event.target.startswith(launcher.SERVER_ERROR_DIR + "/")):
@@ -625,6 +735,10 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
                 continue
             if _is_ipv6_probe_bind(event, listening):
                 continue  # urllib3 checking whether IPv6 works (#142)
+            if policy.allow_domains and dns_pid is not None and _to_dns_recorder(event):
+                # (#147) Like a connect to the sink: the recorder records the
+                # name, which is judged against allow_domains by itself.
+                continue
             reason = "network activity while network.allow is false"
             bucket = "violation"  # attempts count, even failed ones
 
@@ -659,7 +773,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
     if startup_exit:
         incomplete.append(startup_exit)
         # (#148) Only explains a run that is INCOMPLETE anyway: never changes a verdict.
-        missing = _missing_program(events, server_launch, attempted, programs, (sink_pid, relay_pid))
+        missing = _missing_program(events, server_launch, attempted, programs, (sink_pid, relay_pid, dns_pid))
         if missing:
             incomplete.append(f"{MISSING_PROGRAM}: {missing}")
     if trace_cut_short:
@@ -696,6 +810,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
                           f"recorded {len(domains)} request(s); a request may be missing")
     if evaded:
         incomplete.append(f"{EVADED_INCOMPLETE} ({len(evaded)} call(s), first: {evaded[0].raw})")
+    incomplete += _dns_problems(events, dns_pid, server_launch, dns_names)  # (#147)
     if incomplete:
         verdict = "INCOMPLETE"
     elif violations:
@@ -710,6 +825,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
         "attempted": attempted,
         "probes": sorted(probes.values(), key=lambda p: p["first_timestamp"]),
         "domains": domains,
+        "dns_names": dns_names,  # every name the DNS recorder recorded (#147)
         "network_isolation": isolation,
         "resolvers": resolvers,  # None: unknown (#141)
         "phase_note": phase_note,
@@ -1099,7 +1215,7 @@ def verdict_line(r: dict) -> str:
 
 # Where glibc asks the name service cache daemon (absent in the image) first.
 NSCD_SOCKETS = ("/var/run/nscd/socket", "/run/nscd/socket")
-NAME_LOOKUPS = "name lookups: domain not recorded (see #147)"
+NAME_LOOKUPS = "name lookups: no name recorded"
 SOCKADDR_RE = {
     "AF_UNIX": re.compile(r'sa_family=AF_UNIX, sun_path="([^"]*)"'),
     "AF_INET": re.compile(r'sa_family=AF_INET, sin_port=htons\((\d+)\), sin_addr=inet_addr\("([^"]+)"\)'),
@@ -1119,12 +1235,30 @@ def _sockaddr(target: str) -> tuple[str, str, int | None] | None:
     return None
 
 
-def _group_key(v: dict, index: int, resolvers: list[str] | None) -> tuple[tuple, str, str | None]:
+def _lookup_group(phase: str | None, names: list[str]) -> tuple[tuple, str]:
+    """(#147) Where the resolver's lookup steps (nscd socket, port 53 at the
+    resolver) go. They don't carry the name, and lookups run side by side, so
+    they're never matched one by one: with exactly one name recorded in the
+    phase they join that domain's entry; with several, one entry naming all;
+    with none, "no name recorded"."""
+    if len(names) == 1:
+        return ("domain", phase, names[0]), f"domain {names[0]}"
+    if names:
+        return ("name lookups", phase), f"name lookups for {', '.join(names)}"
+    return ("name lookups", phase), NAME_LOOKUPS
+
+
+def _group_key(v: dict, index: int, resolvers: list[str] | None,
+               names: dict | None = None) -> tuple[tuple, str, str | None]:
     """(key, label, breakdown line) of one violation record. Records with the
-    same key (always within one phase) form one entry."""
+    same key (always within one phase) form one entry. `names`: the DNS
+    recorder's names per phase (#147)."""
     phase = v.get("phase")
     if v["syscall"] == "proxy request":
         return ("domain", phase, v["target"]), f"domain {v['target']}", None
+    if v["syscall"] == "dns query":
+        # (#147) Same key as the sink's requests: one entry per domain, both ways.
+        return ("domain", phase, v["target"]), f"domain {v['target']}", f"DNS lookup {v.get('qtype')}"
     if v["syscall"] not in NETWORK_SYSCALLS:
         return ("event", index), "", None  # files, programs, evasions: one entry each
     address = _sockaddr(v["target"])
@@ -1132,12 +1266,13 @@ def _group_key(v: dict, index: int, resolvers: list[str] | None) -> tuple[tuple,
     if address is None:
         return ("network", phase, v["syscall"], v["target"]), f"{v['syscall']} {v['target']}", None
     family, host, port = address
+    phase_names = (names or {}).get(phase, [])
     if family == "AF_UNIX" and host in NSCD_SOCKETS:
-        return ("name lookups", phase), NAME_LOOKUPS, f"nscd socket{error}"
+        return (*_lookup_group(phase, phase_names), f"nscd socket{error}")
     if port == 53 and resolvers is not None and host in resolvers:
-        # The system resolver, from the container's resolv.conf: the trace
-        # doesn't contain the name looked up, so none is guessed.
-        return ("name lookups", phase), NAME_LOOKUPS, f"port 53 at {host}{error}"
+        # The system resolver, from the container's resolv.conf (the DNS
+        # recorder, #147): the step doesn't contain the name looked up.
+        return (*_lookup_group(phase, phase_names), f"port 53 at {host}{error}")
     if port == 53:
         # Never merged with the resolver's lookups: DNS sent somewhere else,
         # or (resolvers None) the resolver list couldn't be read.
@@ -1150,7 +1285,7 @@ def _group_key(v: dict, index: int, resolvers: list[str] | None) -> tuple[tuple,
 
 
 def group_violations(violations: list[dict], domains: list[dict],
-                     resolvers: list[str] | None) -> list[dict]:
+                     resolvers: list[str] | None, dns_names: list[dict] | None = None) -> list[dict]:
     """The violations as report entries (#141), in order of first appearance.
 
     Network events are grouped: proxy requests per domain, the system
@@ -1159,11 +1294,18 @@ def group_violations(violations: list[dict], domains: list[dict],
     port). Everything else stays one entry per event. Each entry lists the
     indexes of its events in `violations`, which is never changed: the
     verdict, the counts and check_fixtures.py use the raw list.
-    `resolvers` None means the nameservers are unknown.
+    `resolvers` None means the nameservers are unknown. (#147) `dns_names`,
+    the DNS recorder's names: a lookup joins its domain's entry, and the
+    lookup steps follow _lookup_group.
     """
+    names: dict[str, list[str]] = {}  # phase -> distinct names, in order
+    for d in dns_names or []:
+        phase_names = names.setdefault(d.get("phase"), [])
+        if d["name"] not in phase_names:
+            phase_names.append(d["name"])
     groups: dict[tuple, dict] = {}
     for index, v in enumerate(violations):
-        key, label, part = _group_key(v, index, resolvers)
+        key, label, part = _group_key(v, index, resolvers, names)
         group = groups.get(key)
         if group is None:
             group = groups[key] = {"label": label, "phase": v.get("phase"), "count": 0,
@@ -1179,7 +1321,9 @@ def group_violations(violations: list[dict], domains: list[dict],
             # How the server asked for it, from the sink's records.
             requests = [f"{d['method']} :{d['port']}" for d in domains
                         if d["host"] == rest[1] and d.get("phase") == rest[0]]
-            group["breakdown"] = {r: requests.count(r) for r in dict.fromkeys(requests)}
+            # (#147) then its DNS lookups and lookup steps, if any.
+            group["breakdown"] = {**{r: requests.count(r) for r in dict.fromkeys(requests)},
+                                  **group["breakdown"]}
     return list(groups.values())
 
 
@@ -1292,10 +1436,11 @@ def build_report(server: str, timestamp: str, policy: Policy, session: dict,
         "violations": result["violations"],  # every event, never grouped
         # The same violations as report entries (#141), for the summary and the Markdown.
         "violation_groups": group_violations(result["violations"], result["domains"],
-                                             result.get("resolvers")),
+                                             result.get("resolvers"), result.get("dns_names")),
         "attempted": result["attempted"],
         "probes": result["probes"],
         "domains": result["domains"],
+        "dns_names": result.get("dns_names", []),  # names the DNS recorder recorded (#147)
         "network_isolation": result["network_isolation"],
         "resolvers": result.get("resolvers"),  # the container's nameservers, None if unknown (#141)
         "phase_note": result["phase_note"],
@@ -1463,15 +1608,37 @@ def _network_section(r: dict) -> list[str]:
                     else "**unknown** (port 53 to any address is listed separately)"))
     lines += ["", "Domains the server asked the local sink for (nothing was sent anywhere):", ""]
     if not r.get("domains"):
+        lines.append("None.")
+    else:
+        # One row per identical request (#141); the JSON lists every one.
+        rows: dict[tuple, int] = {}
+        for d in r["domains"]:
+            key = (d["host"], d["port"], d["method"], d["allowed"], d.get("phase", "?"))
+            rows[key] = rows.get(key, 0) + 1
+        lines += ["| Domain | Port | Method | Allowed | Phase | Requests |", "|---|---|---|---|---|---|"]
+        for (host, port, method, allowed, phase), count in rows.items():
+            lines.append(f"| `{host}` | {port} | {method} | {'yes' if allowed else '**no**'} | {phase} | {count} |")
+    return lines + _dns_lines(r)
+
+
+def _dns_lines(r: dict) -> list[str]:
+    """(#147) The names the DNS recorder recorded, one line per (name, phase):
+    the query types, and whether the server then asked the sink for it."""
+    lines = ["", "Names the server looked up (the DNS recorder answered every one NXDOMAIN, "
+             "so no address was ever given):", ""]
+    names: dict[tuple, list[str]] = {}
+    for d in r.get("dns_names") or []:
+        types = names.setdefault((d["name"], d.get("phase", "?"), d.get("allowed")), [])
+        if d["qtype"] not in types:
+            types.append(d["qtype"])
+    if not names:
         return lines + ["None."]
-    # One row per identical request (#141); the JSON lists every one.
-    rows: dict[tuple, int] = {}
-    for d in r["domains"]:
-        key = (d["host"], d["port"], d["method"], d["allowed"], d.get("phase", "?"))
-        rows[key] = rows.get(key, 0) + 1
-    lines += ["| Domain | Port | Method | Allowed | Phase | Requests |", "|---|---|---|---|---|---|"]
-    for (host, port, method, allowed, phase), count in rows.items():
-        lines.append(f"| `{host}` | {port} | {method} | {'yes' if allowed else '**no**'} | {phase} | {count} |")
+    requested = {(d["host"], d.get("phase")) for d in r.get("domains", [])}
+    for (name, phase, allowed), types in names.items():
+        then = ("also requested through the proxy" if (name, phase) in requested
+                else "not contacted (answered NXDOMAIN)")
+        lines.append(f"- `{name}` ({phase}{'' if allowed else ', **not allowed**'}): "
+                     f"looked up (DNS: {', '.join(types)}), {then}")
     return lines
 
 

@@ -110,7 +110,8 @@ Expected verdicts:
 | good_notes_node_server.js | CLEAN | 0 (with the `node_debian` baseline) |
 | tamper_trace_server | VIOLATIONS | 3: list `/proc/1/fd`, read and write `/proc/1/fd/2` (all blocked with EACCES) |
 | missing_api_key_server | INCOMPLETE | 0; reason: exited during startup, `RuntimeError: NOTES_API_KEY is not set` |
-| process_list_server under `policies/templates/no_network.v1.yaml` | CLEAN | 0; sees at least the launcher, sink and relay, and no "sandglass" in any process's command line (#159) |
+| process_list_server under `policies/templates/no_network.v1.yaml` | CLEAN | 0; sees at least the launcher, sink and relay (and the DNS recorder), and no "sandglass" in any process's command line (#159) |
+| dns_fetch_server.js under `policies/templates/no_network.v1.yaml` | VIOLATIONS | one entry, `domain hidden-node.example`: the DNS recorder's A and AAAA lookups plus glibc's lookup steps, all in the tool-call phase; the tool gets ENOTFOUND (#147) |
 | missing_program_server | INCOMPLETE | 0; reasons: exited during startup, and "the server needs a program the sandbox doesn't have: sandglass-missing-program" (#148) |
 | aws_credentials_server under `policies/templates/no_network.v1.yaml` | VIOLATIONS | 1: read of `/home/sandglass/.aws/credentials` (`read_deny: /home`, #121) |
 | symlink_escape_server under `policies/templates/no_network.v1.yaml` | VIOLATIONS | 2, both on `/home/sandglass/.aws/credentials`: the symlink to it made in `/tmp` (a link counts as a read of its target), and the read through that link (judged by the file really opened, #122) |
@@ -566,9 +567,27 @@ Also before it marks itself ready, the sink reads the container's
 sink's own read and markers before "ready" count; the report's Network
 section lists the nameservers, or says they are unknown.
 
-Limitation: a server that ignores the proxy variables and resolves names
-itself shows up only as failed `connect()`s (violations), without the
-domain name (#147).
+**Names looked up: the DNS recorder (#147).** A server that ignores the
+proxy variables (Node's `fetch`, for one) looks names up itself. So the
+container gets `--dns 127.0.0.1 --dns-search .` (still `--network none`:
+127.0.0.1 is its own loopback), and before the sink the launcher starts
+`sandglass/dnssink.py` (in the image as `/usr/local/lib/mcp-runtime/dns.py`,
+by path, empty environment) on 127.0.0.1:53, UDP and TCP. It records every
+query's type and name (`/sandglass-dns/<type>/<name>`, stat()ed like the
+sink's markers, names lower-cased, anything outside `[a-z0-9._-]` escaped)
+and **answers NXDOMAIN, never an address**. Only the first process to stat
+`/sandglass-dns/ready` is trusted. The report lists the names in its Network
+section, e.g. "`hidden-node.example` (tool-call): looked up (DNS: A, AAAA),
+not contacted (answered NXDOMAIN)", and in the JSON as `dns_names`. A name
+not in `network.allow_domains` is a violation, in the same entry as the
+sink's requests for that domain. With some domains allowed, the lookup
+steps to 127.0.0.1:53 aren't violations (the name is judged instead), like
+a connect to the sink. **Fail closed:** the recorder never started (e.g. a
+Docker that doesn't let a non-root user bind port 53 in the container: the
+sandbox adds no `--sysctl` or capability for it), stopped before the server,
+or recorded no name although lookups reached it: INCOMPLETE. The install
+phase keeps Docker's resolver, so names looked up while installing are not
+recorded.
 
 **Network violations are grouped** (#141). One server request can take
 dozens of steps (glibc asks the nscd socket, then each nameserver on port
@@ -577,9 +596,14 @@ per:
 
 - **domain** asked of the sink, with its count;
 - **name lookups**: connects or sends to the nscd socket, or to port 53 at a
-  nameserver from the container's resolv.conf. The trace doesn't contain the
-  name looked up, so the entry says "domain not recorded (see #147)" and
-  never guesses one;
+  nameserver from the container's resolv.conf (the DNS recorder). These steps
+  don't contain the name, and lookups run side by side, so they're never
+  matched one by one (#147): if the recorder recorded exactly one name in
+  that phase, they join that domain's entry (e.g. `domain
+  hidden-node.example ×5 (nscd socket (ENOENT) ×2, port 53 at 127.0.0.1 ×1,
+  DNS lookup A ×1, DNS lookup AAAA ×1)`); with several names, one entry
+  "name lookups for a.example, b.example"; with none, "name lookups: no name
+  recorded";
 - **direct DNS to `<address>:53`** for port 53 anywhere else: that bypasses
   the system resolver. If the nameservers are unknown, every port-53 address
   is its own entry, never merged into the lookups;
@@ -964,6 +988,17 @@ below are from each project's own paper or documentation.
   opened (`test_servers/proc_self_escape_server.py`, #131). Failed opens and probes
   (`stat`) are still judged by the requested path only: strace can't show
   where they would have led.
+- **What the DNS recorder can't see** (#147). DNS over HTTPS (through the
+  proxy the sink records the DoH server's domain, not the name; direct to
+  an IP it's just a connect to that address); DNS over TLS (port 853) and
+  DNS to a hard-coded nameserver (shown as `direct DNS to X:53`, an address,
+  never the name); hard-coded IP addresses (no lookup at all). After the
+  NXDOMAIN answer, what a server would have done next (port, path, data) is
+  never seen: we get the name, not the request. Names looked up during the
+  install phase aren't recorded (Docker's resolver there). A flood of
+  queries only adds markers; the trace size cap (#83) makes an oversized
+  trace INCOMPLETE. The recorder runs as the server's user, like the sink:
+  a server that kills it makes the run INCOMPLETE.
 - **Programs in the image** (#148). Besides Python, the image has strace,
   `node`/`npm`/`npx` (Debian's), `sh`/`bash`, `uv` and `git` (added for
   servers like mcp-server-git; it brings perl, about 101 MB). Running any

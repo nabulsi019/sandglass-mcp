@@ -62,6 +62,23 @@ def test_every_process_fingerprint_fixture_is_protected():
     assert "sandglass" not in " ".join(args[args.index(sandbox.IMAGE) + 1:]).lower()
 
 
+def test_the_dns_recorder_is_protected_and_in_place():
+    # (#147) named in CLAUDE.md, with its fixture, and still what the code does.
+    flat = " ".join(PROTECTED.split())
+    for item in ("`EXPECTED_DNS`", "`sandglass/dnssink.py`", "`start_dns`", "`/sandglass-dns/ready`",
+                 "`--dns 127.0.0.1 --dns-search .`", "never started", "stopped before the server",
+                 "recorded no name", "not contacted (answered NXDOMAIN)"):
+        assert item in flat, f"{item!r} is not in CLAUDE.md's protected items"
+    for (fixture, policy_name), (_, names, entries, result, _) in check_fixtures.EXPECTED_DNS.items():
+        assert fixture.removesuffix(".js") in PROTECTED and policy_name in PROTECTED
+        assert all(name in PROTECTED for name in names) and result in PROTECTED
+    args = " ".join(sandbox.docker_command(PROJECT_ROOT / "test_servers" / "good_notes_server.py")[1])
+    assert "--network none" in args and "--dns 127.0.0.1 --dns-search ." in args
+    launcher = (PROJECT_ROOT / "sandglass" / "launcher.py").read_text(encoding="utf-8")
+    main = launcher[launcher.index("def main()"):]
+    assert main.index("filter_self_test()") < main.index("start_dns()") < main.index("start_sink(")
+
+
 def test_every_missing_program_fixture_is_protected():
     # (#148) the missing-program fixture and the exact reason it must give.
     assert "`EXPECTED_MISSING_PROGRAM`" in PROTECTED

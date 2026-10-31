@@ -28,9 +28,21 @@ def sandbox_policy():
                        multiarch="x86_64-linux-gnu")
 
 
+# (#147) The DNS recorder (sandglass/dnssink.py), pid 6, as it shows up in
+# every real trace, just before the sink: its exec, its UDP and TCP sockets
+# on 127.0.0.1:53, its ready marker.
+DNS_LINES = [
+    '6  10:00:00.000004 execve("/opt/venv/bin/python", ["/opt/venv/bin/python", "-I", "-S", "/usr/local/lib/mcp-runtime/dns.py"], 0x0 /* 0 vars */) = 0',
+    '6  10:00:00.000005 bind(3<UDP:[1]>, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("127.0.0.1")}, 16) = 0',
+    '6  10:00:00.000006 bind(4<TCP:[2]>, {sa_family=AF_INET, sin_port=htons(53), sin_addr=inet_addr("127.0.0.1")}, 16) = 0',
+    '6  10:00:00.000007 listen(4<TCP:[2]>, 16) = 0',
+    '6  10:00:00.000008 newfstatat(AT_FDCWD, "/sandglass-dns/ready", 0x7ffe8cb57b40, 0) = -1 ENOENT (No such file or directory)',
+]
+
 # The local network sink (sandglass/netsink.py) as it shows up in every real
-# trace: its own exec, its listening socket, the isolation check, the ready marker.
-SINK_LINES = [
+# trace: its own exec, its listening socket, the isolation check, the ready
+# marker. (#147) The DNS recorder's lines come first, as in a real run.
+SINK_LINES = DNS_LINES + [
     '9  10:00:00.000010 execve("/opt/venv/bin/python", ["/opt/venv/bin/python", "-I", "-S", "-c", "..."], 0x0 /* 0 vars */) = 0',
     '9  10:00:00.000020 bind(0, {sa_family=AF_INET, sin_port=htons(18080), sin_addr=inet_addr("127.0.0.1")}, 16) = 0',
     '9  10:00:00.000030 listen(0, 16)     = 0',
