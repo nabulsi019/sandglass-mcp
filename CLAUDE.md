@@ -57,6 +57,19 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
     syscall refused for another ABI; and compare.py's rules for it (a missing
     or failed self-test is INCOMPLETE, an evasion attempt is a violation).
     `seccomp=unconfined` never appears in `sandglass/`
+  - the same filter for the install phase and the npm download container
+    (#155): `filter_then_exec` (`--filter-then-exec`, an argv list, never a
+    shell string) as the first program strace runs in the install, and in
+    front of npm in the download container (`sandbox.filtered`); EPERM also
+    for pidfd_getfd, unshare, setns and userfaultfd; compare.py's install
+    rules (a missing or failed install self-test is INCOMPLETE "syscall
+    filter not active during install"); and every `EXPECTED_OLD_DOCKER_SCANS`
+    and `EXPECTED_OLD_DOCKER_NPM_REGISTRY_SCANS` entry in
+    `scripts/check_fixtures.py` (Docker's seccomp profile off for every
+    container of the scan, test code only: npm:sandglass-test-notes CLEAN,
+    npm:sandglass-test-postinstall VIOLATIONS, exactly its install-phase
+    read of the decoy credentials, and npm:sandglass-test-notes through the
+    download container CLEAN)
   - the network sink's accounting (#136): `sandglass/netsink.py` reads every
     connection side by side with a deadline and drains open and queued ones
     on shutdown (one record per connection); compare.py makes a trace/sink

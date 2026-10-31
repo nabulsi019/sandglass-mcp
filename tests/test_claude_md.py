@@ -126,6 +126,22 @@ def test_the_syscall_filter_is_protected_and_in_place():
     assert order == sorted(order)
 
 
+def test_the_install_filter_is_protected_and_in_place():
+    # (#155) named in CLAUDE.md, with the old-Docker scan expectations, and in the code.
+    from sandglass import launcher, scan
+    for item in ("filter_then_exec", "`--filter-then-exec`", "`sandbox.filtered`", "pidfd_getfd",
+                 "unshare", "setns", "userfaultfd", "syscall filter not active during install",
+                 "`EXPECTED_OLD_DOCKER_SCANS`", "`EXPECTED_OLD_DOCKER_NPM_REGISTRY_SCANS`"):
+        assert item in " ".join(PROTECTED.split()), f"{item!r} is not in CLAUDE.md's protected items"
+    for package in (list(check_fixtures.EXPECTED_OLD_DOCKER_SCANS)
+                    + list(check_fixtures.EXPECTED_OLD_DOCKER_NPM_REGISTRY_SCANS)):
+        assert package.split("@")[0] in PROTECTED
+    assert {"pidfd_getfd", "unshare", "setns", "userfaultfd"} <= set(launcher.BLOCKED)
+    assert launcher.FILTER_THEN_EXEC == "--filter-then-exec"
+    _, args = sandbox.scan_install_command("v", PROJECT_ROOT, scan.NPM_INSTALL_SCRIPT, [])
+    assert args[args.index("sandglass-install") + 1:][:5] == sandbox.filtered([])
+
+
 def test_the_sink_accounting_is_protected():
     # (#136) named in CLAUDE.md, with the hostile fixture's expected requests.
     for item in ("`EXPECTED_HOSTILE_DOMAINS`", "drains", "count mismatch", "unidentified connection",

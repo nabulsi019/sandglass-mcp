@@ -217,8 +217,9 @@ What happens (`sandglass/scan.py`):
    install never gets network access. This is where npm runs a package's
    `preinstall`/`postinstall` scripts, so misbehaviour at install time shows up
    here. strace writes the install trace to the container's stderr (saved as
-   `install-trace.txt` next to the server's trace); the traced shell's first
-   act is `exec 2>&1`, so pip, npm and every install script write to the
+   `install-trace.txt` next to the server's trace). The first traced program
+   is Sandglass's syscall filter (#155), which execs the installer's shell;
+   the shell's first act is `exec 2>&1`, so pip, npm and every install script write to the
    install log (`install-log.txt`) and never hold the trace stream. strace
    runs with `-y` here, so pip's and npm's folder-relative calls get full paths.
 
@@ -427,6 +428,9 @@ filter, instead of relying on whatever Docker version is installed:
 | `clone3` | its flags are in memory the filter can't read (could hold `CLONE_UNTRACED`) | `ENOSYS`: glibc, Python and Node then use `clone` |
 | `ptrace` | tracing another process (and making it act), or stopping strace | `EPERM` |
 | `process_vm_readv` / `process_vm_writev` | reading or writing another process's memory, e.g. a Sandglass helper's | `EPERM` |
+| `pidfd_getfd` (#155) | copying an open fd out of another process (e.g. strace's) | `EPERM` |
+| `unshare` / `setns` (#155) | new namespaces (a user namespace gives root-like powers inside it), or joining another one | `EPERM` |
+| `userfaultfd` (#155) | stalling the kernel mid-syscall: races against strace reading the arguments | `EPERM` |
 
 Any syscall from another ABI (32-bit `int 0x80` on x86_64, x32) gets `EPERM`
 too, since the numbers above wouldn't match there.
@@ -434,7 +438,7 @@ too, since the numbers above wouldn't match there.
 How: the launcher (`sandglass/launcher.py`), right after hiding the trace
 stream and before the sink, the relay or any server code, installs the
 filter on itself (`prctl(PR_SET_NO_NEW_PRIVS)`, then
-`SECCOMP_MODE_FILTER`, a 20-instruction BPF program written in Python with
+`SECCOMP_MODE_FILTER`, a 24-instruction BPF program written in Python with
 `ctypes`, for x86_64 and aarch64). A filter is inherited by every child and
 survives `exec`, so it covers the server and everything it starts, but not
 strace, the launcher's parent. Then it runs a **self-test**: it tries
@@ -452,6 +456,22 @@ that got through (no filter) also makes the run INCOMPLETE.
 `check_fixtures.py` also runs three fixtures with Docker's own seccomp
 profile turned off (`--security-opt seccomp=unconfined`, in the test script
 only, never in `sandglass/`), the review's Docker 20.10 case: same verdicts.
+
+**The install phase and the npm download container (#155)** get the same
+filter. The launcher has a second mode, `--filter-then-exec PROGRAM ARG...`:
+it installs the filter on itself, runs the same self-test, then execs the
+program (an argument list, never a shell string). In the install container
+it is the first program strace runs, and it execs the installer's shell, so
+pip, npm and every install script are filtered (strace isn't). The install's
+self-test must show both calls refused before the shell starts, otherwise
+the scan is INCOMPLETE ("syscall filter not active during install"). During
+the install a refused io_uring call is listed as attempted, and a refused
+evasion is a violation ("install tried to evade tracing"). In the download
+container (not traced) npm runs through it too. `check_fixtures.py` scans
+npm:sandglass-test-notes (also through the download container) and
+npm:sandglass-test-postinstall with Docker's seccomp profile off for every
+container of the scan: CLEAN, VIOLATIONS (the postinstall's read of the
+decoy credentials) and CLEAN, never INCOMPLETE because of npm's io_uring.
 
 ### The server's environment (#146)
 
@@ -879,12 +899,10 @@ below are from each project's own paper or documentation.
   isn't possible; the aim is removing cheap tells, and "the server detects
   the sandbox" stays a limitation of any dynamic analysis.
 
-- **The syscall filter (#84) covers the server, not the install phase.**
-  The install container (`sandglass scan`) has no launcher, so nothing
-  refuses `CLONE_UNTRACED` or `ptrace` there (Docker 25+'s own profile still
-  refuses io_uring). They are still seen: strace records the call that
-  starts the hidden child, so an install that tries is a violation and,
-  if it worked, INCOMPLETE; what the hidden child then did is not seen.
+- **The syscall filter covers the install too (#155), from its first
+  program on.** The few lines of the untraced outer `sh` that start strace
+  run before it, like in the server's run. The npm download container is
+  filtered but not traced: it only downloads, with `--ignore-scripts`.
 - **`/proc/<pid>/mem` is out of the filter's reach.** seccomp can't look at
   the path an `open` is given, so opening another process's memory file
   isn't refused by Sandglass. It is still an ordinary file open in the

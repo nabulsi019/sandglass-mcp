@@ -58,7 +58,8 @@ Rules (one place, so they're easy to explain):
                                                this at every startup)
     succeeded                               -> INCOMPLETE: the trace may be
                                                missing file access
-  Evasion (#84): clone/clone3 with CLONE_UNTRACED, ptrace, process_vm_readv/writev
+  Evasion (#84): clone/clone3 with CLONE_UNTRACED, ptrace, process_vm_readv/writev,
+    and (#155) pidfd_getfd, unshare, setns, userfaultfd
     any attempt, even refused -> VIOLATION "tried to evade tracing"
     succeeded                 -> also INCOMPLETE (a child or memory strace can't see)
   Syscall filter self-test (#84): the launcher's io_uring_setup and
@@ -109,23 +110,24 @@ EVADED_INCOMPLETE = ("a process got out of strace's sight (a CLONE_UNTRACED chil
                      "another process's memory), so its actions may be missing from the trace")
 FILTER_INACTIVE = ("Sandglass's syscall filter is not active (#84): its self-test before the server "
                    "started")
+FILTER_INACTIVE_INSTALL = "syscall filter not active during install (#155): its self-test before the installer started"
 EVADE_REASON = "tried to evade tracing"
 
 
-def _filter_self_test(events: list[Event], sink_pid: int | None) -> tuple[list[Event], str | None]:
+def _filter_self_test(events: list[Event], end: int) -> tuple[list[Event], str | None]:
     """The launcher's self-test of the syscall filter (#84): (its events, problem or None).
 
     Right after installing the filter, the launcher (the first process to
     exec) tries io_uring_setup and a clone with CLONE_UNTRACED. Only the FIRST
-    of each, from the launcher, before the sink marks itself ready (so before
-    any server code ran) counts. Both must be there and both must have failed
-    with EPERM; anything else means the filter isn't doing its job.
+    of each, from the launcher, before `end` counts: in the server's run the
+    sink's ready marker (so before any server code ran), in the install
+    (#155) the filter's exec of the installer's shell. Both must be there and
+    both must have failed with EPERM; anything else means the filter isn't
+    doing its job.
     """
     launch = next((e for e in events if e.kind == "process" and e.succeeded), None)
     if launch is None:
         return [], None  # no launch at all: INCOMPLETE for that reason already
-    end = next((i for i, e in enumerate(events) if e.pid == sink_pid and e.kind == "probe"
-                and e.target == netsink.SINK_READY), len(events))
     found = {}
     for event in events[:end]:
         if event.pid != launch.pid:
@@ -189,10 +191,12 @@ def _listening_sockets(events: list[Event]) -> set[str]:
 
 def _is_ipv6_probe_bind(event: Event, listening: set[str]) -> bool:
     """A bind() to 127.0.0.1 or ::1 with port 0, on a socket that never
-    listens or accepts (#142). urllib3 does this to check whether IPv6 works:
-    such a socket can't receive anything. A real port, another address, or a
-    listen() on the same socket is still a violation, and so is anything the
-    socket then connects to or sends."""
+    listens or accepts (#142). urllib3 does this to check whether IPv6 works.
+    It covers any socket type: a TCP socket like that can't receive
+    anything; a UDP one (which never listens) could receive datagrams, but
+    only on loopback, from inside the container (#155). A real port, another
+    address, or a listen() on the same socket is still a violation, and so
+    is anything the socket then connects to or sends."""
     if event.syscall != "bind":
         return False
     inode = _socket_inode(event.raw)
@@ -492,7 +496,8 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
     io_uring_used: list[Event] = []  # io_uring calls that succeeded (#75)
     evaded: list[Event] = []         # evasions that worked (#84): a child or memory strace can't see
     unidentified: list[Event] = []   # sink records with no domain, when some domains are allowed (#136)
-    self_test, filter_problem = _filter_self_test(events, sink_pid)  # the syscall filter's (#84)
+    # The syscall filter's self-test (#84), before the sink is ready.
+    self_test, filter_problem = _filter_self_test(events, sink_ready_index)
     unreadable: list[Event] = []     # file/stat events whose path strace couldn't read (#98)
     server_errors: list[str] = []    # the server's own error messages, via the launcher (#24)
     programs: list[dict] = []        # every successful exec, allowed or not (#120)
@@ -819,14 +824,21 @@ def compare_install(events: list[Event], policy: Policy, baseline: InstallBaseli
                 pip and npm read, plus both runtimes' startup reads), and
                 listing its exact folders (/etc) but nothing inside them
       writes    /package, /tmp, /dev/null (nothing else is writable anyway)
-      programs  the first exec (the installer's shell), then the baseline's
+      programs  the first exec (Sandglass's syscall filter, #155, which then
+                execs the installer's shell), then the baseline's
                 sh / cp / env / node / npm / Python / uname
       network   sockets of a family that can't leave the machine (AF_NETLINK),
-                and bind() to the loopback address (pip checking for IPv6)
+                and bind() to the loopback address (pip checking for IPv6),
+                on any socket type: TCP or UDP
     A new symlink or hard link counts as a READ of where it points: a link in
     /tmp to ~/.aws/credentials would otherwise make that read look allowed.
     Everything else follows the same rules as the server's run (violation /
     attempted / probe; unreadable path or working io_uring -> INCOMPLETE).
+    The syscall filter (#155) covers the install too: a refused io_uring call
+    is "attempted"; a refused evasion (CLONE_UNTRACED, ptrace, process_vm_*,
+    pidfd_getfd, unshare, setns, userfaultfd) a violation; and its self-test,
+    before the installer's shell starts, must show it active, else INCOMPLETE
+    "syscall filter not active during install".
     The install failing or timing out -> INCOMPLETE, with the end of its log.
     """
     read_ok = policy.read_allow + baseline.read_allow
@@ -835,6 +847,12 @@ def compare_install(events: list[Event], policy: Policy, baseline: InstallBaseli
     violations, attempted, probes, incomplete = [], [], {}, []
     unreadable, io_uring_used, programs, evaded = [], [], [], []
     launch: Event | None = None
+    # (#155) The first program is Sandglass's syscall filter; its self-test
+    # comes before it execs the installer's shell (same pid).
+    first = next((e for e in events if e.kind == "process" and e.succeeded), None)
+    shell_index = next((i for i, e in enumerate(events) if first is not None and e is not first
+                        and e.kind == "process" and e.succeeded and e.pid == first.pid), len(events))
+    self_test, filter_problem = _filter_self_test(events, shell_index)
 
     def readable(path: str) -> bool:
         """Allowed to read: under read_ok and not in read_deny (deny wins, #121)."""
@@ -844,7 +862,9 @@ def compare_install(events: list[Event], policy: Policy, baseline: InstallBaseli
         (violations if bucket == "violation" else attempted).append(
             _record(event, reason, "install", target))
 
-    for event in events:
+    for index, event in enumerate(events):
+        if any(event is own for own in self_test):
+            continue  # the filter's self-test, judged by _filter_self_test (#155)
         if event.kind in ("file", "probe") and event.target == UNREADABLE:
             unreadable.append(event)
         elif event.kind == "file":
@@ -874,10 +894,14 @@ def compare_install(events: list[Event], policy: Policy, baseline: InstallBaseli
                 entry["syscalls"][event.syscall] = entry["syscalls"].get(event.syscall, 0) + 1
         elif event.kind == "process":
             if event.succeeded:  # "Programs run" (#120): every successful exec
-                programs.append(_program(event, "install",
-                                         "the installer's shell" if launch is None else None))
+                note = None
+                if launch is None:
+                    note = "Sandglass's syscall filter, which then starts the installer's shell"
+                elif index == shell_index:
+                    note = "the installer's shell"
+                programs.append(_program(event, "install", note))
             if launch is None and event.succeeded:
-                launch = event  # strace starting the installer's shell
+                launch = event  # strace starting the filter (#155), then the installer's shell
             elif not _is_under(event.target, exec_ok):
                 # A failed exec didn't run anything (#120): "tried to run".
                 did = "ran" if event.succeeded else "tried to run"
@@ -897,8 +921,8 @@ def compare_install(events: list[Event], policy: Policy, baseline: InstallBaseli
                 record(event, "io_uring blocked (file access through it would be invisible to strace)",
                        "attempted")
         elif event.kind == "evasion":
-            # (#84) Same rule as the server's run. The install has no launcher,
-            # so nothing refuses these here: one that worked hid what followed.
+            # (#84) Same rule as the server's run: refused by the filter
+            # (#155) or not, trying is a violation; one that worked hid what followed.
             record(event, f"install {EVADE_REASON}", "violation")
             if event.succeeded:
                 evaded.append(event)
@@ -927,6 +951,9 @@ def compare_install(events: list[Event], policy: Policy, baseline: InstallBaseli
     if evaded:
         incomplete.append(f"{EVADED_INCOMPLETE} (during the install: {len(evaded)} call(s), "
                           f"first: {evaded[0].raw})")
+    if filter_problem and events:
+        # (#155) e.g. "...: io_uring_setup succeeded instead of being refused (EPERM)"
+        incomplete.append(FILTER_INACTIVE_INSTALL + filter_problem[len(FILTER_INACTIVE):])
 
     return {
         "incomplete_reasons": incomplete,

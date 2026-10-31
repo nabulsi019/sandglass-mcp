@@ -10,6 +10,7 @@ from sandglass.compare import (DEPENDENCY_HASH_NOTE, _markdown, build_report, co
                                group_attempted, not_run, with_install)
 from sandglass.policy import load_install_baseline, load_policy
 from sandglass.trace_parser import exec_argv, parse_trace
+from tests.test_install import filter_start
 
 POLICY = load_policy(PROJECT_ROOT / "policies" / "templates" / "read_only_folder.v1.yaml",
                      in_sandbox=True, multiarch="x86_64-linux-gnu",
@@ -60,6 +61,9 @@ SAMPLE = [
 
 
 def judge(lines=SAMPLE):
+    """(#155) Since the install runs through Sandglass's syscall filter, its
+    self-test and exec of the installer's shell follow the first line."""
+    lines = lines[:1] + filter_start(10, "19:32:45")[1:] + lines[1:]
     return compare_install(parse_trace("\n".join(lines), cwd="/package"), POLICY, BASELINE, 0)
 
 
@@ -76,6 +80,7 @@ def test_programs_lists_every_successful_exec_with_its_argv():
     programs = judge()["programs"]
     assert [(p["pid"], p["path"], p["argv"]) for p in programs] == [
         (10, "<unreadable>", None),
+        (10, "/bin/sh", ["/bin/sh", "-c", "exec 2>&1; cp /download/project/p...", "sandglass-installer"]),
         (11, "/usr/bin/cp", ["cp", "/download/project/package.json", "/package/"]),
         (10, "/usr/bin/npm", ["npm", "install", "--offline", "--no-audit", "--no-fund"]),
         (10, "/usr/bin/node", ["node", "/usr/bin/npm", "install", "--offline", "--no-audit", "--no-fund"]),
@@ -83,7 +88,9 @@ def test_programs_lists_every_successful_exec_with_its_argv():
         (24, "/usr/bin/node", ["node", "postinstall.js"]),
     ]
     assert all(p["phase"] == "install" for p in programs)
-    assert programs[0]["note"] == "the installer's shell"
+    assert programs[0]["note"] == "Sandglass's syscall filter, which then starts the installer's shell"
+    assert programs[1]["note"] == "the installer's shell"
+    assert judge()["incomplete_reasons"] == []  # the self-test shows the filter active
 
 
 def test_path_searches_are_one_entry_each_with_where_they_were_found():

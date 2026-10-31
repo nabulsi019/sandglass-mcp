@@ -174,6 +174,22 @@ EXPECTED_OLD_DOCKER = {
     "untraced_clone_server.py": ("VIOLATIONS", [("evade", "clone CLONE_UNTRACED"), ("read", CREDS)]),
     "iouring_node_server.js": ("VIOLATIONS", [("read", CREDS)]),
 }
+# (#155) The same simulation for npm scans: Docker's seccomp profile off for
+# EVERY container of the scan (the install, the server's run and the npm
+# download container), so only Sandglass's filter refuses npm's io_uring
+# during the install. The normal verdicts, not INCOMPLETE. Test code only.
+# package spec -> (expected verdict, expected violations), from the local
+# folder registry like EXPECTED_SCANS...
+EXPECTED_OLD_DOCKER_SCANS = {
+    "npm:sandglass-test-notes@1.0.0": ("CLEAN", set()),
+    "npm:sandglass-test-postinstall@1.0.0": ("VIOLATIONS", {
+        ("read", "/home/sandglass/.aws/credentials"),
+    }),
+}
+# ...and through the npm download container from the local npm registry (#138).
+EXPECTED_OLD_DOCKER_NPM_REGISTRY_SCANS = {
+    "npm:sandglass-test-notes@1.0.0": ("CLEAN", set()),
+}
 
 
 # (#140) A tool that hangs: it times out, the next tool is still called, and
@@ -299,6 +315,32 @@ def docker_options(options: list[str]):
         yield
     finally:
         sandbox._traced_run_args = original
+
+
+@contextlib.contextmanager
+def scan_docker_options(options: list[str]):
+    """(#155) Add `docker run` options to EVERY container of a scan inside the
+    `with` block: the install, the server's run and the npm download
+    container. Test only: the product commands are unchanged."""
+    originals = (sandbox.scan_install_command, sandbox.npm_download_container_args)
+
+    def install_with_options(*args, **kwargs):
+        docker, run_args = originals[0](*args, **kwargs)
+        image = run_args.index(sandbox.IMAGE)
+        return docker, run_args[:image] + options + run_args[image:]
+
+    def download_with_options(*args, **kwargs):
+        run_args = originals[1](*args, **kwargs)
+        image = run_args.index(sandbox.IMAGE)
+        return run_args[:image] + options + run_args[image:]
+
+    sandbox.scan_install_command, sandbox.npm_download_container_args = (install_with_options,
+                                                                          download_with_options)
+    try:
+        with docker_options(options):
+            yield
+    finally:
+        sandbox.scan_install_command, sandbox.npm_download_container_args = originals
 
 
 # `sandglass scan` of our own test packages (#19), from the local test
@@ -679,6 +721,15 @@ def main() -> int:
         if missing:
             failures.append(f"{package}: expected failed attempts {sorted(missing)} are missing")
 
+    # (#155) npm scans with Docker's own seccomp profile off: Sandglass's filter alone.
+    for package, (want_verdict, want_violations) in EXPECTED_OLD_DOCKER_SCANS.items():
+        label = f"{package} with Docker's seccomp profile off (old-Docker simulation)"
+        print(f"\n===== scan {label} =====")
+        with scan_docker_options(OLD_DOCKER_OPTIONS):
+            report = run_scan(parse_spec(package), SCAN_POLICY, TEST_REGISTRY)
+        failures += check(label, report, want_verdict, want_violations,
+                          EXPECTED_SCAN_PHASES.get(package, "tool-call"))
+
     # npm through the download container (#138), from a local registry.
     with local_npm_registry() as downloads:
         for package, (want_verdict, want_violations, want_reasons) in EXPECTED_NPM_REGISTRY_SCANS.items():
@@ -691,12 +742,21 @@ def main() -> int:
                          for text in want_reasons if text not in reasons]
             if not want_reasons and not (report.get("package", {}).get("hash") or {}).get("match"):
                 failures.append(f"{label}: the hash check did not match: {report.get('package', {}).get('hash')}")
+        # (#155) The same, with Docker's own seccomp profile off for every container.
+        for package, (want_verdict, want_violations) in EXPECTED_OLD_DOCKER_NPM_REGISTRY_SCANS.items():
+            label = (f"{package} (download container, local npm registry) with Docker's seccomp "
+                     "profile off (old-Docker simulation)")
+            print(f"\n===== scan {label} =====")
+            with scan_docker_options(OLD_DOCKER_OPTIONS):
+                report = run_scan(parse_spec(package), SCAN_POLICY, None)
+            failures += check(label, report, want_verdict, want_violations)
     for package, files in downloads:
         unexpected = [f for f in files if not f.startswith(NPM_DOWNLOAD_OUTPUT)]
         if unexpected or "project/package-lock.json" not in files:
             failures.append(f"{package}: the download container left {unexpected or 'no lockfile'} on the host")
-    if len(downloads) != len(EXPECTED_NPM_REGISTRY_SCANS):
-        failures.append(f"expected {len(EXPECTED_NPM_REGISTRY_SCANS)} npm downloads, saw {len(downloads)}")
+    want_downloads = len(EXPECTED_NPM_REGISTRY_SCANS) + len(EXPECTED_OLD_DOCKER_NPM_REGISTRY_SCANS)
+    if len(downloads) != want_downloads:
+        failures.append(f"expected {want_downloads} npm downloads, saw {len(downloads)}")
     escaped = escaped_traversal_files()
     if escaped:
         failures.append(f"sandglass-test-traversal wrote outside its folder on the host: {escaped}")
@@ -710,7 +770,8 @@ def main() -> int:
                  + len(EXPECTED_MISSING_PROGRAM)
                  + len(EXPECTED_COVERAGE_SUMMARY) + len(EXPECTED_SERVER_SETUP)
                  + len(EXPECTED_ENVIRONMENT) + len(EXPECTED_INPUT_MODES)
-                 + len(EXPECTED_SCANS) + len(EXPECTED_NPM_REGISTRY_SCANS))
+                 + len(EXPECTED_SCANS) + len(EXPECTED_NPM_REGISTRY_SCANS)
+                 + len(EXPECTED_OLD_DOCKER_SCANS) + len(EXPECTED_OLD_DOCKER_NPM_REGISTRY_SCANS))
         print(f"all {total} fixtures match expectations")
     return 1 if failures else 0
 

@@ -29,7 +29,7 @@ import shutil
 import subprocess
 from pathlib import Path, PurePosixPath
 
-from sandglass import PROJECT_ROOT
+from sandglass import PROJECT_ROOT, launcher
 
 IMAGE = "sandglass-sandbox"
 
@@ -76,9 +76,20 @@ STDIN_RELAY = (PROJECT_ROOT / "sandglass" / "stdin_relay.py").read_text(encoding
 #                 process or reaching into its memory; refused by Sandglass's
 #                 syscall filter (launcher.py), recorded as attempts to evade.
 #                 (clone and clone3 are already in "process".)
+#   pidfd_getfd, unshare, setns, userfaultfd   (#155) also refused by the
+#                 filter, and recorded as attempts to evade like the above.
 TRACED_SYSCALLS = ("file,process,network,memfd_create,"
                    "io_uring_setup,io_uring_enter,io_uring_register,"
-                   "ptrace,process_vm_readv,process_vm_writev")
+                   "ptrace,process_vm_readv,process_vm_writev,"
+                   "pidfd_getfd,unshare,setns,userfaultfd")
+
+
+def filtered(argv: list[str]) -> list[str]:
+    """`argv` run through Sandglass's syscall filter (#155): the launcher in
+    its --filter-then-exec mode installs the filter on itself, runs the
+    self-test, then execs argv. The system Python (/usr/local/bin/python),
+    -S: no site-packages, so no package code runs before the filter."""
+    return [str(CONTAINER_SYSTEM_PYTHON), "-S", "-c", LAUNCHER, launcher.FILTER_THEN_EXEC, *argv]
 
 
 def to_container_path(host_path: Path) -> PurePosixPath:
@@ -261,17 +272,23 @@ def scan_install_command(volume: str, download_dir: Path, script: str, script_ar
     and the host saves it (install-trace.txt). The traced shell's first act is
     `exec 2>&1`, so the installer and every install script it runs (npm's
     preinstall/postinstall) write to stdout (the install log) and never hold
-    the trace stream. Before that line only /bin/sh runs.
+    the trace stream. Before that line only Sandglass's filter and /bin/sh run.
+
+    (#155) The first traced program is Sandglass's syscall filter (the
+    launcher's --filter-then-exec mode, see `filtered`): it installs the
+    filter on itself, runs the self-test, then execs that shell, so the
+    installer and its children are filtered like the server; strace isn't.
     """
     docker = shutil.which("docker") or "docker"
     env_args = [arg for name, value in (env or {}).items() for arg in ("-e", f"{name}={value}")]
-    # "$1" is the install script, the rest are its arguments. sh runs before
-    # strace, so it isn't traced; the traced part starts at the inner /bin/sh.
+    # "$@" is the whole traced command, as separate arguments: the filter,
+    # then the installer's shell with the fixed script and its arguments.
+    # The outer sh runs before strace, so it isn't traced; the traced part
+    # starts at the filter.
     # -y: print the folder behind each fd, so pip's and npm's dirfd-relative
     # calls (openat(3</tmp/pip-x>, "lib")) get real paths in the trace.
-    traced = ('script="$1"; shift; '
-              f'exec strace -f -tt -y -e trace={TRACED_SYSCALLS} --kill-on-exit -o /proc/self/fd/2 '
-              '/bin/sh -c "exec 2>&1; $script" sandglass-installer "$@"')
+    traced = (f'exec strace -f -tt -y -e trace={TRACED_SYSCALLS} --kill-on-exit -o /proc/self/fd/2 "$@"')
+    installer = ["/bin/sh", "-c", f"exec 2>&1; {script}", "sandglass-installer", *script_args]
     args = [
         "run", "--rm",
         *(["--name", name] if name else []),  # so it can be removed if it runs too long
@@ -285,7 +302,7 @@ def scan_install_command(volume: str, download_dir: Path, script: str, script_ar
         "-v", f"{volume}:{CONTAINER_PACKAGE}",   # the one writable mount
         "-w", str(CONTAINER_PACKAGE),
         IMAGE,
-        "sh", "-c", traced, "sandglass-install", script, *script_args,
+        "sh", "-c", traced, "sandglass-install", *filtered(installer),
     ]
     return docker, args
 
@@ -332,7 +349,8 @@ def npm_download_container_args(out_dir: Path, out_group: int, script: str, npm_
         "-v", f"{out_dir}:{CONTAINER_OUT}",  # the one writable mount
         "-w", "/tmp",
         IMAGE,
-        "sh", "-c", script, "sandglass-download", *npm_command,
+        # (#155) npm runs through Sandglass's syscall filter here too.
+        "sh", "-c", script, "sandglass-download", *filtered(npm_command),
     ]
 
 
