@@ -501,8 +501,9 @@ def run_scan(spec: scan.PackageSpec, policy_path: Path, registry_dir: Path | Non
     }
     print(f"Scanning {spec} (from {package['source']})")
 
-    # Docker volume names: letters, digits, "_", ".", "-".
-    volume = re.sub(r"[^A-Za-z0-9_.-]", "-", f"sandglass-{spec.slug}-{timestamp}")
+    # Docker volume names: letters, digits, "_", ".", "-". A neutral prefix
+    # (#159): the server sees the volume's name in /proc/self/mountinfo.
+    volume = re.sub(r"[^A-Za-z0-9_.-]", "-", f"mcp-scan-{spec.slug}-{timestamp}")
     with tempfile.TemporaryDirectory(prefix="sandglass-download-") as tmp:
         folder = Path(tmp)
         folder.chmod(0o755)  # the install container's user must be able to read it

@@ -42,6 +42,9 @@ WORKDIR /build
 COPY pyproject.toml uv.lock ./
 RUN UV_PROJECT_ENVIRONMENT=/opt/venv UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy \
         uv sync --frozen --no-install-project --no-dev && rm -rf /build
+# (#159) No project name in the venv a server can read: uv writes it as the
+# venv's prompt (pyvenv.cfg) and into the activate scripts, which nothing here uses.
+RUN rm -f /opt/venv/bin/activate* && sed -i '/^prompt = /d' /opt/venv/pyvenv.cfg
 
 # The slim image ships the standard library without .pyc files; compile them
 # now so Python doesn't try to write them into /usr/local at run time.
@@ -64,6 +67,17 @@ RUN mkdir /package && chown 10001:10001 /package
 COPY --chown=10001:10001 sandbox/decoy_home/ /home/sandglass/
 RUN chmod 700 /home/sandglass /home/sandglass/.ssh /home/sandglass/.aws \
     && chmod 600 /home/sandglass/.ssh/id_rsa /home/sandglass/.aws/credentials /home/sandglass/.env
+
+# (#159) Sandglass's launcher, network sink and stdin relay, at a neutral
+# path, started by path: no command line in the container carries their
+# source or the name Sandglass (the server can read every process's
+# /proc/<pid>/cmdline). Root-owned and read-only like the rest of the image.
+# Must match launcher.RUNTIME_DIR; the client checks these copies against its
+# own files before every run (sandbox.detect_multiarch), so rebuild after
+# changing them.
+COPY sandglass/launcher.py /usr/local/lib/mcp-runtime/run.py
+COPY sandglass/netsink.py /usr/local/lib/mcp-runtime/sink.py
+COPY sandglass/stdin_relay.py /usr/local/lib/mcp-runtime/relay.py
 USER 10001:10001
 
 ENV PATH=/opt/venv/bin:$PATH

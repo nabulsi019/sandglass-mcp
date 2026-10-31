@@ -32,7 +32,7 @@ def filter_start(pid: int, second: str = "10:00:00") -> list[str]:
         f"{pid}     {second}.000003 clone(child_stack=NULL, flags=CLONE_UNTRACED|SIGCHLD)"
         " = -1 EPERM (Operation not permitted)",
         f'{pid}     {second}.000004 execve("/bin/sh", ["/bin/sh", "-c", "exec 2>&1; cp /download/project/p'
-        '"..., "sandglass-installer"], 0x7ffd /* 9 vars */) = 0',
+        '"..., "installer"], 0x7ffd /* 9 vars */) = 0',
     ]
 
 
@@ -200,9 +200,10 @@ def test_install_runs_under_strace_and_never_holds_the_trace_stream(tmp_path):
     assert traced.endswith('"$@"')
     # (#155) strace runs Sandglass's syscall filter, which execs the installer's
     # shell; the shell's first act: its stderr (the trace stream) becomes stdout.
-    command = args[args.index("sandglass-install") + 1:]
-    assert command[:5] == sandbox.filtered([])
-    assert command[5:] == ["/bin/sh", "-c", "exec 2>&1; " + scan.NPM_INSTALL_SCRIPT, "sandglass-installer"]
+    command = args[args.index("install") + 1:]
+    assert command[:4] == sandbox.filtered([])
+    assert command[4:] == ["/bin/sh", "-c", "exec 2>&1; " + scan.NPM_INSTALL_SCRIPT, "installer"]
+    assert "sandglass" not in " ".join(args[args.index(sandbox.IMAGE) + 1:]).lower()  # (#159)
     assert "--network none" in joined and "--read-only" in joined and "--user 10001:10001" in joined
     assert "--cap-add" not in joined and "--privileged" not in joined
     assert [args[i + 1] for i, a in enumerate(args) if a == "-v"] == [

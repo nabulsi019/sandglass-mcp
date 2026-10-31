@@ -110,6 +110,7 @@ Expected verdicts:
 | good_notes_node_server.js | CLEAN | 0 (with the `node_debian` baseline) |
 | tamper_trace_server | VIOLATIONS | 3: list `/proc/1/fd`, read and write `/proc/1/fd/2` (all blocked with EACCES) |
 | missing_api_key_server | INCOMPLETE | 0; reason: exited during startup, `RuntimeError: NOTES_API_KEY is not set` |
+| process_list_server under `policies/templates/no_network.v1.yaml` | CLEAN | 0; sees at least the launcher, sink and relay, and no "sandglass" in any process's command line (#159) |
 | missing_program_server | INCOMPLETE | 0; reasons: exited during startup, and "the server needs a program the sandbox doesn't have: sandglass-missing-program" (#148) |
 | aws_credentials_server under `policies/templates/no_network.v1.yaml` | VIOLATIONS | 1: read of `/home/sandglass/.aws/credentials` (`read_deny: /home`, #121) |
 | symlink_escape_server under `policies/templates/no_network.v1.yaml` | VIOLATIONS | 2, both on `/home/sandglass/.aws/credentials`: the symlink to it made in `/tmp` (a link counts as a read of its target), and the read through that link (judged by the file really opened, #122) |
@@ -385,15 +386,23 @@ docker run -i --rm --network none --read-only --tmpfs /tmp --user 10001:10001 \
   -e HOME=/home/sandglass -v <project>:/project:ro --mount type=tmpfs,destination=/project/reports,tmpfs-mode=0555 \
   -w /project sandglass-sandbox \
   sh -c 'mkdir -m 0700 /tmp/work && cd /tmp/work &&
-         unset OLDPWD GPG_KEY PYTHON_VERSION PYTHON_SHA256 && launcher="$1" && shift &&
-         exec strace -f -tt -y -e trace=file,process,network,memfd_create,io_uring_setup,io_uring_enter,io_uring_register,ptrace,process_vm_readv,process_vm_writev \
+         unset OLDPWD GPG_KEY PYTHON_VERSION PYTHON_SHA256 &&
+         exec strace -f -tt -y -e trace=file,process,network,memfd_create,io_uring_setup,io_uring_enter,io_uring_register,ptrace,process_vm_readv,process_vm_writev,pidfd_getfd,unshare,setns,userfaultfd \
          --kill-on-exit -o /proc/self/fd/2 \
-         /opt/venv/bin/python -S -c "$launcher" "$@" 3>/dev/null' \
-  sandglass-launch "<launcher.py>" <server> "<netsink.py>" "<stdin_relay.py>" <python|node> "<site dir or empty>" \
-  [--server-arg values...]
+         /opt/venv/bin/python -S /usr/local/lib/mcp-runtime/run.py "$@" 3>/dev/null' \
+  launch <server> <python|node> "<site dir or empty>" [--server-arg values...]
 ```
 
 (`--env` adds `-e NAME` for each name, without the value; see Server setup.)
+
+The launcher (`sandglass/launcher.py`), the network sink (`netsink.py`) and
+the stdin relay (`stdin_relay.py`) are copied into the image as
+`/usr/local/lib/mcp-runtime/run.py`, `sink.py` and `relay.py` (#159) and
+started by path, so no process's command line (which the server can read
+in `/proc/<pid>/cmdline`) carries their source or the name Sandglass.
+**Rebuild the image after changing them**: before every run the client
+compares the image's copies with your checkout (sha256) and refuses a
+stale image.
 
 - `--network none`: no network. Connection attempts still show up in the trace.
 - `--read-only` + `--tmpfs /tmp`: the server can't modify the image; only `/tmp` is writable.
@@ -891,13 +900,21 @@ below are from each project's own paper or documentation.
   in the JSON). A read of `/proc/self/status` isn't flagged by itself: many
   runtimes read it for ordinary reasons, and the policy decides, like for any
   other file.
-- **A server can tell it's in the sandbox** in other cheap ways too (#159):
-  the Python launcher's `/proc/self/cmdline` (and the sink's and relay's)
-  contains Sandglass's source, `/etc/passwd` has a `sandglass` user and
-  `HOME` is `/home/sandglass`, and the proxy listens on 127.0.0.1:18080.
-  Its environment no longer names Sandglass (#146). Fully hiding a tracer
-  isn't possible; the aim is removing cheap tells, and "the server detects
-  the sandbox" stays a limitation of any dynamic analysis.
+- **A server can tell it's in the sandbox** in other cheap ways too (#159).
+  Removed so far: Sandglass's name in the environment (#146) and on every
+  command line (the launcher, sink and relay are files in the image at
+  `/usr/local/lib/mcp-runtime/`, the shells' `$0` are neutral, the venv has
+  no project prompt, a scan's volume and npm `package.json` have neutral
+  names). Still there: `/etc/passwd` has a `sandglass` user and `HOME` is
+  `/home/sandglass` (the protected decoy home); `TracerPid` in
+  `/proc/self/status` (#82); the proxy on 127.0.0.1:18080 and the proxy
+  variables pointing at it; the helper files themselves (readable, and
+  their comments mention Sandglass); the launcher's own command line (a
+  Python server's `/proc/self/cmdline` is `python -S .../run.py <server>`,
+  not `python <server>`); and fixture runs mount the project at `/project`.
+  Fully hiding a tracer isn't possible; the aim is removing cheap tells,
+  and "the server detects the sandbox" stays a limitation of any dynamic
+  analysis.
 
 - **The syscall filter covers the install too (#155), from its first
   program on.** The few lines of the untraced outer `sh` that start strace

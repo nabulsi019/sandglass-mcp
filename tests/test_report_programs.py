@@ -80,7 +80,7 @@ def test_programs_lists_every_successful_exec_with_its_argv():
     programs = judge()["programs"]
     assert [(p["pid"], p["path"], p["argv"]) for p in programs] == [
         (10, "<unreadable>", None),
-        (10, "/bin/sh", ["/bin/sh", "-c", "exec 2>&1; cp /download/project/p...", "sandglass-installer"]),
+        (10, "/bin/sh", ["/bin/sh", "-c", "exec 2>&1; cp /download/project/p...", "installer"]),
         (11, "/usr/bin/cp", ["cp", "/download/project/package.json", "/package/"]),
         (10, "/usr/bin/npm", ["npm", "install", "--offline", "--no-audit", "--no-fund"]),
         (10, "/usr/bin/node", ["node", "/usr/bin/npm", "install", "--offline", "--no-audit", "--no-fund"]),

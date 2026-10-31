@@ -1,8 +1,10 @@
 """The local network sink: a fake HTTP(S) proxy that never connects anywhere.
 
 Started by the launcher inside the sandbox, as its own process:
-`python -I -S -c <this source>` (-I: no cwd on sys.path, so starting it
-lists no folder; -S: no site-packages, it only needs the stdlib).
+`python -I -S /usr/local/lib/mcp-runtime/sink.py`, where the Dockerfile
+copies this file (#159: a neutral path, no source on the command line).
+-I: no script folder or cwd on sys.path; -S: no site-packages, it only
+needs the stdlib.
 
 The server's HTTP_PROXY / HTTPS_PROXY point here. For every request the sink
 records the method, host and port, then answers locally (200 for plain HTTP,

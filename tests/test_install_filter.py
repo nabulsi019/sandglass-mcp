@@ -53,8 +53,13 @@ def test_the_new_calls_are_blocked_on_both_architectures():
 
 def test_filtered_is_an_argv_list_through_the_launcher():
     argv = sandbox.filtered(["npm", "install", "--ignore-scripts"])
-    assert argv[:4] == ["/usr/local/bin/python", "-S", "-c", sandbox.LAUNCHER]
-    assert argv[4:] == ["--filter-then-exec", "npm", "install", "--ignore-scripts"]
+    assert argv[:3] == ["/usr/local/bin/python", "-S", "/usr/local/lib/mcp-runtime/run.py"]  # (#159)
+    assert argv[3:] == ["--filter-then-exec", "npm", "install", "--ignore-scripts"]
+
+
+def test_filtered_names_no_sandglass():
+    argv = sandbox.filtered(["npm", "install"])
+    assert "sandglass" not in " ".join(argv).lower()
 
 
 @pytest.mark.skipif(platform.system() != "Linux" or platform.machine() not in launcher.SYSCALLS,

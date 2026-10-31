@@ -25,6 +25,7 @@ read, change or delete it. There is no trace file in the container at all:
      strace process "non-dumpable", so the server gets EACCES there.
 """
 
+import hashlib
 import shutil
 import subprocess
 from pathlib import Path, PurePosixPath
@@ -57,13 +58,23 @@ CONTAINER_HOME = PurePosixPath("/home/sandglass")
 CONTAINER_WORKDIR = PurePosixPath("/tmp/work")
 
 # The launcher (sandglass/launcher.py) runs first inside the traced Python as
-# `python -S -c LAUNCHER <server>`: it hides the trace stream from the server,
-# starts the local network sink, then runs the server. Its source is read here,
-# on the host, so the container doesn't have to read an extra file.
+# `python -S CONTAINER_LAUNCHER <server>`: it hides the trace stream from the
+# server, starts the local network sink and the stdin relay, then runs the
+# server. (#159) The Dockerfile copies the three into the image at a neutral
+# path, so no command line in the container carries their source or the
+# name Sandglass; the server can read every process's /proc/<pid>/cmdline.
+CONTAINER_RUNTIME_DIR = PurePosixPath(launcher.RUNTIME_DIR)
+CONTAINER_LAUNCHER = CONTAINER_RUNTIME_DIR / "run.py"
+# host file -> its copy in the image (must match the Dockerfile's COPY lines)
+IMAGE_HELPERS = {
+    "launcher.py": CONTAINER_LAUNCHER,
+    "netsink.py": PurePosixPath(launcher.SINK_SCRIPT),
+    "stdin_relay.py": PurePosixPath(launcher.RELAY_SCRIPT),
+}
+# Their source, as on the host: the image's copies must be the same (see
+# check_image_helpers), and tests read it.
 LAUNCHER = (PROJECT_ROOT / "sandglass" / "launcher.py").read_text(encoding="utf-8")
-# The local network sink the launcher starts (see sandglass/netsink.py).
 NETSINK = (PROJECT_ROOT / "sandglass" / "netsink.py").read_text(encoding="utf-8")
-# The stdin relay the launcher starts (see sandglass/stdin_relay.py).
 STDIN_RELAY = (PROJECT_ROOT / "sandglass" / "stdin_relay.py").read_text(encoding="utf-8")
 
 # What strace records (-e trace=...): strace's file, process and network
@@ -88,8 +99,9 @@ def filtered(argv: list[str]) -> list[str]:
     """`argv` run through Sandglass's syscall filter (#155): the launcher in
     its --filter-then-exec mode installs the filter on itself, runs the
     self-test, then execs argv. The system Python (/usr/local/bin/python),
-    -S: no site-packages, so no package code runs before the filter."""
-    return [str(CONTAINER_SYSTEM_PYTHON), "-S", "-c", LAUNCHER, launcher.FILTER_THEN_EXEC, *argv]
+    -S: no site-packages, so no package code runs before the filter. The
+    launcher by its path in the image (#159), never its source."""
+    return [str(CONTAINER_SYSTEM_PYTHON), "-S", str(CONTAINER_LAUNCHER), launcher.FILTER_THEN_EXEC, *argv]
 
 
 def to_container_path(host_path: Path) -> PurePosixPath:
@@ -107,23 +119,49 @@ def detect_multiarch() -> str:
 
     e.g. "aarch64-linux-gnu" on Apple chips, "x86_64-linux-gnu" on CI runners.
     Asking the container (not the host) keeps the baseline correct on both.
+
+    (#159) The same run also hashes the image's copies of the launcher, sink
+    and relay: an image built from older code would run older helpers, so a
+    mismatch stops here (SandboxError: rebuild the image).
     """
     docker = shutil.which("docker") or "docker"
-    query = "import sysconfig; print(sysconfig.get_config_var('MULTIARCH') or '')"
+    paths = [str(path) for path in IMAGE_HELPERS.values()]
+    query = ("import hashlib, sys, sysconfig; print(sysconfig.get_config_var('MULTIARCH') or '')\n"
+             "for path in sys.argv[1:]:\n"
+             "    try:\n"
+             "        print(hashlib.sha256(open(path, 'rb').read()).hexdigest())\n"
+             "    except OSError:\n"
+             "        print('missing')")
     try:
         out = subprocess.run(
-            [docker, "run", "--rm", "--network", "none", IMAGE, "python", "-c", query],
+            [docker, "run", "--rm", "--network", "none", IMAGE, "python", "-c", query, *paths],
             capture_output=True, text=True, timeout=60,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise SandboxError(f"could not run docker: {exc}") from None
-    multiarch = out.stdout.strip()
+    lines = out.stdout.split("\n")
+    multiarch = lines[0].strip()
     if out.returncode != 0 or not multiarch:
         raise SandboxError(
             f"could not read multiarch from image '{IMAGE}' "
             f"(is it built? `docker build -t {IMAGE} .`): {out.stderr.strip()[:200]}"
         )
+    stale = stale_helpers(lines[1:1 + len(paths)])
+    if stale:
+        raise SandboxError(f"the image '{IMAGE}' has older copies of {', '.join(stale)} than this "
+                           f"checkout; rebuild it: `docker build -t {IMAGE} .`")
     return multiarch
+
+
+def stale_helpers(image_hashes: list[str]) -> list[str]:
+    """(#159) The helpers whose copy in the image (by its sha256, in
+    IMAGE_HELPERS order) differs from the file in this checkout."""
+    stale = []
+    for (name, _), image_hash in zip(IMAGE_HELPERS.items(), image_hashes + [""] * len(IMAGE_HELPERS)):
+        host_hash = hashlib.sha256((PROJECT_ROOT / "sandglass" / name).read_bytes()).hexdigest()
+        if image_hash.strip() != host_hash:
+            stale.append(name)
+    return stale
 
 
 def docker_command(server_script: Path, server_args: list[str] = (),
@@ -182,16 +220,15 @@ def _traced_run_args(server_path: str, mounts: list[str], runtime: str, site_dir
     """
     # sh, before strace (so untraced): make the empty work folder, owned by
     # the sandbox user, go into it, and unset what the server shouldn't see.
-    # Then "$1" is the launcher code and "$@" the server path, the sink code,
-    # the relay code, the runtime, the site dir and the server's arguments,
-    # each passed on exactly as given.
+    # Then "$@" is the server path, the runtime, the site dir and the
+    # server's arguments, each passed on exactly as given. The launcher is a
+    # file in the image (#159), never source on a command line.
     # -y (#122): print the file behind each fd, so a successful open shows the
     # file it really opened (= 3</home/x>), even through a symlink.
     strace = (f"mkdir -m 0700 {CONTAINER_WORKDIR} && cd {CONTAINER_WORKDIR} && "
               f"unset {' '.join(UNSET_BEFORE_TRACING)} && "
-              "launcher=\"$1\" && shift && "
               f"exec strace -f -tt -y -e trace={TRACED_SYSCALLS} --kill-on-exit"
-              f" -o /proc/self/fd/2 {CONTAINER_PYTHON} -S -c \"$launcher\" \"$@\" 3>/dev/null")
+              f" -o /proc/self/fd/2 {CONTAINER_PYTHON} -S {CONTAINER_LAUNCHER} \"$@\" 3>/dev/null")
     env_args = [arg for name in env_names for arg in ("-e", name)]
     return [
         "run",
@@ -206,12 +243,12 @@ def _traced_run_args(server_path: str, mounts: list[str], runtime: str, site_dir
         *mounts,
         "-w", str(workdir),
         IMAGE,
-        # sh runs before strace, so it isn't traced. "$1".."$6" are the launcher
-        # code, the server path, the sink code, the relay code, the runtime and
-        # the site dir, as separate arguments; the server's own arguments
-        # follow (#144).
-        "sh", "-c", strace, "sandglass-launch",
-        LAUNCHER, server_path, NETSINK, STDIN_RELAY, runtime, site_dir, *server_args,
+        # sh runs before strace, so it isn't traced. "$1".."$3" are the server
+        # path, the runtime and the site dir, as separate arguments; the
+        # server's own arguments follow (#144). "launch" is sh's $0, a neutral
+        # name (#159); sh then execs strace, so it's gone anyway.
+        "sh", "-c", strace, "launch",
+        server_path, runtime, site_dir, *server_args,
     ]
 
 
@@ -288,7 +325,8 @@ def scan_install_command(volume: str, download_dir: Path, script: str, script_ar
     # -y: print the folder behind each fd, so pip's and npm's dirfd-relative
     # calls (openat(3</tmp/pip-x>, "lib")) get real paths in the trace.
     traced = (f'exec strace -f -tt -y -e trace={TRACED_SYSCALLS} --kill-on-exit -o /proc/self/fd/2 "$@"')
-    installer = ["/bin/sh", "-c", f"exec 2>&1; {script}", "sandglass-installer", *script_args]
+    # "installer": the shell's $0, a neutral name (#159), visible to install scripts.
+    installer = ["/bin/sh", "-c", f"exec 2>&1; {script}", "installer", *script_args]
     args = [
         "run", "--rm",
         *(["--name", name] if name else []),  # so it can be removed if it runs too long
@@ -302,7 +340,7 @@ def scan_install_command(volume: str, download_dir: Path, script: str, script_ar
         "-v", f"{volume}:{CONTAINER_PACKAGE}",   # the one writable mount
         "-w", str(CONTAINER_PACKAGE),
         IMAGE,
-        "sh", "-c", traced, "sandglass-install", *filtered(installer),
+        "sh", "-c", traced, "install", *filtered(installer),
     ]
     return docker, args
 
@@ -350,7 +388,7 @@ def npm_download_container_args(out_dir: Path, out_group: int, script: str, npm_
         "-w", "/tmp",
         IMAGE,
         # (#155) npm runs through Sandglass's syscall filter here too.
-        "sh", "-c", script, "sandglass-download", *filtered(npm_command),
+        "sh", "-c", script, "download", *filtered(npm_command),
     ]
 
 

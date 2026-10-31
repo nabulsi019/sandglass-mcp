@@ -35,7 +35,7 @@ def test_runtime_and_site_dir_are_launcher_arguments():
 
 def test_the_launcher_reads_them_from_argv_and_deletes_any_sandglass_variable():
     main = sandbox.LAUNCHER[sandbox.LAUNCHER.index("def main()"):]
-    assert "server, sink_source, relay_source, runtime, site_dir = sys.argv[1:6]" in main
+    assert "server, runtime, site_dir = sys.argv[1:4]" in main  # (#159: no helper source)
     assert "os.environ.get(" not in main  # nothing read from the environment any more
     assert 'n.upper().startswith("SANDGLASS")' in main and "del os.environ[name]" in main
     # Deleted before the server starts (Node exec, or Python's runpy), after the fd swap.

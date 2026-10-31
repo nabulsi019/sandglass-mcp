@@ -371,7 +371,7 @@ NPM_DOWNLOAD_PROJECT = sandbox.CONTAINER_OUT / "project"
 NPM_DOWNLOAD_SCRIPT = (
     f'umask 007; mkdir -p /tmp/home /tmp/project {NPM_DOWNLOAD_PROJECT} {NPM_DOWNLOAD_CACHE}'
     ' && cd /tmp/project'
-    ' && printf \'{"name": "sandglass-scan", "version": "0.0.0", "private": true}\\n\' > package.json'
+    ' && printf \'{"name": "mcp-scan", "version": "0.0.0", "private": true}\\n\' > package.json'
     ' && "$@"; status=$?'
     f'; cp package.json package-lock.json {NPM_DOWNLOAD_PROJECT}/'
     f'; chmod -R ug+rwX,o-w {NPM_DOWNLOAD_PROJECT} {NPM_DOWNLOAD_CACHE}'
@@ -438,7 +438,8 @@ def _download_npm(spec, folder, registry_dir) -> Prepared:
     """Fill folder/ with project/package.json (+ lockfile), npm-cache/ and, for a
     local registry, the tarball. Install scripts never run on the host."""
     project = folder / "project"
-    manifest = {"name": "sandglass-scan", "version": "0.0.0", "private": True}
+    # A neutral name (#159): this package.json ends up in /package, readable by the server.
+    manifest = {"name": "mcp-scan", "version": "0.0.0", "private": True}
 
     if registry_dir is not None:
         # A local test package: no registry, no npm, no download container.
