@@ -100,6 +100,10 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
     variable names in both views and no "SANDGLASS" in any name or value),
     the runtime and site dir passed to the launcher as arguments (never
     `SANDGLASS_*` variables), and `UNSET_BEFORE_TRACING` in `sandglass/sandbox.py`
+  - every `EXPECTED_MISSING_PROGRAM` entry in `scripts/check_fixtures.py`
+    (#148: missing_program_server INCOMPLETE under notes_readonly, no
+    violations, with exactly the reason "the server needs a program the
+    sandbox doesn't have: sandglass-missing-program")
   - `EXPECTED_EXIT_CODES` in `scripts/check_fixtures.py` (the exit code of
     every verdict: 0 CLEAN, 1 VIOLATIONS, 3 INCOMPLETE; 2 is a usage error)
   - the sandbox hardening flags (--network none, --read-only, non-root user,

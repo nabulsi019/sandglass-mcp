@@ -52,6 +52,16 @@ def test_every_runtime_fixture_is_protected():
             f"EXPECTED_RUNTIME entry {fixture} is not in CLAUDE.md's protected items"
 
 
+def test_every_missing_program_fixture_is_protected():
+    # (#148) the missing-program fixture and the exact reason it must give.
+    assert "`EXPECTED_MISSING_PROGRAM`" in PROTECTED
+    for fixture, (_, _, reasons) in check_fixtures.EXPECTED_MISSING_PROGRAM.items():
+        assert fixture.removesuffix(".py") in PROTECTED
+        for reason in reasons:
+            assert " ".join(reason.split()) in " ".join(PROTECTED.split()), \
+                f"EXPECTED_MISSING_PROGRAM reason {reason!r} is not in CLAUDE.md's protected items"
+
+
 def test_every_coverage_summary_fixture_is_protected():
     # (#143) the tool error fixture and the summary it must show.
     assert "`EXPECTED_COVERAGE_SUMMARY`" in PROTECTED

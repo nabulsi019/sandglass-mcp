@@ -45,6 +45,9 @@ Rules (one place, so they're easy to explain):
   and, for Python servers, the error message the launcher recorded
   (/sandglass-server-error/<message>, from the server's own process: used
   only as the wording of that reason, and skipped as a probe).
+  If such a server looked for a program in PATH during startup and nothing
+  ever found it (#148), one more reason names it: "the server needs a
+  program the sandbox doesn't have: <name>". It never changes the verdict.
   Process exec:
     the first exec in the trace is the server itself -> allowed
     (Node servers: the launcher then execs node in that same process; that
@@ -650,6 +653,10 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
     startup_exit = _startup_exit_reason(events, server_launch, relay_pid, session, server_errors)
     if startup_exit:
         incomplete.append(startup_exit)
+        # (#148) Only explains a run that is INCOMPLETE anyway: never changes a verdict.
+        missing = _missing_program(events, server_launch, attempted, programs, (sink_pid, relay_pid))
+        if missing:
+            incomplete.append(f"{MISSING_PROGRAM}: {missing}")
     if trace_cut_short:
         limit = MAX_TRACE_BYTES // (1024 * 1024)
         incomplete.append(f"the trace is larger than {limit} MiB; only the first {limit} MiB were "
@@ -759,6 +766,40 @@ def _startup_exit_reason(events: list[Event], server_launch: Event | None, relay
         # it. It only explains a run that is INCOMPLETE anyway.
         reason += f"; its error message (as the server reported it): {server_errors[-1]}"
     return reason
+
+
+MISSING_PROGRAM = "the server needs a program the sandbox doesn't have"
+
+
+def _missing_program(events: list[Event], server_launch: Event | None, attempted: list[dict],
+                     programs: list[dict], helper_pids: tuple) -> str | None:
+    """The program a server that exited during startup looked for and never
+    found (#148), e.g. "git", or None. Only called when _startup_exit_reason
+    already made the run INCOMPLETE, so it explains, it never judges.
+
+    A search counts only if all of these hold:
+      - it is a PATH search (_path_searches, #120) with 2+ failed places,
+        from the server's processes (not the sink or relay), in the startup
+        phase (so pip's install-phase probes like lsb_release never count)
+      - no process ran a program with that basename anywhere in the run
+        (a shell that finds node in its 3rd PATH folder isn't "missing" it)
+      - it ended before the server's exit
+    If several qualify, the LAST one (the closest to the exit) is named.
+    Programs looked up without exec (e.g. shutil.which) leave no search: no reason.
+    """
+    exit_event = next((e for e in events if server_launch is not None
+                       and e.kind == "exit" and e.pid == server_launch.pid), None)
+    if exit_event is None:
+        return None
+    found_names = {posixpath.basename(p["path"]) for p in programs}
+    runs = {id(run): run for run in _path_searches(attempted, programs).values()}.values()
+    missing = None
+    for run in sorted(runs, key=lambda r: r["records"][-1]["timestamp"]):  # by when each search ended
+        if (len(run["records"]) >= 2 and run["phase"] == "startup" and run["pid"] not in helper_pids
+                and run["basename"] not in found_names
+                and run["records"][-1]["timestamp"] <= exit_event.timestamp):
+            missing = run["basename"]
+    return missing
 
 
 # ---------------------------------------------------------------------------
