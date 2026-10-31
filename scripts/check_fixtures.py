@@ -244,6 +244,14 @@ EXPECTED_ENVIRONMENT = {
     "env_report_server.js": (BASE_ENV_NAMES | PROXY_NAMES, BASE_ENV_NAMES | PROXY_NAMES),
 }
 
+# (#148) A server that runs a program the image doesn't have at startup and
+# exits. Under notes_readonly. fixture -> (expected verdict, expected
+# violations, a reason that must be in the INCOMPLETE reasons exactly).
+EXPECTED_MISSING_PROGRAM = {
+    "missing_program_server.py": ("INCOMPLETE", set(), [
+        "the server needs a program the sandbox doesn't have: sandglass-missing-program"]),
+}
+
 EXPECTED_RUNTIME = {
     # /dev/null O_RDWR, the overcommit_memory read, bind ::1 port 0, uname -p.
     "runtime_noise_server.py": ("CLEAN", set(), [(["uname", "-p"], UNAME_NOTE)]),
@@ -589,6 +597,14 @@ def main() -> int:
         failures += [f"{fixture}: expected the program run {argv} with note {note!r}, got {programs}"
                      for argv, note in want_programs if (argv, note) not in programs]
 
+    for fixture, (want_verdict, want_violations, want_reasons) in EXPECTED_MISSING_PROGRAM.items():
+        print(f"\n===== {fixture} =====")
+        report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, POLICY)
+        failures += check(fixture, report, want_verdict, want_violations)
+        failures += [f"{fixture}: INCOMPLETE reasons don't include exactly {text!r}: "
+                     f"{report.get('incomplete_reasons')}"
+                     for text in want_reasons if text not in report.get("incomplete_reasons", [])]
+
     for fixture, (want_verdict, want_violations, want_coverage, want_stopped) in EXPECTED_TIMEOUTS.items():
         print(f"\n===== {fixture} (call timeout {FIXTURE_CALL_TIMEOUT_SECONDS} s) =====")
         with call_timeout(FIXTURE_CALL_TIMEOUT_SECONDS):
@@ -691,6 +707,7 @@ def main() -> int:
     if not failures:
         total = (len(EXPECTED) + len(EXPECTED_V04) + len(EXPECTED_POLICY_RUNS) + len(EXPECTED_HOSTILE)
                  + len(EXPECTED_OLD_DOCKER) + len(EXPECTED_TIMEOUTS) + len(EXPECTED_RUNTIME)
+                 + len(EXPECTED_MISSING_PROGRAM)
                  + len(EXPECTED_COVERAGE_SUMMARY) + len(EXPECTED_SERVER_SETUP)
                  + len(EXPECTED_ENVIRONMENT) + len(EXPECTED_INPUT_MODES)
                  + len(EXPECTED_SCANS) + len(EXPECTED_NPM_REGISTRY_SCANS))

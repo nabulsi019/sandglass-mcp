@@ -16,8 +16,11 @@ FROM python:3.12-slim-trixie
 # strace records every syscall the server makes. nodejs (Debian's package)
 # runs Node.js servers. npm installs scanned npm packages inside the sandbox
 # (`sandglass scan npm:...`, #19), offline, from files downloaded on the host.
+# git (#148): servers like mcp-server-git exit at startup without it. It
+# brings perl (about 101 MB in all). Running it is still the server's own
+# action: a violation unless the policy's exec_allow lists /usr/bin/git.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends strace nodejs npm \
+    && apt-get install -y --no-install-recommends strace nodejs npm git \
     && rm -rf /var/lib/apt/lists/*
 
 # Executable but NOT readable for the server's user. Linux marks a process

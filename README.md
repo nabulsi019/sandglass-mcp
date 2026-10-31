@@ -110,6 +110,7 @@ Expected verdicts:
 | good_notes_node_server.js | CLEAN | 0 (with the `node_debian` baseline) |
 | tamper_trace_server | VIOLATIONS | 3: list `/proc/1/fd`, read and write `/proc/1/fd/2` (all blocked with EACCES) |
 | missing_api_key_server | INCOMPLETE | 0; reason: exited during startup, `RuntimeError: NOTES_API_KEY is not set` |
+| missing_program_server | INCOMPLETE | 0; reasons: exited during startup, and "the server needs a program the sandbox doesn't have: sandglass-missing-program" (#148) |
 | aws_credentials_server under `policies/templates/no_network.v1.yaml` | VIOLATIONS | 1: read of `/home/sandglass/.aws/credentials` (`read_deny: /home`, #121) |
 | symlink_escape_server under `policies/templates/no_network.v1.yaml` | VIOLATIONS | 2, both on `/home/sandglass/.aws/credentials`: the symlink to it made in `/tmp` (a link counts as a read of its target), and the read through that link (judged by the file really opened, #122) |
 | proc_self_escape_server under `policies/templates/no_network.v1.yaml` | VIOLATIONS | 3, all reads of `/home/sandglass/.aws/credentials`: through `/proc/self/root/...`, directly, and again through `/proc/self/fd/100` (each judged by the file really opened, #131) |
@@ -748,7 +749,9 @@ report), never guessed.
 The verdict is **INCOMPLETE**, and never clean, if the server didn't start or
 exited during startup (e.g. it needs an API key or a real account: the report
 gives its exit status and, for Python servers, the error message the launcher
-recorded in the trace, since the server's stderr is discarded), the MCP
+recorded in the trace, since the server's stderr is discarded; and if it
+looked for a program in PATH at startup that nothing ever found, "the server
+needs a program the sandbox doesn't have: <name>", #148), the MCP
 session failed, no tool was exercised, the trace is missing or has no
 `+++ exited` line for the server (a truncated trace), the network sink didn't
 start, the sink didn't report the isolation check as isolated, or the stdin relay didn't
@@ -926,6 +929,19 @@ below are from each project's own paper or documentation.
   opened (`test_servers/proc_self_escape_server.py`, #131). Failed opens and probes
   (`stat`) are still judged by the requested path only: strace can't show
   where they would have led.
+- **Programs in the image** (#148). Besides Python, the image has strace,
+  `node`/`npm`/`npx` (Debian's), `sh`/`bash`, `uv` and `git` (added for
+  servers like mcp-server-git; it brings perl, about 101 MB). Running any
+  of them is still the server's own action: a violation unless the
+  policy's `exec_allow` lists it, so mcp-server-git gets VIOLATIONS under
+  every template for running `/usr/bin/git`. A server that needs another
+  program and exits at startup gets the INCOMPLETE reason "the server
+  needs a program the sandbox doesn't have: <name>", but only if it
+  looked for it with exec (a PATH search, 2+ places, never found by any
+  process, the last such search before its exit). A program looked up
+  with `stat` only (e.g. `shutil.which`) isn't named, and a server that
+  probes for an optional program, carries on, and then exits for another
+  reason gets a misleading hint (its own error message comes first).
 - **Baselines are specific to the image.** `python312_slim` covers
   `python:3.12-slim-trixie`; `node_debian` covers Debian's `nodejs` package in the same
   image (`.js` servers get both, since the launcher is Python). Another base image
