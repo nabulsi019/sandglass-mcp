@@ -70,6 +70,7 @@ IMAGE_HELPERS = {
     "launcher.py": CONTAINER_LAUNCHER,
     "netsink.py": PurePosixPath(launcher.SINK_SCRIPT),
     "stdin_relay.py": PurePosixPath(launcher.RELAY_SCRIPT),
+    "dnssink.py": PurePosixPath(launcher.DNS_SCRIPT),  # (#147)
 }
 # Their source, as on the host: the image's copies must be the same (see
 # check_image_helpers), and tests read it.
@@ -239,6 +240,10 @@ def _traced_run_args(server_path: str, mounts: list[str], runtime: str, site_dir
         "--tmpfs", "/tmp",          # ...except a scratch /tmp in memory
         "--user", CONTAINER_USER,   # never root inside the container
         "-e", f"HOME={CONTAINER_HOME}",  # the decoy home, never the host's
+        # (#147) resolv.conf names only the DNS recorder the launcher starts
+        # on the container's own loopback (no route added), and no search
+        # domain, so each lookup is one name, recorded as asked.
+        "--dns", "127.0.0.1", "--dns-search", ".",
         *env_args,
         *mounts,
         "-w", str(workdir),

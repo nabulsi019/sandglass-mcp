@@ -118,6 +118,18 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
     processes and no "sandglass" in any case in any argv), and the helpers
     started by path from `/usr/local/lib/mcp-runtime/` (never their source
     or "sandglass" on a command line)
+  - the DNS recorder (#147): every `EXPECTED_DNS` entry in
+    `scripts/check_fixtures.py` (dns_fetch_server.js VIOLATIONS under
+    no_network.v1, its names exactly {hidden-node.example}, one entry
+    "domain hidden-node.example" holding every violation, all in the
+    tool-call phase, the tool getting ENOTFOUND, and the report saying
+    "not contacted (answered NXDOMAIN)"); `sandglass/dnssink.py` answering
+    only NXDOMAIN, started by the launcher (`start_dns`, by path, empty
+    environment) before the sink and any server code; `--dns 127.0.0.1
+    --dns-search .` with `--network none` unchanged; compare.py trusting only
+    the first process to stat `/sandglass-dns/ready`, and its fail-closed
+    INCOMPLETE reasons (the recorder never started, stopped before the
+    server, or recorded no name although lookups reached it)
   - every `EXPECTED_MISSING_PROGRAM` entry in `scripts/check_fixtures.py`
     (#148: missing_program_server INCOMPLETE under notes_readonly, no
     violations, with exactly the reason "the server needs a program the

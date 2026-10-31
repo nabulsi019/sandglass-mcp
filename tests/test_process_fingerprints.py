@@ -56,5 +56,5 @@ def test_a_stale_image_is_refused():
     hashes = [hashlib.sha256((PROJECT_ROOT / "sandglass" / name).read_bytes()).hexdigest()
               for name in sandbox.IMAGE_HELPERS]
     assert sandbox.stale_helpers(hashes) == []
-    assert sandbox.stale_helpers([hashes[0], "0" * 64, hashes[2]]) == ["netsink.py"]
+    assert sandbox.stale_helpers([hashes[0], "0" * 64, *hashes[2:]]) == ["netsink.py"]
     assert sandbox.stale_helpers(["missing"]) == list(sandbox.IMAGE_HELPERS)  # an image from before #159

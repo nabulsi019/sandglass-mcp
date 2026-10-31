@@ -18,7 +18,7 @@ from sandglass.client import _scan_policy
 from sandglass.compare import (NAME_LOOKUPS, _markdown, build_report, compare, group_violations,
                                summary_lines)
 from sandglass.trace_parser import parse_trace
-from tests.test_sandbox_pipeline import EXITED, LAUNCH, NOTE_READ, SINK_LINES, run, sandbox_policy
+from tests.test_sandbox_pipeline import DNS_LINES, EXITED, LAUNCH, NOTE_READ, SINK_LINES, run, sandbox_policy
 
 WIKIPEDIA = (Path(__file__).parent / "data" / "wikipedia_network_trace.txt").read_text(encoding="utf-8")
 NO_NETWORK = PROJECT_ROOT / "policies" / "templates" / "no_network.v1.yaml"
@@ -34,6 +34,9 @@ def wikipedia(extra_after_last_connect: list[str] = (), drop_resolvers: bool = F
         lines = [line for line in lines if netsink.RESOLVER_MARKER_DIR not in line]
     last = max(i for i, line in enumerate(lines) if "connect(" in line)
     lines = lines[:last + 1] + list(extra_after_last_connect) + lines[last + 1:]
+    # The trace predates the DNS recorder (#147): its startup lines are added
+    # after the launch, as in every run since. It recorded no name here.
+    lines = lines[:1] + DNS_LINES + lines[1:]
     policy = _scan_policy(NO_NETWORK, "/package/site/bin/wikipedia-mcp", "aarch64-linux-gnu", "python")
     result = compare(parse_trace("\n".join(lines)), policy, SESSION)
     return build_report("wikipedia", "t", policy, SESSION, result, Path("trace.txt"), {},

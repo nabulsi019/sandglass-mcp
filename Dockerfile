@@ -78,6 +78,8 @@ RUN chmod 700 /home/sandglass /home/sandglass/.ssh /home/sandglass/.aws \
 COPY sandglass/launcher.py /usr/local/lib/mcp-runtime/run.py
 COPY sandglass/netsink.py /usr/local/lib/mcp-runtime/sink.py
 COPY sandglass/stdin_relay.py /usr/local/lib/mcp-runtime/relay.py
+# (#147) The DNS recorder, the same way.
+COPY sandglass/dnssink.py /usr/local/lib/mcp-runtime/dns.py
 USER 10001:10001
 
 ENV PATH=/opt/venv/bin:$PATH

@@ -27,6 +27,7 @@ from pathlib import Path
 
 from sandglass import PROJECT_ROOT, client, sandbox, scan
 from sandglass.client import EXIT_CODES, run_sandboxed, run_scan
+from sandglass.compare import _dns_lines
 from sandglass.scan import npm_tarball_name, parse_spec
 
 POLICY = PROJECT_ROOT / "policies" / "notes_readonly.yaml"
@@ -275,6 +276,21 @@ EXPECTED_MISSING_PROGRAM = {
 # must see: the launcher (its own process), the sink and the relay)
 EXPECTED_PROCESS_FINGERPRINTS = {
     "process_list_server.py": ("CLEAN", set(), 3),
+}
+
+# (#147) A lookup the network sink never sees (Node's fetch ignores the proxy):
+# the DNS recorder records it and answers NXDOMAIN. The raw violation count
+# isn't fixed (glibc may retry), so the check is: the verdict, the set of
+# names recorded, the violation entries (every violation in one entry for the
+# domain, all in the tool-call phase), what the tool got back, and the
+# report's line for the name.
+# (fixture, policy name in POLICIES) -> (verdict, names, entry labels, tool
+# result, text the Markdown report must contain)
+EXPECTED_DNS = {
+    ("dns_fetch_server.js", "no_network.v1"): (
+        "VIOLATIONS", {"hidden-node.example"}, ["domain hidden-node.example"], "ENOTFOUND",
+        ["`hidden-node.example` (tool-call, **not allowed**): looked up (DNS: ",
+         "not contacted (answered NXDOMAIN)"]),
 }
 
 EXPECTED_RUNTIME = {
@@ -599,6 +615,38 @@ def environment_failures(label: str, report: dict, want_environ: set, want_proc_
     return failures
 
 
+def dns_failures(label: str, report: dict, want_verdict: str, want_names: set, want_entries: list,
+                 want_result: str, want_text: list) -> list[str]:
+    """(#147) The DNS fixture: see EXPECTED_DNS. Also the checks every
+    fixture gets that don't depend on exact violations (isolation, no sink
+    requests, durations)."""
+    print(f"{label}: {report['verdict']}, exit code {EXIT_CODES.get(report['verdict'])}")
+    failures = []
+    if report["verdict"] != want_verdict:
+        failures.append(f"{label}: expected {want_verdict}, got {report['verdict']} "
+                        f"{report['incomplete_reasons']}")
+    names = {d["name"] for d in report.get("dns_names", [])}
+    if names != want_names:
+        failures.append(f"{label}: expected DNS names {sorted(want_names)}, got {sorted(names)}")
+    entries = [g["label"] for g in report.get("violation_groups", [])]
+    if entries != want_entries:
+        failures.append(f"{label}: expected violation entries {want_entries}, got {entries}")
+    wrong_phase = [v["target"] for v in report["violations"] if v["phase"] != "tool-call"]
+    if wrong_phase:
+        failures.append(f"{label}: violations outside the tool-call phase: {wrong_phase}")
+    calls = report.get("exercised") or []
+    if [c.get("result") for c in calls] != [want_result]:
+        failures.append(f"{label}: expected the tool to return {want_result!r}, got {calls}")
+    network_lines = "\n".join(_dns_lines(report))  # the Markdown report's lines for the names
+    failures += [f"{label}: the report doesn't say {text!r}" for text in want_text if text not in network_lines]
+    isolation = report["network_isolation"]
+    if not isolation or not isolation["isolated"]:
+        failures.append(f"{label}: network isolation check did not report isolated: {isolation}")
+    if report["domains"]:
+        failures.append(f"{label}: expected no sink requests, got {report['domains']}")
+    return failures + duration_failures(label, report)
+
+
 def process_failures(label: str, report: dict, fewest: int) -> list[str]:
     """(#159) What the process list fixture's tool returned: at least `fewest`
     processes, and "sandglass" in no argv, in any case."""
@@ -738,6 +786,13 @@ def main() -> int:
         failures += check(label, report, want_verdict, want_violations)
         failures += process_failures(label, report, fewest)
 
+    for (fixture, policy_name), (want_verdict, want_names, want_entries, want_result, want_text) \
+            in EXPECTED_DNS.items():
+        label = f"{fixture} under {policy_name}"
+        print(f"\n===== {label} =====")
+        report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, POLICIES[policy_name])
+        failures += dns_failures(label, report, want_verdict, want_names, want_entries, want_result, want_text)
+
     build_test_packages()
     for package, (want_verdict, want_violations) in EXPECTED_SCANS.items():
         print(f"\n===== scan {package} =====")
@@ -799,7 +854,7 @@ def main() -> int:
     if not failures:
         total = (len(EXPECTED) + len(EXPECTED_V04) + len(EXPECTED_POLICY_RUNS) + len(EXPECTED_HOSTILE)
                  + len(EXPECTED_OLD_DOCKER) + len(EXPECTED_TIMEOUTS) + len(EXPECTED_RUNTIME)
-                 + len(EXPECTED_MISSING_PROGRAM) + len(EXPECTED_PROCESS_FINGERPRINTS)
+                 + len(EXPECTED_MISSING_PROGRAM) + len(EXPECTED_PROCESS_FINGERPRINTS) + len(EXPECTED_DNS)
                  + len(EXPECTED_COVERAGE_SUMMARY) + len(EXPECTED_SERVER_SETUP)
                  + len(EXPECTED_ENVIRONMENT) + len(EXPECTED_INPUT_MODES)
                  + len(EXPECTED_SCANS) + len(EXPECTED_NPM_REGISTRY_SCANS)

@@ -20,6 +20,8 @@ In this order it:
      runs its self-test: io_uring, CLONE_UNTRACED clones, ptrace,
      process_vm_*, pidfd_getfd, unshare, setns and userfaultfd (#155) are
      refused, whatever Docker's own profile allows;
+  1c. (#147) starts the DNS recorder (sandglass/dnssink.py, in the image as
+     dns.py) as its own process and waits until it listens on 127.0.0.1:53;
   2. (#13) starts the local network sink (sandglass/netsink.py, in the image
      as sink.py) as its own process and waits until it listens, then points
      HTTP(S)_PROXY at it;
@@ -57,6 +59,9 @@ NODE = "/usr/bin/node"  # must match sandglass/sandbox.py CONTAINER_NODE
 RUNTIME_DIR = "/usr/local/lib/mcp-runtime"
 SINK_SCRIPT = f"{RUNTIME_DIR}/sink.py"
 RELAY_SCRIPT = f"{RUNTIME_DIR}/relay.py"
+DNS_SCRIPT = f"{RUNTIME_DIR}/dns.py"  # (#147) sandglass/dnssink.py
+# Must match sandglass/dnssink.py (tests/test_dns_rules.py checks this).
+DNS_READY_FD = 3
 # (#24) A Python server that dies with an exception: the launcher stat()s
 # <this>/<message> (it doesn't exist), so the message lands in the trace.
 SERVER_ERROR_DIR = "/sandglass-server-error"
@@ -80,6 +85,22 @@ def start_sink() -> None:
     ])
     os.close(ready_w)
     os.read(ready_r, 1)  # b"" if the sink died; compare.py then says it never started
+    os.close(ready_r)
+
+
+def start_dns() -> None:
+    """(#147) Start the DNS recorder (DNS_SCRIPT) like the sink: a separate
+    process, empty environment, no stdin or stdout, and wait until it listens
+    on 127.0.0.1:53. If it can't start (e.g. port 53 not bindable), the read
+    returns b"" and compare.py says the recorder never started: INCOMPLETE."""
+    ready_r, ready_w = os.pipe()
+    os.posix_spawn(PYTHON, [PYTHON, "-I", "-S", DNS_SCRIPT], {}, file_actions=[
+        (os.POSIX_SPAWN_CLOSE, 0),
+        (os.POSIX_SPAWN_CLOSE, 1),
+        (os.POSIX_SPAWN_DUP2, ready_w, DNS_READY_FD),
+    ])
+    os.close(ready_w)
+    os.read(ready_r, 1)
     os.close(ready_r)
 
 
@@ -289,6 +310,10 @@ def main() -> None:
     # none (--env refuses them too); this is the safety net.
     for name in [n for n in os.environ if n.upper().startswith("SANDGLASS")]:
         del os.environ[name]
+
+    # 1c. (#147) The DNS recorder, which /etc/resolv.conf points at
+    # (--dns 127.0.0.1): every name looked up lands in the trace.
+    start_dns()
 
     # 2. The network sink.
     start_sink()
