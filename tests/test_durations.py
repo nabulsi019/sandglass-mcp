@@ -157,6 +157,45 @@ def test_the_coverage_table_shows_each_calls_time():
     assert "| `a` | ran | 0.12 s |  |" in lines and "| `b` | skipped |  | no input |" in lines
 
 
+# --- the download's size (#167) -------------------------------------------------------
+
+MB = 1024 * 1024
+PHASES = {"total": 241.96, "download": 201.23, "install": 32.33, "run": 3.63, "analysis": 4.16}
+
+
+def test_duration_line_shows_the_download_size():
+    # markitdown's real numbers: 71 files, 114.6 MB.
+    files = [{"size": 114 * MB}, {"size": int(0.6 * MB)}]
+    assert duration_line(PHASES, files) == \
+        "Duration: 242.0 s (download 201.2 s (114 MB), install 32.3, run 3.6, analysis 4.2)"
+
+
+def test_a_small_download_keeps_one_decimal():
+    assert "download 201.2 s (9.5 MB)," in duration_line(PHASES, [{"size": int(9.5 * MB)}])
+
+
+def test_no_files_means_no_size():
+    # A fixture run has no package; a download that failed has no files.
+    assert duration_line(PHASES) == duration_line(PHASES, []) == \
+        "Duration: 242.0 s (download 201.2, install 32.3, run 3.6, analysis 4.2)"
+    assert duration_line({"total": 2.0, "download": None, "install": None, "run": 1.5, "analysis": 0.5},
+                         [{"size": MB}]) == "Duration: 2.0 s (run 1.5, analysis 0.5)"
+
+
+def test_the_size_reaches_the_terminal_and_the_markdown_and_never_the_verdict(fake_scan, monkeypatch):
+    monkeypatch.setattr(scan, "describe_files",
+                        lambda prepared: [{"name": "x.whl", "size": 15 * MB, "sha256": "a"}])
+    report = client.run_scan(scan.parse_spec("pypi:x@1.0"), POLICY)
+    line = "Duration: 21.1 s (download 3.1 s (15 MB), install 6.0, run 10.8, analysis 1.0)"
+    assert summary_lines(report)[-1] == line
+    assert f"- {line}\n" in _markdown(report)
+    # The JSON's durations are unchanged, and the same run without a size has the same verdict.
+    assert set(report["durations"]) == {"total", "download", "install", "run", "analysis"}
+    verdict = report["verdict"]
+    monkeypatch.setattr(scan, "describe_files", lambda prepared: [])
+    assert client.run_scan(scan.parse_spec("pypi:x@1.0"), POLICY)["verdict"] == verdict
+
+
 def test_duration_line_leaves_out_phases_that_did_not_happen():
     assert duration_line({"total": 12.34, "download": None, "install": None,
                           "run": 10.8, "analysis": 1.5}) == "Duration: 12.3 s (run 10.8, analysis 1.5)"

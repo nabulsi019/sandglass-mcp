@@ -1345,19 +1345,35 @@ def summary_lines(r: dict) -> list[str]:
         lines.append(f"  VIOLATION {group['label']} ×{group['count']}" + (f" ({parts})" if parts else "")
                      + f", {group['first']} – {group['last']}, {group['phase']}")
     if r.get("durations"):
-        lines.append(duration_line(r["durations"]))
+        lines.append(duration_line(r["durations"], (r.get("package") or {}).get("files")))
     return lines
 
 
 DURATION_PHASES = ("download", "install", "run", "analysis")
 
 
-def duration_line(durations: dict) -> str:
-    """"Duration: 21.4 s (download 3.1, install 6.0, run 10.8, analysis 1.5)"
+def _megabytes(files: list[dict]) -> str:
+    """The downloaded files' total size (#167): "114 MB", or "9.5 MB" under 10
+    MB. 1 MB = 1024 * 1024 bytes, like the archive limits in scan.py."""
+    mb = sum(f["size"] for f in files) / (1024 * 1024)
+    return f"{mb:.1f} MB" if mb < 10 else f"{int(mb)} MB"
+
+
+def duration_line(durations: dict, files: list[dict] | None = None) -> str:
+    """"Duration: 21.4 s (download 3.1 s (9.5 MB), install 6.0, run 10.8, analysis 1.5)"
     (#156). Phases that didn't happen (None) are left out of the line; the
-    JSON keeps them as null."""
-    phases = ", ".join(f"{name} {durations[name]:.1f}" for name in DURATION_PHASES
-                       if durations.get(name) is not None)
+    JSON keeps them as null. `files` (the report's package files, each with
+    its size): the download's size is shown next to its time, because that
+    time depends on the network (#167). Reporting only, never judged."""
+    parts = []
+    for name in DURATION_PHASES:
+        if durations.get(name) is None:
+            continue
+        if name == "download" and files:
+            parts.append(f"download {durations[name]:.1f} s ({_megabytes(files)})")
+        else:
+            parts.append(f"{name} {durations[name]:.1f}")
+    phases = ", ".join(parts)
     return f"Duration: {durations['total']:.1f} s" + (f" ({phases})" if phases else "")
 
 
@@ -1472,7 +1488,8 @@ def _markdown(r: dict) -> str:
         f"**Verdict: {r['verdict']}**" + verdict_line(r).removeprefix(r["verdict"]),
         "",
         f"- Run: `{r['timestamp']}`",
-        *([f"- {duration_line(r['durations'])}"] if r.get("durations") else []),
+        *([f"- {duration_line(r['durations'], (r.get('package') or {}).get('files'))}"]
+          if r.get("durations") else []),
         f"- Policy: `{r['policy']['name']}`",
         *([f"- Server setup: {setup_line(r['server_setup'])}",
            f"- Reproduce: `{r['server_setup']['command']}`"] if r.get("server_setup") else []),
