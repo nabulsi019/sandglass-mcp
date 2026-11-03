@@ -864,8 +864,9 @@ calls) and **analysis** (reading the traces, comparing, building the
 report; writing the report itself isn't counted). A phase that didn't happen
 is `null` in `report["durations"]`, never 0: a fixture run has no download or
 install, and a scan stopped at the hash check has only a download. The
-Markdown header and the terminal summary show one line, e.g. `Duration:
-21.4 s (download 3.1, install 6.0, run 10.8, analysis 1.5)`, and the
+Markdown header and the terminal summary show one line, with the download's
+size next to its time because that time depends on the network (#167), e.g.
+`Duration: 21.4 s (download 3.1 s (9.5 MB), install 6.0, run 10.8, analysis 1.5)`, and the
 Coverage table shows each call's time next to its status. Durations vary
 from run to run and never affect the verdict or the exit code.
 
