@@ -61,6 +61,38 @@ PING_TIMEOUT_SECONDS = 5
 # Hitting it is a session failure (INCOMPLETE).
 SESSION_GRACE_SECONDS = 30
 
+# Scan depth (#170): "quick" (the default) is the scan above, unchanged;
+# "deep" (--deep) gives the calls a budget that grows with the tool count.
+DEPTHS = ("quick", "deep")
+DEFAULT_DEPTH = "quick"
+# Deep budget: DEEP_PER_TOOL_SECONDS per tool (one full call timeout each),
+# at least DEEP_FLOOR_SECONDS, at most DEEP_CAP_SECONDS. 2 tools get 120 s,
+# 22 tools 600 s (660 capped).
+DEEP_PER_TOOL_SECONDS = 30
+DEEP_FLOOR_SECONDS = 120
+DEEP_CAP_SECONDS = 600
+# Deep only: no call starts with less than this left of the budget. The tool
+# is "not called (time budget)" instead of "no answer within 0 s".
+DEEP_MIN_CALL_SECONDS = 5
+
+
+def deep_budget(tools: int) -> int:
+    """The deep scan's time budget in seconds for `tools` tools (#170)."""
+    return min(max(DEEP_FLOOR_SECONDS, DEEP_PER_TOOL_SECONDS * tools), DEEP_CAP_SECONDS)
+
+
+def depth_argument(depth: str) -> dict:
+    """`depth=` for a call, only for a deep scan (#170): a quick scan calls
+    run(), run_scan() and run_sandboxed() exactly as before deep existed."""
+    return {"depth": depth} if depth == "deep" else {}
+
+
+def session_limit(depth: str) -> float:
+    """The safety net around run() (#170): the largest budget the depth can
+    have, plus SESSION_GRACE_SECONDS for the handshake and shutdown."""
+    budget = DEEP_CAP_SECONDS if depth == "deep" else TIME_BUDGET_SECONDS
+    return budget + SESSION_GRACE_SECONDS
+
 # --sandbox exit codes, so scripts and CI can check the verdict. INCOMPLETE
 # is 3, not 2: argparse exits with 2 on a usage error, and a script must be
 # able to tell "you called it wrong" from "the run can't be trusted" (#124).
@@ -112,12 +144,13 @@ def parse_server_env(items: list[str]) -> dict[str, str]:
 
 
 def server_setup(command: list[str], server_args: list[str], server_env: dict,
-                 inputs_mode: str = DEFAULT_MODE) -> dict:
+                 inputs_mode: str = DEFAULT_MODE, depth: str = DEFAULT_DEPTH) -> dict:
     """The server setup for the report (#144): the arguments as given, the
     environment's NAMES only (values are never recorded), the work dir, the
     input mode (#145), and a command line that reproduces the run, with the
-    values redacted."""
-    full = (command + ["--inputs", inputs_mode] + [f"--server-arg={arg}" for arg in server_args]
+    values redacted. `--deep` is in that command only for a deep scan (#170)."""
+    full = (command + (["--deep"] if depth == "deep" else []) + ["--inputs", inputs_mode]
+            + [f"--server-arg={arg}" for arg in server_args]
             + [f"--env={name}=<redacted>" for name in server_env])
     return {"args": list(server_args), "env": list(server_env),
             "workdir": str(sandbox.CONTAINER_WORKDIR), "inputs": inputs_mode,
@@ -201,7 +234,8 @@ async def server_answers_ping(session: ClientSession) -> bool:
 
 
 async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr,
-              session_record: dict | None = None, inputs_mode: str = DEFAULT_MODE) -> dict:
+              session_record: dict | None = None, inputs_mode: str = DEFAULT_MODE,
+              depth: str = DEFAULT_DEPTH) -> dict:
     """Run one MCP session and return a record of what was exercised.
 
     `errlog` receives the subprocess's stderr. In the sandbox that stream is
@@ -210,10 +244,16 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
     fails half-way the caller still has everything recorded until then (#23).
     The calls share TIME_BUDGET_SECONDS, counted from the start (#140).
     `inputs_mode` (#145): how each tool's input is built (minimal, schema, described).
+    `depth` (#170): "deep" replaces that budget, once the tools are listed,
+    with deep_budget(tool count), and starts no call with under
+    DEEP_MIN_CALL_SECONDS left. "quick" is exactly the behaviour above.
     """
     if session_record is None:
         session_record = new_session_record()
-    deadline = time.monotonic() + TIME_BUDGET_SECONDS
+    deadline = budget_clock() + TIME_BUDGET_SECONDS
+    # The least time a call needs left to start: any time at all in quick (as
+    # before #170), DEEP_MIN_CALL_SECONDS in deep.
+    min_left = DEEP_MIN_CALL_SECONDS if depth == "deep" else 0
 
     # stdio_client spawns the subprocess and gives us its stdin/stdout streams.
     async with stdio_client(params, errlog=errlog) as (read_stream, write_stream):
@@ -228,6 +268,13 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
                 print(f"    input schema: {json.dumps(tool.input_schema)}")
                 session_record["tools"].append({"name": tool.name, "description": tool.description})
             print()
+            if depth == "deep":
+                # (#170) The budget grows with the tool count, counted from here.
+                seconds = deep_budget(len(tools))
+                deadline = budget_clock() + seconds
+                session_record["budget"] = {"seconds": seconds, "per_tool": DEEP_PER_TOOL_SECONDS,
+                                            "tools": len(tools)}
+                print(f"Deep scan: time budget {seconds} s for {len(tools)} tools\n")
 
             stop_reason = None  # set once no more tools may be called (#140)
             for tool in tools:
@@ -239,8 +286,8 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
                     print(f"Skipping {tool.name}: no valid input ({exc})")
                     session_record["skipped"].append({"tool": tool.name, "reason": f"no valid input: {exc}"})
                     continue
-                remaining = deadline - time.monotonic()
-                if stop_reason is None and remaining <= 0:
+                remaining = deadline - budget_clock()
+                if stop_reason is None and remaining <= min_left:
                     stop_reason = "time budget"
                 if stop_reason is not None:
                     # Never dropped silently: the report lists it as not called.
@@ -289,6 +336,9 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
 # The clock for durations (#156): wall-clock, monotonic, on the host. A name
 # of its own so tests can replace it with a fake clock.
 clock = time.monotonic
+# The clock run() measures the time budget with (#140, #170): the same
+# monotonic clock, under its own name so a test can fake the budget alone.
+budget_clock = time.monotonic
 
 
 class Durations:
@@ -338,10 +388,11 @@ def run_host(server_script: Path, inputs_mode: str = DEFAULT_MODE) -> None:
 
 
 def run_sandboxed(server_script: Path, policy_path: Path, server_args: list[str] = (),
-                  server_env: dict | None = None, inputs_mode: str = DEFAULT_MODE) -> dict:
+                  server_env: dict | None = None, inputs_mode: str = DEFAULT_MODE,
+                  depth: str = DEFAULT_DEPTH) -> dict:
     """Run the server in Docker under strace, compare, write and return the report.
     `server_args`, `server_env`: --server-arg and --env (#144), already checked.
-    `inputs_mode`: --inputs (#145)."""
+    `inputs_mode`: --inputs (#145). `depth`: "quick" or "deep" (--deep, #170)."""
     durations = Durations()  # no download or install phase in fixture mode (#156)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     server = server_script.stem
@@ -356,7 +407,8 @@ def run_sandboxed(server_script: Path, policy_path: Path, server_args: list[str]
 
     server_env = server_env or {}
     setup = server_setup(["sandglass", str(server_script.relative_to(PROJECT_ROOT)),
-                          "--policy", str(policy_path), "--sandbox"], server_args, server_env, inputs_mode)
+                          "--policy", str(policy_path), "--sandbox"], server_args, server_env, inputs_mode,
+                         depth)
     command, args = sandbox.docker_command(server_script, server_args, list(server_env))
     path_mapping = {
         str(sandbox.CONTAINER_PROJECT): f"{PROJECT_ROOT} (read-only)",
@@ -366,14 +418,14 @@ def run_sandboxed(server_script: Path, policy_path: Path, server_args: list[str]
         **WORKDIR_MAPPING,
     }
     return _trace_and_report(server, timestamp, command, args, policy, runtime, multiarch,
-                             path_mapping, durations, setup=setup, server_env=server_env)
+                             path_mapping, durations, setup=setup, server_env=server_env, depth=depth)
 
 
 def _trace_and_report(server: str, timestamp: str, command: str, args: list[str], policy: Policy,
                       runtime: str, multiarch: str, path_mapping: dict, durations: Durations,
                       package: dict | None = None,
                       install: dict | None = None, setup: dict | None = None,
-                      server_env: dict | None = None) -> dict:
+                      server_env: dict | None = None, depth: str = DEFAULT_DEPTH) -> dict:
     """Run the docker command under strace, compare, write and return the report.
 
     Shared by fixture mode (run_sandboxed) and scan mode (run_scan). The
@@ -382,7 +434,7 @@ def _trace_and_report(server: str, timestamp: str, command: str, args: list[str]
     result, added in front. `setup` is server_setup()'s record for the report;
     `server_env` the --env values, given only to the docker command's own
     environment (its -e NAME copies them into the container). `durations`
-    gets the run and analysis phases (#156).
+    gets the run and analysis phases (#156). `depth`: "quick" or "deep" (#170).
     """
     if setup:
         print(f"Server setup: {setup_line(setup)}")
@@ -399,11 +451,12 @@ def _trace_and_report(server: str, timestamp: str, command: str, args: list[str]
     with durations.phase("run"), open(trace_file, "w", encoding="utf-8") as trace_out:
         try:
             # run() keeps to the time budget itself (#140); this is only the
-            # safety net for a handshake or shutdown that hangs.
+            # safety net for a handshake or shutdown that hangs (#170: deep's cap).
             # The input mode is recorded in the setup (#145); fixture mode and scans always have one.
             inputs_mode = (setup or {}).get("inputs", DEFAULT_MODE)
-            asyncio.run(asyncio.wait_for(run(params, server, trace_out, session, inputs_mode),
-                                         TIME_BUDGET_SECONDS + SESSION_GRACE_SECONDS))
+            asyncio.run(asyncio.wait_for(run(params, server, trace_out, session, inputs_mode,
+                                             **depth_argument(depth)),
+                                         session_limit(depth)))
         except BaseException as exc:  # includes ExceptionGroup from anyio task groups
             if isinstance(exc, KeyboardInterrupt):
                 raise
@@ -420,7 +473,7 @@ def _trace_and_report(server: str, timestamp: str, command: str, args: list[str]
         path_mapping = {**path_mapping,
                         "(container stderr)": f"strace output, saved on the host as {trace_file}"}
         report = build_report(server, timestamp, policy, session, result, trace_file,
-                              path_mapping, _baseline(policy, runtime, multiarch), package, setup)
+                              path_mapping, _baseline(policy, runtime, multiarch), package, setup, depth)
     return _write_and_print(report, durations)
 
 
@@ -474,19 +527,20 @@ def _scan_policy(policy_path: Path, server_path: str, multiarch: str, runtime: s
 
 def run_scan(spec: scan.PackageSpec, policy_path: Path, registry_dir: Path | None = None,
              entry: str | None = None, server_args: list[str] = (),
-             server_env: dict | None = None, inputs_mode: str = DEFAULT_MODE) -> dict:
+             server_env: dict | None = None, inputs_mode: str = DEFAULT_MODE,
+             depth: str = DEFAULT_DEPTH) -> dict:
     """Download (host), install (sandbox), run and trace one package; return the report.
 
     Any failing step makes a report too, with verdict INCOMPLETE and the reason.
     `server_args`, `server_env`: --server-arg and --env (#144), already checked.
-    `inputs_mode`: --inputs (#145).
+    `inputs_mode`: --inputs (#145). `depth`: "quick" or "deep" (--deep, #170).
     """
     durations = Durations()  # every phase can happen here (#156)
     server_env = server_env or {}
     setup = server_setup(["sandglass", "scan", str(spec), "--policy", str(policy_path)]
                          + (["--entry", entry] if entry else [])
                          + (["--registry-dir", str(registry_dir)] if registry_dir else []),
-                         server_args, server_env, inputs_mode)
+                         server_args, server_env, inputs_mode, depth)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     multiarch = sandbox.detect_multiarch()
     runtime = "node" if spec.ecosystem == "npm" else "python"
@@ -552,7 +606,7 @@ def run_scan(spec: scan.PackageSpec, policy_path: Path, registry_dir: Path | Non
                     with durations.phase("analysis"):
                         report = build_report(spec.slug, timestamp, policy, new_session_record(),
                                               with_install(not_run(None), install), None, {},
-                                              _baseline(policy, runtime, multiarch), package, setup)
+                                              _baseline(policy, runtime, multiarch), package, setup, depth)
                     return _write_and_print(report, durations)
 
                 command, args = sandbox.scan_run_command(volume, server_path, runtime,
@@ -566,14 +620,14 @@ def run_scan(spec: scan.PackageSpec, policy_path: Path, registry_dir: Path | Non
                 }
                 return _trace_and_report(spec.slug, timestamp, command, args, policy, runtime,
                                          multiarch, path_mapping, durations, package, install=install,
-                                         setup=setup, server_env=server_env)
+                                         setup=setup, server_env=server_env, depth=depth)
             finally:
                 sandbox.remove_volume(volume)
         except scan.ScanError as exc:
             print(f"Scan failed: {exc}")
             report = build_report(spec.slug, timestamp, policy, new_session_record(),
                                   not_run(str(exc)), None, {}, _baseline(policy, runtime, multiarch),
-                                  package, setup)
+                                  package, setup, depth)
             # No analysis phase: there was no trace to read (#156).
             return _write_and_print(report, durations)
 
@@ -590,6 +644,9 @@ def add_setup_arguments(parser: argparse.ArgumentParser) -> None:
                         help="how each tool's input is built (#145): minimal (required arguments, "
                              "plain values), schema (the JSON schema only), described (the schema, "
                              f"then examples in the descriptions). Default: {DEFAULT_MODE}")
+    parser.add_argument("--deep", action="store_true",
+                        help="deep scan (#170): a time budget of 30 s per tool (at least 120 s, "
+                             "at most 600 s) instead of the quick scan's 120 s for all calls")
 
 
 def checked_env(parser: argparse.ArgumentParser, args: argparse.Namespace) -> dict[str, str]:
@@ -636,7 +693,7 @@ def scan_main(argv: list[str]) -> None:
 
     try:
         report = run_scan(spec, args.policy, registry_dir, args.entry, args.server_arg, server_env,
-                          args.inputs)
+                          args.inputs, **depth_argument("deep" if args.deep else DEFAULT_DEPTH))
     except sandbox.SandboxError as exc:
         print(f"Sandbox error: {exc}", file=sys.stderr)
         sys.exit(EXIT_CODES["INCOMPLETE"])
@@ -662,6 +719,8 @@ def main() -> None:
     server_env = checked_env(parser, args)
     if (args.server_arg or server_env) and not args.sandbox:
         parser.error("--server-arg and --env need --sandbox")
+    if args.deep and not args.sandbox:
+        parser.error("--deep needs --sandbox")
 
     # The server path is a normal CLI argument, so it's relative to the CWD.
     # (Paths INSIDE the policy file are relative to the project root instead.)
@@ -675,7 +734,8 @@ def main() -> None:
         if not server_script.is_relative_to(PROJECT_ROOT):
             parser.error("--sandbox only mounts the project, so the server must be inside it")
         try:
-            report = run_sandboxed(server_script, args.policy, args.server_arg, server_env, args.inputs)
+            report = run_sandboxed(server_script, args.policy, args.server_arg, server_env, args.inputs,
+                                   **depth_argument("deep" if args.deep else DEFAULT_DEPTH))
         except sandbox.SandboxError as exc:
             # No sandbox -> nothing observed -> never "clean".
             print(f"Sandbox error: {exc}", file=sys.stderr)

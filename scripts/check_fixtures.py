@@ -293,6 +293,18 @@ EXPECTED_DNS = {
          "not contacted (answered NXDOMAIN)"]),
 }
 
+# (#170) The deep scan's budget grows with the tool count. Six tools of 2 s
+# each, with shortened budgets (test only; the product's stay 120 s for
+# quick, 30 s per tool with a 120 s floor for deep). Under no_network.v1.
+# client constant -> its value in these runs
+FIXTURE_BUDGETS = {"TIME_BUDGET_SECONDS": 5, "DEEP_PER_TOOL_SECONDS": 3, "DEEP_FLOOR_SECONDS": 3}
+# (fixture, depth) -> (expected verdict, expected violations, text the
+# coverage summary must contain, or None: every tool ran, no summary)
+EXPECTED_DEEP_BUDGET = {
+    ("many_tools_server.py", "quick"): ("CLEAN", set(), "not called"),
+    ("many_tools_server.py", "deep"): ("CLEAN", set(), None),
+}
+
 EXPECTED_RUNTIME = {
     # /dev/null O_RDWR, the overcommit_memory read, bind ::1 port 0, uname -p.
     "runtime_noise_server.py": ("CLEAN", set(), [(["uname", "-p"], UNAME_NOTE)]),
@@ -322,6 +334,19 @@ def call_timeout(seconds: float):
         yield
     finally:
         client.CALL_TIMEOUT_SECONDS = original
+
+
+@contextlib.contextmanager
+def budgets(values: dict):
+    """Set client budget constants (FIXTURE_BUDGETS) inside the `with` block. Test only."""
+    originals = {name: getattr(client, name) for name in values}
+    for name, value in values.items():
+        setattr(client, name, value)
+    try:
+        yield
+    finally:
+        for name, value in originals.items():
+            setattr(client, name, value)
 
 
 @contextlib.contextmanager
@@ -755,6 +780,19 @@ def main() -> int:
             failures.append(f"{label}: expected mode {mode} and input {want_input}, "
                             f"got {report.get('input_mode')} {got_input}")
 
+    for (fixture, depth), (want_verdict, want_violations, want_summary) in EXPECTED_DEEP_BUDGET.items():
+        label = f"{fixture} ({depth} scan, budgets {FIXTURE_BUDGETS})"
+        print(f"\n===== {label} =====")
+        with budgets(FIXTURE_BUDGETS):
+            report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, POLICIES["no_network.v1"],
+                                   [], {}, client.DEFAULT_MODE, depth)
+        failures += check(label, report, want_verdict, want_violations)
+        summary = report.get("coverage_summary")
+        if (summary is None) != (want_summary is None) or (want_summary and want_summary not in summary):
+            failures.append(f"{label}: expected coverage summary with {want_summary!r}, got {summary!r}")
+        if report.get("depth") != depth:
+            failures.append(f"{label}: expected depth {depth!r}, got {report.get('depth')!r}")
+
     for (fixture, policy_name, with_setup), (want_verdict, want_violations, want_reasons) \
             in EXPECTED_SERVER_SETUP.items():
         label = f"{fixture} under {policy_name}, {'with' if with_setup else 'without'} its setup"
@@ -856,7 +894,7 @@ def main() -> int:
                  + len(EXPECTED_OLD_DOCKER) + len(EXPECTED_TIMEOUTS) + len(EXPECTED_RUNTIME)
                  + len(EXPECTED_MISSING_PROGRAM) + len(EXPECTED_PROCESS_FINGERPRINTS) + len(EXPECTED_DNS)
                  + len(EXPECTED_COVERAGE_SUMMARY) + len(EXPECTED_SERVER_SETUP)
-                 + len(EXPECTED_ENVIRONMENT) + len(EXPECTED_INPUT_MODES)
+                 + len(EXPECTED_ENVIRONMENT) + len(EXPECTED_INPUT_MODES) + len(EXPECTED_DEEP_BUDGET)
                  + len(EXPECTED_SCANS) + len(EXPECTED_NPM_REGISTRY_SCANS)
                  + len(EXPECTED_OLD_DOCKER_SCANS) + len(EXPECTED_OLD_DOCKER_NPM_REGISTRY_SCANS))
         print(f"all {total} fixtures match expectations")

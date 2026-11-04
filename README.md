@@ -378,6 +378,33 @@ the server *does*, not what it was asked. The values are only sent to the
 tool, never interpreted by Sandglass (no path is created, nothing is run),
 and are capped at 200 characters.
 
+### Deep scan: `--deep` (#170)
+
+The quick scan (the default) gives all the tool calls one budget of 120 s,
+whatever the tool count, so a server with many tools can run out of it
+(wikipedia-mcp, 22 tools). `--deep`, on `sandglass scan` and on
+`sandglass <server> --sandbox` (a usage error without `--sandbox`), gives the
+calls a budget that grows with the tool count instead:
+
+    budget = min(max(120, 30 × tools), 600) seconds
+
+30 s is the call timeout, so every tool can use one full timeout: 2 tools
+get 120 s, 13 tools 390 s, 22 tools 600 s (the cap). The budget starts once
+the tools are listed, and in deep no call starts with under 5 s left: that
+tool is "not called (time budget)". Download and install time come on top.
+
+The report records which scan ran: `depth` (`quick` or `deep`) in the JSON,
+and for deep its `budget` (`seconds`, `per_tool`, `tools`) and a "Time
+budget" line in the Markdown header; the reproduce command has `--deep`.
+Everything else is the quick scan's: the same call timeout (30 s), the same
+ping rule after a timeout, the same verdict rules and exit codes. Without
+`--deep`, a scan behaves exactly as before (`tests/test_quick_unchanged.py`
+freezes its docker arguments, messages and budget).
+
+```bash
+uv run sandglass scan pypi:wikipedia-mcp@2.0.1 --policy policies/templates/no_network.v1.yaml --deep
+```
+
 ### What the sandbox does
 
 The client runs:
@@ -839,7 +866,7 @@ totals:
 - **timed out** (#140): no answer within 30 s; the server is then pinged, and
   if it still answers (anything, even an error), the next tool is called;
 - **not called** (#140): the calls had stopped before this tool: the time
-  budget (120 s for all calls) was used up, or the server didn't answer the
+  budget (120 s for all calls; with `--deep`, 30 s per tool, #170) was used up, or the server didn't answer the
   ping after a timeout;
 - **skipped**: no valid input could be built from its schema, or the session
   ended before the tool was reached.
