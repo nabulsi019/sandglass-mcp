@@ -405,6 +405,19 @@ freezes its docker arguments, messages and budget).
 uv run sandglass scan pypi:wikipedia-mcp@2.0.1 --policy policies/templates/no_network.v1.yaml --deep
 ```
 
+**The depth label** (#174). Every report, scans and fixture runs alike,
+says which scan ran, in the terminal summary (just before the Duration
+line) and in the Markdown header:
+
+| Depth | Label |
+|---|---|
+| quick | `Depth: quick scan: a first look` |
+| deep | `Depth: deep scan: recommended before approving a server` |
+
+The label describes the scan, never the server: a deep scan that reports
+CLEAN still only covers what ran, and a person makes the decision. The
+verdict and the exit code never depend on the label.
+
 ### What the sandbox does
 
 The client runs:
@@ -893,7 +906,8 @@ is `null` in `report["durations"]`, never 0: a fixture run has no download or
 install, and a scan stopped at the hash check has only a download. The
 Markdown header and the terminal summary show one line, with the download's
 size next to its time because that time depends on the network (#167), e.g.
-`Duration: 21.4 s (download 3.1 s (9.5 MB), install 6.0, run 10.8, analysis 1.5)`, and the
+`Duration: 21.4 s (download 3.1 s (9.5 MB), install 6.0, run 10.8, analysis 1.5)`
+(whole MB from 10 MB, one decimal from 0.1 MB, KB below that, e.g. `(3 KB)`, #174), and the
 Coverage table shows each call's time next to its status. Durations vary
 from run to run and never affect the verdict or the exit code.
 

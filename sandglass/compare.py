@@ -1344,6 +1344,8 @@ def summary_lines(r: dict) -> list[str]:
         parts = ", ".join(f"{text} ×{n}" for text, n in group["breakdown"].items())
         lines.append(f"  VIOLATION {group['label']} ×{group['count']}" + (f" ({parts})" if parts else "")
                      + f", {group['first']} – {group['last']}, {group['phase']}")
+    # (#174) Which scan ran, just before the Duration line (which stays last).
+    lines.append(depth_line(r))
     if r.get("durations"):
         lines.append(duration_line(r["durations"], (r.get("package") or {}).get("files")))
     return lines
@@ -1352,11 +1354,28 @@ def summary_lines(r: dict) -> list[str]:
 DURATION_PHASES = ("download", "install", "run", "analysis")
 
 
-def _megabytes(files: list[dict]) -> str:
-    """The downloaded files' total size (#167): "114 MB", or "9.5 MB" under 10
-    MB. 1 MB = 1024 * 1024 bytes, like the archive limits in scan.py."""
-    mb = sum(f["size"] for f in files) / (1024 * 1024)
+def _size(files: list[dict]) -> str:
+    """The downloaded files' total size (#167, #174): "114 MB" from 10 MB,
+    "9.5 MB" from 0.1 MB, "3 KB" below that (at least "1 KB"). 1 MB = 1024 KB
+    = 1024 * 1024 bytes, like the archive limits in scan.py. For display
+    only: the file list keeps the exact bytes."""
+    size = sum(f["size"] for f in files)
+    mb = size / (1024 * 1024)
+    if mb < 0.1:
+        return f"{max(1, round(size / 1024))} KB"
     return f"{mb:.1f} MB" if mb < 10 else f"{int(mb)} MB"
+
+
+# Which scan ran (#174), next to the verdict. The wording is the owner's and
+# final. It describes the scan, never the server: a deep scan is not approval.
+DEPTH_LABELS = {"quick": "quick scan: a first look",
+                "deep": "deep scan: recommended before approving a server"}
+
+
+def depth_line(r: dict) -> str:
+    """"Depth: quick scan: a first look" (#174). A report from before #170
+    has no depth: it was a quick scan."""
+    return f"Depth: {DEPTH_LABELS[r.get('depth', 'quick')]}"
 
 
 def duration_line(durations: dict, files: list[dict] | None = None) -> str:
@@ -1370,7 +1389,7 @@ def duration_line(durations: dict, files: list[dict] | None = None) -> str:
         if durations.get(name) is None:
             continue
         if name == "download" and files:
-            parts.append(f"download {durations[name]:.1f} s ({_megabytes(files)})")
+            parts.append(f"download {durations[name]:.1f} s ({_size(files)})")
         else:
             parts.append(f"{name} {durations[name]:.1f}")
     phases = ", ".join(parts)
@@ -1494,6 +1513,7 @@ def _markdown(r: dict) -> str:
         f"**Verdict: {r['verdict']}**" + verdict_line(r).removeprefix(r["verdict"]),
         "",
         f"- Run: `{r['timestamp']}`",
+        f"- {depth_line(r)}",  # quick or deep (#174)
         *([f"- {duration_line(r['durations'], (r.get('package') or {}).get('files'))}"]
           if r.get("durations") else []),
         f"- Policy: `{r['policy']['name']}`",
