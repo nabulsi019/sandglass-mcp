@@ -68,6 +68,14 @@ def test_every_repeat_run_fixture_is_protected():
         assert fixture.removesuffix(".py") in PROTECTED
 
 
+def test_every_observation_fixture_is_protected():
+    # (#175) the delayed-read fixture and its test-only window.
+    for item in ("`EXPECTED_OBSERVATION`", "`FIXTURE_OBSERVE_SECONDS`", "`OBSERVE_SECONDS`"):
+        assert item in PROTECTED, f"{item!r} is not in CLAUDE.md's protected items"
+    for fixture, _ in check_fixtures.EXPECTED_OBSERVATION:
+        assert fixture.removesuffix(".py") in PROTECTED
+
+
 def test_every_runtime_fixture_is_protected():
     # (#142) the runtime noise fixture and its dangerous neighbours.
     assert "`EXPECTED_RUNTIME`" in PROTECTED

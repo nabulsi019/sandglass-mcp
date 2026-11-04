@@ -259,7 +259,8 @@ def _domain_allowed(host: str, policy: Policy) -> bool:
     return False
 
 
-PHASES = ("install", "startup", "tool-call", "unknown")
+# "observation" (#175): deep scans only, after the client's last call.
+PHASES = ("install", "startup", "tool-call", "observation", "unknown")
 # Event kinds counted in every report ("evasion": #84).
 EVENT_KINDS = ("file", "probe", "process", "network", "io_uring", "evasion", "exit")
 
@@ -288,7 +289,8 @@ def _helper_exec(events: list[Event], pid: int | None) -> Event | None:
 
 
 RELAY_MARKERS = {stdin_relay.RELAY_READY, stdin_relay.TOOL_CALL_MARKER, stdin_relay.EOF_MARKER,
-                 stdin_relay.SERVER_EXITED_MARKER, stdin_relay.SERVER_STOPPED_MARKER}
+                 stdin_relay.SERVER_EXITED_MARKER, stdin_relay.SERVER_STOPPED_MARKER,
+                 stdin_relay.OBSERVATION_MARKER}  # (#175)
 # In the report when the relay had to stop the server after eof (#140).
 SERVER_STOPPED_NOTE = ("the server did not exit after the client closed its stdin "
                        f"(within {stdin_relay.STOP_GRACE_SECONDS:g} s); Sandglass stopped it")
@@ -458,6 +460,27 @@ def _phase_of(events: list[Event], session: dict, relay_pid: int | None):
         return (lambda index: "unknown"), "the stdin relay did not start, so there is no tool-call marker"
     boundary = next((i for i, e in enumerate(events) if e.pid == relay_pid
                      and e.kind == "probe" and e.target == stdin_relay.TOOL_CALL_MARKER), None)
+    # (#175) Deep scans: the second boundary, the relay's own observation
+    # marker. Only the relay's counts; without it the window isn't guessed.
+    observed = next((i for i, e in enumerate(events) if e.pid == relay_pid
+                     and e.kind == "probe" and e.target == stdin_relay.OBSERVATION_MARKER), None)
+    if session.get("observation") and observed is None:
+        # The window ran, but its start is missing from the trace: everything
+        # after the tool-call marker could be either, so it's "unknown".
+        note = "the client started the observation window, but its marker is missing from the trace"
+        if boundary is None:
+            return (lambda index: "unknown"), note
+        return (lambda index: "unknown" if index > boundary else "startup"), note
+    if observed is not None:
+        # Tools called but no tool-call marker: before the window, don't guess.
+        before = "unknown" if boundary is None and session.get("calls") else "startup"
+
+        def phase(index: int) -> str:
+            if index > observed:
+                return "observation"
+            return "tool-call" if boundary is not None and index > boundary else before
+        return phase, (None if before == "startup" else
+                       "tools were called, but the tool-call marker is missing from the trace")
     if boundary is not None:
         return (lambda index: "tool-call" if index > boundary else "startup"), None
     if session.get("calls"):
@@ -616,6 +639,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
     # run, and the reads of them the policy would otherwise not allow.
     sample_paths = session.get("sample_paths", [])
     sample_reads: list[dict] = []
+    observation_events = 0  # (#175) the server's events in the observation window
 
     for index, event in enumerate(events):
         if event.kind == "process" and event.succeeded:
@@ -649,6 +673,9 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
 
         if event.pid == dns_pid and _is_dns_own(event, dns_exec):
             continue  # (#147) the recorder's launch, ready marker, sockets and replies
+
+        if phase_of(index) == "observation" and event.kind != "exit":
+            observation_events += 1  # (#175) judged below like any other event
 
         query = (_dns_query(event.target) if event.pid == dns_pid and event.kind == "probe"
                  and index > dns_ready_index else None)
@@ -862,6 +889,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
         "server_stopped": server_stopped,  # the relay killed it after eof (#140)
         "programs": programs,
         "sample_reads": sample_reads,  # (#171) deep scans: reads of the samples passed in
+        "observation_events": observation_events,  # (#175) deep scans: events in the window
         "event_counts": {
             kind: sum(1 for e in events if e.kind == kind)
             for kind in EVENT_KINDS
@@ -1217,6 +1245,17 @@ def stability_line(r: dict) -> str | None:
     return f"Stability: {UNSTABLE_LABEL} ({'; '.join(details)})"
 
 
+def observation_line(r: dict) -> str | None:
+    """(#175) "Observation: 60 s idle after the last call, 2 events" (or
+    "ended early: the server exited"); None if no window ran."""
+    o = r.get("observation")
+    if not o:
+        return None
+    end = ", ended early: the server exited" if o.get("ended_early") else ""
+    return (f"Observation: {o['seconds']} s idle after the last call{end}; {o['events']} "
+            f"{'event' if o['events'] == 1 else 'events'} in the window, judged like any other")
+
+
 # ---------------------------------------------------------------------------
 # Coverage (#23): which tools ran, failed, or were skipped
 # ---------------------------------------------------------------------------
@@ -1483,6 +1522,8 @@ def summary_lines(r: dict) -> list[str]:
     # (#174) Which scan ran, just before the Duration line (which stays last).
     if stability_line(r):
         lines.append(stability_line(r))  # (#172) deep: whether the two runs agreed
+    if observation_line(r):
+        lines.append(observation_line(r))  # (#175) deep: the window after the last call
     lines.append(depth_line(r))
     if r.get("durations"):
         lines.append(duration_line(r["durations"], (r.get("package") or {}).get("files")))
@@ -1637,6 +1678,11 @@ def build_report(server: str, timestamp: str, policy: Policy, session: dict,
         report["stability"] = result.get("stability")
         report["second_run"] = result.get("second_run")
         report["calls_not_made"] = session.get("calls_not_made", 0)
+        # (#175) The idle window after the last call: its length, whether the
+        # server exited first, and how many of its events fell inside it.
+        observation = session.get("observation")
+        report["observation"] = ({**observation, "events": result.get("observation_events", 0)}
+                                 if observation else None)
     return report
 
 
@@ -1661,6 +1707,7 @@ def _markdown(r: dict) -> str:
         f"- Run: `{r['timestamp']}`",
         f"- {depth_line(r)}",  # quick or deep (#174)
         *([f"- {stability_line(r)}"] if stability_line(r) else []),  # (#172)
+        *([f"- {observation_line(r)}"] if observation_line(r) else []),  # (#175)
         *([f"- {duration_line(r['durations'], (r.get('package') or {}).get('files'))}"]
           if r.get("durations") else []),
         f"- Policy: `{r['policy']['name']}`",
@@ -1879,7 +1926,7 @@ def _dns_lines(r: dict) -> list[str]:
 def _phase_sections(r: dict) -> list[str]:
     """Violations grouped by phase: install / startup / tool calls."""
     titles = {"install": "Install", "startup": "Startup", "tool-call": "Tool calls",
-              "unknown": "Phase unknown"}
+              "observation": "Observation window (after the last call)", "unknown": "Phase unknown"}
     lines = ["", "## Violations by phase"]
     if r.get("phase_note"):
         lines += ["", f"Phases are unknown: {r['phase_note']}."]
@@ -1890,6 +1937,8 @@ def _phase_sections(r: dict) -> list[str]:
         records = [v for v in r["violations"] if v.get("phase") == phase]
         if phase == "unknown" and not records:
             continue  # only shown when the boundary was missing
+        if phase == "observation" and r.get("depth") != "deep":
+            continue  # (#175) deep scans only
         section = _event_section(titles[phase], records, level="###",
                                  groups=[g for g in groups if g["phase"] == phase],
                                  violations=r["violations"])
@@ -1913,7 +1962,7 @@ def _programs_section(r: dict) -> list[str]:
     """Every successful exec, by phase (#120). Allowed or not: violations are
     listed in their own section; this shows what actually ran."""
     titles = {"install": "Install", "startup": "Startup", "tool-call": "Tool calls",
-              "unknown": "Phase unknown"}
+              "observation": "Observation window (after the last call)", "unknown": "Phase unknown"}
     lines = ["", "## Programs run", "",
              "Every program that was started successfully, allowed or not "
              "(violations are listed above)."]
@@ -1922,6 +1971,8 @@ def _programs_section(r: dict) -> list[str]:
         rows = [p for p in programs if p["phase"] == phase]
         if phase == "unknown" and not rows:
             continue
+        if phase == "observation" and r.get("depth") != "deep":
+            continue  # (#175) deep scans only
         lines += ["", f"### {titles[phase]}", ""]
         if phase == "install" and not rows and not r.get("package"):
             lines.append("Nothing is installed in a fixture run.")

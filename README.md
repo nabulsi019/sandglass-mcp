@@ -466,6 +466,25 @@ can't hide and a stable run lists each finding once. A server with honest
 randomness (a random CDN host) reads as unstable; that's accurate. Deep scans
 take about twice as long.
 
+**The observation window** (#175, deep only). A quick scan closes the
+session right after the last call, so anything a server does a few seconds
+later (a background thread, a timer) is never traced. After its last call,
+a deep scan sends one ordinary MCP notification,
+`notifications/roots/list_changed` (servers ignore it; it carries no
+Sandglass name), then keeps the session open and idle for **60 s**, in both
+runs, sending nothing. If the server exits, the window ends early. The stdin
+relay marks the trace just before passing that notification on, and events
+after the marker are in the **observation** phase, with their own sections
+in the Markdown; they are judged by exactly the same rules, the label only
+says when it happened. Only the relay's own marker counts: if a deep trace
+lacks it, those events are "unknown", never guessed. The report gets
+`observation` (`seconds`, `ended_early`, `events`) and an "Observation" line.
+This narrows the blind spot; it doesn't close it: anything delayed past the
+window, or triggered by a date or an event, stays unseen, and a hostile
+server can notice the notification and stay quiet. (The MCP SDK now marks
+roots as deprecated, SEP-2577; the notification is still valid.) A deep scan
+takes about 2 minutes longer.
+
 **The depth label** (#174). Every report, scans and fixture runs alike,
 says which scan ran, in the terminal summary (just before the Duration
 line) and in the Markdown header:
@@ -1017,6 +1036,10 @@ below are from each project's own paper or documentation.
 
 ## Known limitations
 
+- **Delayed behaviour** (#175). A deep scan watches for 60 s after the last
+  call; a quick scan not at all. Anything a server does later, on a date, or
+  only after an event Sandglass never causes, is not seen, and a server can
+  notice the deep scan (its sample folder, its notification) and wait it out.
 - **A server can tell it's being traced** (#82). Under strace, a process's
   `/proc/self/status` shows a non-zero `TracerPid`, so a server (or an install
   script) can notice it's being watched and behave well only then. Sandglass

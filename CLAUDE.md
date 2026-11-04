@@ -156,6 +156,13 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
     the two runs with no new verdict word or exit code, run 2 replays run 1's
     calls from the same download, and no edge-case input is a path,
     traversal or injection string
+  - every `EXPECTED_OBSERVATION` entry in `scripts/check_fixtures.py`, with
+    `FIXTURE_OBSERVE_SECONDS` (#175: delayed_read_server quick CLEAN and deep
+    VIOLATIONS under no_network.v1, exactly the delayed read of the decoy
+    credentials, in the "observation" phase; test-only window), the 60 s
+    `OBSERVE_SECONDS` in both deep runs with nothing sent during it, and
+    compare.py trusting only the relay's own observation marker (missing in
+    a deep run: "unknown", never guessed)
   - `EXPECTED_EXIT_CODES` in `scripts/check_fixtures.py` (the exit code of
     every verdict: 0 CLEAN, 1 VIOLATIONS, 3 INCOMPLETE; 2 is a usage error)
   - the sandbox hardening flags (--network none, --read-only, non-root user,

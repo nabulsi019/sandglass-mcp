@@ -336,6 +336,17 @@ EXPECTED_STABILITY = {
     "unstable_server.py": ("VIOLATIONS", {("read", CREDS)}, "unstable", CREDS, True),
 }
 
+# (#175) The observation window: a read 3 s after the tool answered. Every
+# deep fixture run here uses the window shortened to FIXTURE_OBSERVE_SECONDS
+# (test only; the product's stays 60 s), so the fixture job stays short.
+# Under no_network.v1. (fixture, depth) -> (expected verdict, expected
+# violations, the phase they must be in)
+FIXTURE_OBSERVE_SECONDS = 6
+EXPECTED_OBSERVATION = {
+    ("delayed_read_server.py", "quick"): ("CLEAN", set(), "tool-call"),
+    ("delayed_read_server.py", "deep"): ("VIOLATIONS", {("read", CREDS)}, "observation"),
+}
+
 EXPECTED_RUNTIME = {
     # /dev/null O_RDWR, the overcommit_memory read, bind ::1 port 0, uname -p.
     "runtime_noise_server.py": ("CLEAN", set(), [(["uname", "-p"], UNAME_NOTE)]),
@@ -752,6 +763,13 @@ def process_failures(label: str, report: dict, fewest: int) -> list[str]:
 
 
 def main() -> int:
+    # (#175) Every deep fixture run gets the short observation window (test
+    # only), restored afterwards.
+    with budgets({"OBSERVE_SECONDS": FIXTURE_OBSERVE_SECONDS}):
+        return check_all()
+
+
+def check_all() -> int:
     failures = []
     # The exit code each verdict gives (#124); 2 stays argparse's usage error.
     if EXIT_CODES != EXPECTED_EXIT_CODES:
@@ -899,6 +917,19 @@ def main() -> int:
             failures.append(f"{label}: expected the violation tagged run 2, got "
                             f"{[v.get('run') for v in report['violations']]}")
 
+    for (fixture, depth), (want_verdict, want_violations, want_phase) in EXPECTED_OBSERVATION.items():
+        label = f"{fixture} ({depth} scan, observation {FIXTURE_OBSERVE_SECONDS} s) under no_network.v1"
+        print(f"\n===== {label} =====")
+        report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, POLICIES["no_network.v1"],
+                               [], {}, client.DEFAULT_MODE, depth)
+        failures += check(label, report, want_verdict, want_violations, want_phase=want_phase)
+        observation = report.get("observation")
+        if depth == "deep" and not (observation and observation["seconds"] == FIXTURE_OBSERVE_SECONDS
+                                    and observation["events"] > 0):
+            failures.append(f"{label}: expected an observation window with events, got {observation}")
+        if depth == "quick" and observation is not None:
+            failures.append(f"{label}: a quick scan must have no observation window, got {observation}")
+
     for (fixture, policy_name, with_setup), (want_verdict, want_violations, want_reasons) \
             in EXPECTED_SERVER_SETUP.items():
         label = f"{fixture} under {policy_name}, {'with' if with_setup else 'without'} its setup"
@@ -1002,6 +1033,7 @@ def main() -> int:
                  + len(EXPECTED_COVERAGE_SUMMARY) + len(EXPECTED_SERVER_SETUP)
                  + len(EXPECTED_ENVIRONMENT) + len(EXPECTED_INPUT_MODES) + len(EXPECTED_DEEP_BUDGET)
                  + len(EXPECTED_SAMPLE_FILES) + len(EXPECTED_REPEATED_CALLS) + len(EXPECTED_STABILITY)
+                 + len(EXPECTED_OBSERVATION)
                  + len(EXPECTED_SCANS) + len(EXPECTED_NPM_REGISTRY_SCANS)
                  + len(EXPECTED_OLD_DOCKER_SCANS) + len(EXPECTED_OLD_DOCKER_NPM_REGISTRY_SCANS))
         print(f"all {total} fixtures match expectations")

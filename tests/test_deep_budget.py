@@ -31,7 +31,8 @@ def test_deep_budget(tools, seconds):
 
 
 def test_the_safety_net_covers_the_cap():
-    assert client.session_limit("deep") == 600 + client.SESSION_GRACE_SECONDS
+    # (#175) plus the observation window
+    assert client.session_limit("deep") == 600 + client.OBSERVE_SECONDS + client.SESSION_GRACE_SECONDS
     assert client.session_limit("quick") == 120 + client.SESSION_GRACE_SECONDS
 
 
@@ -49,6 +50,7 @@ def run_with_clock(monkeypatch, readings: list[float], depth: str) -> dict:
 
     monkeypatch.setattr(client, "budget_clock", fake_clock)
     monkeypatch.setattr(client, "CALL_TIMEOUT_SECONDS", 1)  # slow_tool takes 3 s
+    monkeypatch.setattr(client, "OBSERVE_SECONDS", 0)  # (#175) no idle window in these tests
     params = StdioServerParameters(command=sys.executable, args=[str(FAKE_SERVER)])
     return asyncio.run(client.run(params, "coverage_server", depth=depth))
 

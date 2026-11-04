@@ -84,6 +84,13 @@ def deep_budget(tools: int) -> int:
     return min(max(DEEP_FLOOR_SECONDS, DEEP_PER_TOOL_SECONDS * tools), DEEP_CAP_SECONDS)
 
 
+# (#175) Deep only: after the last call, the session stays open and idle this
+# long, so what a server does a little later (a delayed thread, a timer) is
+# still traced. Fixed (the owner's decision); in both runs of #172.
+OBSERVE_SECONDS = 60
+OBSERVE_POLL_SECONDS = 0.25  # how often the window checks that the server is still there
+
+
 def depth_argument(depth: str) -> dict:
     """`depth=` for a call, only for a deep scan (#170): a quick scan calls
     run(), run_scan() and run_sandboxed() exactly as before deep existed."""
@@ -92,8 +99,9 @@ def depth_argument(depth: str) -> dict:
 
 def session_limit(depth: str) -> float:
     """The safety net around run() (#170): the largest budget the depth can
-    have, plus SESSION_GRACE_SECONDS for the handshake and shutdown."""
-    budget = DEEP_CAP_SECONDS if depth == "deep" else TIME_BUDGET_SECONDS
+    have, plus SESSION_GRACE_SECONDS for the handshake and shutdown. Deep
+    adds the observation window (#175)."""
+    budget = DEEP_CAP_SECONDS + OBSERVE_SECONDS if depth == "deep" else TIME_BUDGET_SECONDS
     return budget + SESSION_GRACE_SECONDS
 
 # --sandbox exit codes, so scripts and CI can check the verdict. INCOMPLETE
@@ -287,6 +295,8 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
             if depth == "deep":
                 # (#172) Up to MAX_VARIANTS calls per tool, round robin.
                 await _deep_calls(session, tools, session_record, deadline, inputs_mode, replay)
+                # (#175) Then the idle observation window, in both runs.
+                await _observe(session, read_stream, session_record)
                 return session_record
 
             stop_reason = None  # set once no more tools may be called (#140)
@@ -351,6 +361,27 @@ async def _call(session: ClientSession, session_record: dict, tool_name: str, ar
     call["seconds"] = round(clock() - started, 2)
     print(f"  -> [{call['status']}] {call['result']}")
     return call
+
+
+async def _observe(session: ClientSession, read_stream, session_record: dict) -> None:
+    """(#175) The observation window: after the last call, send the marker
+    notification (an ordinary MCP notifications/roots/list_changed; the
+    stdin relay marks the trace just before passing it on), then wait
+    OBSERVE_SECONDS with the session open, sending nothing. If the server
+    exits (its output stream closes), the wait ends early."""
+    # Recorded before it's sent: a session that dies now still shows the window started.
+    session_record["observation"] = {"seconds": OBSERVE_SECONDS, "ended_early": False}
+    # The SDK now warns that roots are deprecated (SEP-2577); the notification
+    # is still a valid message that servers ignore, which is all the marker needs.
+    await session.send_roots_list_changed()
+    print(f"\nObserving: {OBSERVE_SECONDS} s idle after the last call")
+    end = time.monotonic() + OBSERVE_SECONDS
+    while time.monotonic() < end:
+        if read_stream.statistics().open_send_streams == 0:
+            session_record["observation"]["ended_early"] = True  # the server's output closed: it exited
+            print("  the server exited during the observation window")
+            return
+        await asyncio.sleep(min(OBSERVE_POLL_SECONDS, max(0.0, end - time.monotonic())))
 
 
 def deep_plan(tools: list[Tool], session_record: dict, inputs_mode: str) -> list[tuple[str, str, dict]]:

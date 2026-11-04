@@ -23,6 +23,10 @@ Markers (stat()s of paths under /sandglass-phase, which doesn't exist):
              later (#140), e.g. a tool stuck in a thread that the client's
              cancel can't interrupt: the relay then kills the server, so
              strace records its exit and the trace is complete
+  observation  (#175, deep scans only) just before the client's
+             notifications/roots/list_changed is passed on: the client sends
+             it after its last call, then keeps the session open, idle, for
+             the observation window. Quick scans never send it.
 
 Imported on the host too (compare.py uses the constants), so the actual work
 only happens under `if __name__ == "__main__"`.
@@ -37,6 +41,11 @@ TOOL_CALL_MARKER = f"{PHASE_MARKER_DIR}/tool-call"
 EOF_MARKER = f"{PHASE_MARKER_DIR}/eof"
 SERVER_EXITED_MARKER = f"{PHASE_MARKER_DIR}/server-exited"
 SERVER_STOPPED_MARKER = f"{PHASE_MARKER_DIR}/server-stopped"
+# (#175) The observation window starts here: deep scans only.
+OBSERVATION_MARKER = f"{PHASE_MARKER_DIR}/observation"
+# The ordinary MCP notification the client sends to start the window. It
+# carries no Sandglass name, and servers ignore it.
+OBSERVATION_METHOD = "notifications/roots/list_changed"
 # How often (seconds) the relay checks that the server is still running while
 # it waits for the client's next message.
 PARENT_CHECK_SECONDS = 0.5
@@ -48,13 +57,23 @@ STOP_GRACE_SECONDS = 1.0
 READY_FD = 3
 
 
-def is_tool_call(line: bytes) -> bool:
-    """Is this one MCP stdio message (one line of JSON) a tools/call request?"""
+def _method(line: bytes) -> str | None:
+    """The "method" of one MCP stdio message (one line of JSON), or None."""
     try:
         message = json.loads(line)
     except ValueError:
-        return False  # not JSON (or a partial line): never a marker
-    return isinstance(message, dict) and message.get("method") == "tools/call"
+        return None  # not JSON (or a partial line): never a marker
+    return message.get("method") if isinstance(message, dict) else None
+
+
+def is_tool_call(line: bytes) -> bool:
+    """Is this one MCP stdio message (one line of JSON) a tools/call request?"""
+    return _method(line) == "tools/call"
+
+
+def is_observation_start(line: bytes) -> bool:
+    """(#175) Is this message the client's start of the observation window?"""
+    return _method(line) == OBSERVATION_METHOD
 
 
 def _record(path: str) -> None:
@@ -85,6 +104,7 @@ def relay() -> None:
     # notice at its session timeout (#24).
     parent = os.getppid()
     seen_tool_call = False
+    seen_observation = False  # (#175)
     partial = b""  # the start of a line whose newline hasn't arrived yet
     while True:
         ready, _, _ = select.select([0], [], [], PARENT_CHECK_SECONDS)
@@ -96,14 +116,20 @@ def relay() -> None:
         chunk = os.read(0, 65536)
         if not chunk:
             break
-        if not seen_tool_call:
+        if not (seen_tool_call and seen_observation):
             # MCP stdio messages are one JSON object per line. Only complete
             # lines are checked; the server can't act on a line before its
             # newline arrives, and that newline is passed on after the marker.
+            # Lines are parsed until both markers are seen (#175); the bytes
+            # are passed on unchanged either way.
             *lines, partial = (partial + chunk).split(b"\n")
-            if any(is_tool_call(line) for line in lines):
-                _record(TOOL_CALL_MARKER)
-                seen_tool_call = True
+            for line in lines:
+                if not seen_tool_call and is_tool_call(line):
+                    _record(TOOL_CALL_MARKER)
+                    seen_tool_call = True
+                if not seen_observation and is_observation_start(line):
+                    _record(OBSERVATION_MARKER)
+                    seen_observation = True
         _write_all(1, chunk)
 
     _record(EOF_MARKER)  # a normal end: the client closed stdin

@@ -95,6 +95,7 @@ def run_deep(monkeypatch, readings: list[float], replay: dict | None = None) -> 
 
     monkeypatch.setattr(client, "budget_clock", fake_clock)
     monkeypatch.setattr(client, "CALL_TIMEOUT_SECONDS", 1)  # slow_tool takes 3 s
+    monkeypatch.setattr(client, "OBSERVE_SECONDS", 0)  # (#175) no idle window in these tests
     params = StdioServerParameters(command=sys.executable, args=[str(FAKE_SERVER)])
     return asyncio.run(client.run(params, "coverage_server", depth="deep", replay=replay))
 
