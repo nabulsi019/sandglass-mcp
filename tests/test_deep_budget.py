@@ -80,9 +80,10 @@ def test_deep_with_exactly_5_s_left_does_not_start(monkeypatch):
 
 def test_deep_reaches_every_tool_with_time_left(monkeypatch):
     record = run_with_clock(monkeypatch, [0, 0, 10, 20, 30, 40, 50], "deep")
-    assert [c["tool"] for c in record["calls"]] == ["ok_tool", "error_tool", "rejected_tool",
-                                                     "pattern_tool", "slow_tool"]
-    assert record["not_called"] == []
+    # The first pass of the round robin (#172) reaches every tool.
+    assert [c["tool"] for c in record["calls"][:5]] == ["ok_tool", "error_tool", "rejected_tool",
+                                                         "pattern_tool", "slow_tool"]
+    assert record["not_called"] == [] and record["calls_not_made"] == 0
 
 
 # --- the flag ----------------------------------------------------------------------

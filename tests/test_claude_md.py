@@ -59,6 +59,15 @@ def test_every_sample_file_fixture_is_protected():
         assert fixture.removesuffix(".py") in PROTECTED
 
 
+def test_every_repeat_run_fixture_is_protected():
+    # (#172) the second-input and unstable fixtures, and the run-2 test hook.
+    for item in ("`EXPECTED_REPEATED_CALLS`", "`EXPECTED_STABILITY`", "`UNSTABLE_TEST_HOOK`"):
+        assert item in PROTECTED, f"{item!r} is not in CLAUDE.md's protected items"
+    fixtures = [f for f, _ in check_fixtures.EXPECTED_REPEATED_CALLS] + list(check_fixtures.EXPECTED_STABILITY)
+    for fixture in fixtures:
+        assert fixture.removesuffix(".py") in PROTECTED
+
+
 def test_every_runtime_fixture_is_protected():
     # (#142) the runtime noise fixture and its dangerous neighbours.
     assert "`EXPECTED_RUNTIME`" in PROTECTED

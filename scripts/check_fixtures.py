@@ -319,6 +319,23 @@ EXPECTED_SAMPLE_FILES = {
         {"/tmp/work/samples/notes.txt", "/tmp/work/samples/repo/.git/HEAD"}),
 }
 
+# (#172) Repeated calls: a tool that misbehaves only with a second kind of
+# input. Under no_network.v1. (fixture, depth) -> (expected verdict, expected
+# violations, the one variant whose call must return "found", or None in quick)
+EXPECTED_REPEATED_CALLS = {
+    ("second_input_server.py", "quick"): ("CLEAN", set(), None),
+    ("second_input_server.py", "deep"): ("VIOLATIONS", {("read", CREDS)}, "sample-file"),
+}
+# (#172) The repeatability check: a server that reads the decoy credentials
+# only in run 2, through a test-only variable that run_2_env sets for run 2
+# alone (never a Sandglass option). Under no_network.v1, deep.
+# fixture -> (expected verdict, expected violations, stability status, text
+# that must be in "only_in_run_2", whether "only_in_run_1" must be empty)
+UNSTABLE_TEST_HOOK = "UNSTABLE_FIXTURE_RUN"
+EXPECTED_STABILITY = {
+    "unstable_server.py": ("VIOLATIONS", {("read", CREDS)}, "unstable", CREDS, True),
+}
+
 EXPECTED_RUNTIME = {
     # /dev/null O_RDWR, the overcommit_memory read, bind ::1 port 0, uname -p.
     "runtime_noise_server.py": ("CLEAN", set(), [(["uname", "-p"], UNAME_NOTE)]),
@@ -361,6 +378,26 @@ def budgets(values: dict):
     finally:
         for name, value in originals.items():
             setattr(client, name, value)
+
+
+@contextlib.contextmanager
+def run_2_env(name: str):
+    """(#172) Set the variable `name` in a deep scan's run 2 only (the run
+    that replays run 1's calls), inside the `with` block. Test only."""
+    original = client.run
+
+    async def run_with_hook(params, *args, replay=None, **kwargs):
+        if replay is not None:
+            image = params.args.index(sandbox.IMAGE)
+            params = params.model_copy(update={"args": params.args[:image] + ["-e", f"{name}=1"]
+                                               + params.args[image:]})
+        return await original(params, *args, replay=replay, **kwargs)
+
+    client.run = run_with_hook
+    try:
+        yield
+    finally:
+        client.run = original
 
 
 @contextlib.contextmanager
@@ -833,6 +870,35 @@ def main() -> int:
         if reads != want_reads:
             failures.append(f"{label}: expected sample files read {sorted(want_reads)}, got {sorted(reads)}")
 
+    for (fixture, depth), (want_verdict, want_violations, want_variant) in EXPECTED_REPEATED_CALLS.items():
+        label = f"{fixture} ({depth} scan) under no_network.v1"
+        print(f"\n===== {label} =====")
+        report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, POLICIES["no_network.v1"],
+                               [], {}, client.DEFAULT_MODE, depth)
+        failures += check(label, report, want_verdict, want_violations)
+        found = [c.get("variant") for c in report.get("exercised", []) if c["result"] == "found"]
+        if found != ([want_variant] if want_variant else []):
+            failures.append(f"{label}: expected only the {want_variant} variant to find its file, got {found}")
+        if depth == "deep" and (report.get("stability") or {}).get("status") != "stable":
+            failures.append(f"{label}: expected stable runs, got {report.get('stability')}")
+
+    for fixture, (want_verdict, want_violations, want_status, want_only_2, only_1_empty) \
+            in EXPECTED_STABILITY.items():
+        label = f"{fixture} (deep scan, {UNSTABLE_TEST_HOOK} in run 2 only) under no_network.v1"
+        print(f"\n===== {label} =====")
+        with run_2_env(UNSTABLE_TEST_HOOK):
+            report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, POLICIES["no_network.v1"],
+                                   [], {}, client.DEFAULT_MODE, "deep")
+        failures += check(label, report, want_verdict, want_violations)
+        stability = report.get("stability") or {}
+        if (stability.get("status") != want_status
+                or not any(want_only_2 in entry for entry in stability.get("only_in_run_2", []))
+                or (only_1_empty and stability.get("only_in_run_1"))):
+            failures.append(f"{label}: expected {want_status} with {want_only_2!r} only in run 2, got {stability}")
+        if [v.get("run") for v in report["violations"]] != [2]:
+            failures.append(f"{label}: expected the violation tagged run 2, got "
+                            f"{[v.get('run') for v in report['violations']]}")
+
     for (fixture, policy_name, with_setup), (want_verdict, want_violations, want_reasons) \
             in EXPECTED_SERVER_SETUP.items():
         label = f"{fixture} under {policy_name}, {'with' if with_setup else 'without'} its setup"
@@ -935,7 +1001,7 @@ def main() -> int:
                  + len(EXPECTED_MISSING_PROGRAM) + len(EXPECTED_PROCESS_FINGERPRINTS) + len(EXPECTED_DNS)
                  + len(EXPECTED_COVERAGE_SUMMARY) + len(EXPECTED_SERVER_SETUP)
                  + len(EXPECTED_ENVIRONMENT) + len(EXPECTED_INPUT_MODES) + len(EXPECTED_DEEP_BUDGET)
-                 + len(EXPECTED_SAMPLE_FILES)
+                 + len(EXPECTED_SAMPLE_FILES) + len(EXPECTED_REPEATED_CALLS) + len(EXPECTED_STABILITY)
                  + len(EXPECTED_SCANS) + len(EXPECTED_NPM_REGISTRY_SCANS)
                  + len(EXPECTED_OLD_DOCKER_SCANS) + len(EXPECTED_OLD_DOCKER_NPM_REGISTRY_SCANS))
         print(f"all {total} fixtures match expectations")

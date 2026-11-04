@@ -147,6 +147,15 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
     compare.py's sample rule: only READS of the exact sample paths passed in
     a call of that run, or of files under a passed directory, are listed
     apart; writes, other reads and programs run are judged normally
+  - every `EXPECTED_REPEATED_CALLS` and `EXPECTED_STABILITY` entry in
+    `scripts/check_fixtures.py`, with `UNSTABLE_TEST_HOOK` (#172:
+    second_input_server quick CLEAN and deep VIOLATIONS under no_network.v1,
+    exactly the read of the decoy credentials, found only by the sample-file
+    variant; unstable_server deep VIOLATIONS, "unstable", the read only in
+    run 2 and tagged run 2), and the deep rules: the verdict is the worse of
+    the two runs with no new verdict word or exit code, run 2 replays run 1's
+    calls from the same download, and no edge-case input is a path,
+    traversal or injection string
   - `EXPECTED_EXIT_CODES` in `scripts/check_fixtures.py` (the exit code of
     every verdict: 0 CLEAN, 1 VIOLATIONS, 3 INCOMPLETE; 2 is a usage error)
   - the sandbox hardening flags (--network none, --read-only, non-root user,
