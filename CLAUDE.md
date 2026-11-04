@@ -139,6 +139,14 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
     both depths: quick with tools "not called" in its coverage summary, deep
     with every tool run; test-only budgets), and `tests/test_quick_unchanged.py`
     (the quick scan's frozen docker arguments, MCP messages and budget)
+  - every `EXPECTED_SAMPLE_FILES` entry in `scripts/check_fixtures.py`
+    (#171: sample_reader_server quick CLEAN with "3 of 3 tools returned
+    errors" and deep CLEAN under no_network.v1; deep VIOLATIONS under
+    read_only_folder.v1, exactly the write of /tmp/work/samples/notes.txt.copy,
+    with exactly notes.txt and repo/.git/HEAD as "sample files read"), and
+    compare.py's sample rule: only READS of the exact sample paths passed in
+    a call of that run, or of files under a passed directory, are listed
+    apart; writes, other reads and programs run are judged normally
   - `EXPECTED_EXIT_CODES` in `scripts/check_fixtures.py` (the exit code of
     every verdict: 0 CLEAN, 1 VIOLATIONS, 3 INCOMPLETE; 2 is a usage error)
   - the sandbox hardening flags (--network none, --read-only, non-root user,

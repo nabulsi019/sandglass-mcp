@@ -305,6 +305,20 @@ EXPECTED_DEEP_BUDGET = {
     ("many_tools_server.py", "deep"): ("CLEAN", set(), None),
 }
 
+# (#171) Sample files in deep scans: tools that need a real file or git repo.
+# (fixture, depth, policy name in POLICIES or SETUP_POLICIES) -> (expected
+# verdict, expected violations, expected coverage summary (None: every tool
+# ran), the exact set of paths in "sample files read")
+EXPECTED_SAMPLE_FILES = {
+    ("sample_reader_server.py", "quick", "no_network.v1"): (
+        "CLEAN", set(), "3 of 3 tools returned errors", set()),
+    # The policy already allows these reads, so nothing needs the list.
+    ("sample_reader_server.py", "deep", "no_network.v1"): ("CLEAN", set(), None, set()),
+    ("sample_reader_server.py", "deep", "read_only_folder.v1"): (
+        "VIOLATIONS", {("write", "/tmp/work/samples/notes.txt.copy")}, None,
+        {"/tmp/work/samples/notes.txt", "/tmp/work/samples/repo/.git/HEAD"}),
+}
+
 EXPECTED_RUNTIME = {
     # /dev/null O_RDWR, the overcommit_memory read, bind ::1 port 0, uname -p.
     "runtime_noise_server.py": ("CLEAN", set(), [(["uname", "-p"], UNAME_NOTE)]),
@@ -805,6 +819,20 @@ def main() -> int:
         if report.get("depth") != depth:
             failures.append(f"{label}: expected depth {depth!r}, got {report.get('depth')!r}")
 
+    for (fixture, depth, policy_name), (want_verdict, want_violations, want_summary, want_reads) \
+            in EXPECTED_SAMPLE_FILES.items():
+        label = f"{fixture} ({depth} scan) under {policy_name}"
+        print(f"\n===== {label} =====")
+        policy = {**POLICIES, **SETUP_POLICIES}[policy_name]
+        report = run_sandboxed(PROJECT_ROOT / "test_servers" / fixture, policy, [], {}, client.DEFAULT_MODE, depth)
+        failures += check(label, report, want_verdict, want_violations)
+        if report.get("coverage_summary") != want_summary:
+            failures.append(f"{label}: expected coverage summary {want_summary!r}, "
+                            f"got {report.get('coverage_summary')!r}")
+        reads = {v["target"] for v in report.get("sample_files_read", [])}
+        if reads != want_reads:
+            failures.append(f"{label}: expected sample files read {sorted(want_reads)}, got {sorted(reads)}")
+
     for (fixture, policy_name, with_setup), (want_verdict, want_violations, want_reasons) \
             in EXPECTED_SERVER_SETUP.items():
         label = f"{fixture} under {policy_name}, {'with' if with_setup else 'without'} its setup"
@@ -907,6 +935,7 @@ def main() -> int:
                  + len(EXPECTED_MISSING_PROGRAM) + len(EXPECTED_PROCESS_FINGERPRINTS) + len(EXPECTED_DNS)
                  + len(EXPECTED_COVERAGE_SUMMARY) + len(EXPECTED_SERVER_SETUP)
                  + len(EXPECTED_ENVIRONMENT) + len(EXPECTED_INPUT_MODES) + len(EXPECTED_DEEP_BUDGET)
+                 + len(EXPECTED_SAMPLE_FILES)
                  + len(EXPECTED_SCANS) + len(EXPECTED_NPM_REGISTRY_SCANS)
                  + len(EXPECTED_OLD_DOCKER_SCANS) + len(EXPECTED_OLD_DOCKER_NPM_REGISTRY_SCANS))
         print(f"all {total} fixtures match expectations")

@@ -405,6 +405,38 @@ freezes its docker arguments, messages and budget).
 uv run sandglass scan pypi:wikipedia-mcp@2.0.1 --policy policies/templates/no_network.v1.yaml --deep
 ```
 
+**Sample files** (#171, deep only). Many tools need a real file to do
+anything: "hello" isn't a path, so a quick scan sees only their input
+errors. The image holds a few small, harmless sample files, built by
+`scripts/build_samples.py` (`notes.txt`, `notes.md`, `table.csv`,
+`data.json`, `book.xlsx`, `doc.pdf`, `image.png`) and a git repository
+`repo/` with 2 commits (fixed author and dates). A deep run copies them to
+`/tmp/work/samples` before tracing starts (owned by the server's user,
+fresh for each run); a quick run's `/tmp/work` stays empty.
+
+A string argument named with *path*, *file*, *dir*, *folder*, *repo*,
+*document*, *uri* or *url* (or with `format: uri`) gets a sample instead of
+its normal value, source `sample-file`. Which one comes from the words in the
+argument's name and description, then the tool's: excel/xlsx/spreadsheet →
+`book.xlsx`, pdf → `doc.pdf`, csv → `table.csv`, json → `data.json`,
+markdown/md → `notes.md`, image/png → `image.png`, git/repo → `repo`,
+dir/folder → the samples folder, otherwise `notes.txt`. A URI is
+`file:///tmp/work/samples/...`; a URL argument keeps its http(s) URL unless
+the text names `file:`. The server's text only chooses among these fixed
+paths: it can never put a path of its own into an input.
+
+**Reads of the samples.** Reading a sample Sandglass passed in is not the
+server overreaching, so in deep scans those reads are listed under "Sample
+files read" instead of as violations, only for **the exact sample paths
+passed in any call of that run** (`sample_paths` in the JSON), and for files
+under a passed directory (e.g. `repo/.git/HEAD` when `repo` was passed).
+Everything else is judged normally: a sample that wasn't passed, any write
+(a tool saving next to a sample under a read-only policy is a violation),
+and any program run (mcp-server-git running `git` stays a violation unless
+`exec_allow` lists it). A server can notice `/tmp/work/samples` and tell it's
+a deep scan, and a tool may change a sample that later tools then see; calls
+keep a fixed order, so it's the same every run.
+
 **The depth label** (#174). Every report, scans and fixture runs alike,
 says which scan ran, in the terminal summary (just before the Duration
 line) and in the Markdown header:

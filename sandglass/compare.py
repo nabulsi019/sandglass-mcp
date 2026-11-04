@@ -110,6 +110,7 @@ from pathlib import Path
 from mcp.types import CONNECTION_CLOSED, REQUEST_TIMEOUT
 
 from sandglass import dnssink, launcher, netsink, sandbox, stdin_relay
+from sandglass.inputs import SAMPLE_DIRS
 from sandglass.policy import InstallBaseline, Policy
 from sandglass.trace_parser import MAX_TRACE_BYTES, NETWORK_SYSCALLS, UNREADABLE, Event, exec_argv
 
@@ -537,6 +538,26 @@ def _file_problems(event: Event, allowed, readable, reason_for, link_reason: str
     return problems
 
 
+SAMPLE_READ_REASON = "read a sample file Sandglass passed in (deep scan input, #171)"
+
+
+def _is_sample_read(event: Event, sample_paths: list[str]) -> bool:
+    """(#171) Is this file event a READ of a sample Sandglass passed in?
+
+    Only reads (and directory listings), never writes. Every path involved
+    must be covered: the requested one and the file really opened, and a new
+    link never counts. A passed file covers exactly that file; a passed
+    directory (inputs.SAMPLE_DIRS) covers itself and every file under it.
+    """
+    if event.mode not in ("read", "list") or event.link_target or not sample_paths:
+        return False
+    dirs = [p for p in sample_paths if p in SAMPLE_DIRS]
+
+    def covered(path: str) -> bool:
+        return path in sample_paths or _is_under(path, dirs)
+    return all(covered(p) for p in (event.target, event.opened) if p)
+
+
 def _program(event: Event, phase: str, note: str | None = None) -> dict:
     """One successful exec for the report's "Programs run" section (#120).
     Listed whether it was allowed or not: this is visibility, not a verdict."""
@@ -591,6 +612,10 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
     dns_ready_index = next((i for i, e in enumerate(events) if e.pid == dns_pid and e.kind == "probe"
                             and e.target == dnssink.DNS_READY), len(events))
     dns_names: list[dict] = []  # every query the recorder recorded: name, type, phase
+    # (#171) Deep scans: the sample paths Sandglass passed in any call of this
+    # run, and the reads of them the policy would otherwise not allow.
+    sample_paths = session.get("sample_paths", [])
+    sample_reads: list[dict] = []
 
     for index, event in enumerate(events):
         if event.kind == "process" and event.succeeded:
@@ -690,6 +715,11 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
                 event, allowed, readable,
                 lambda path: _file_reason(event.mode, path, policy.read_deny),
                 "linked to a path outside allowed reads")
+            if problems and _is_sample_read(event, sample_paths):
+                # (#171) A deep scan read a sample Sandglass itself passed in:
+                # listed apart, never a violation. Anything else is judged below.
+                sample_reads.append(_record(event, SAMPLE_READ_REASON, phase_of(index)))
+                continue
             for reason, target in problems:
                 (violations if _bucket_for_failure_or_success(event) == "violation" else attempted).append(
                     _record(event, reason, phase_of(index), target))
@@ -831,6 +861,7 @@ def compare(events: list[Event], policy: Policy, session: dict, runtime: str = "
         "phase_note": phase_note,
         "server_stopped": server_stopped,  # the relay killed it after eof (#140)
         "programs": programs,
+        "sample_reads": sample_reads,  # (#171) deep scans: reads of the samples passed in
         "event_counts": {
             kind: sum(1 for e in events if e.kind == kind)
             for kind in EVENT_KINDS
@@ -1491,6 +1522,10 @@ def build_report(server: str, timestamp: str, policy: Policy, session: dict,
     if depth == "deep":
         # (#170) {"seconds", "per_tool", "tools"}; None if the tools were never listed.
         report["budget"] = session.get("budget")
+        # (#171) The sample paths passed in, and the reads of them the policy
+        # alone would have called violations (listed apart, never judged).
+        report["sample_paths"] = session.get("sample_paths", [])
+        report["sample_files_read"] = result.get("sample_reads", [])
     return report
 
 
@@ -1553,6 +1588,7 @@ def _markdown(r: dict) -> str:
         out.append("None.")
 
     out += _coverage_section(r)
+    out += _sample_section(r)
     if r.get("not_tested"):
         out += ["", "## Not tested", ""] + [f"- {line}" for line in r["not_tested"]]
     out += _network_section(r)
@@ -1634,6 +1670,28 @@ def _coverage_section(r: dict) -> list[str]:
         took = seconds.get(row["tool"])
         time_text = "" if took is None else f"{took:.2f} s"
         lines.append(f"| `{row['tool']}` | {row['status']} | {time_text} | {reason} |")
+    return lines
+
+
+def _sample_section(r: dict) -> list[str]:
+    """(#171) Deep scans: the sample files passed in, and the reads of them
+    that are listed here instead of as violations. Writes, other reads and
+    programs run are judged as usual."""
+    if r.get("depth") != "deep":
+        return []
+    lines = ["", "## Sample files read (deep scan)", ""]
+    passed = r.get("sample_paths") or []
+    lines.append("Passed in: " + (", ".join(f"`{p}`" for p in passed) if passed else "none") + ".")
+    lines.append("")
+    reads = r.get("sample_files_read") or []
+    if not reads:
+        return lines + ["No read of them needed this list: the policy allows them, or none happened."]
+    lines.append("Reads of these samples that the policy alone doesn't allow; not violations, because "
+                 "Sandglass chose the input. Writes and programs run are judged as usual.")
+    lines.append("")
+    for path in dict.fromkeys(v["target"] for v in reads):
+        count = sum(1 for v in reads if v["target"] == path)
+        lines.append(f"- `{path}` ×{count}")
     return lines
 
 
