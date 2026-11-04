@@ -38,7 +38,8 @@ from mcp.types import REQUEST_TIMEOUT, CallToolResult, TextContent, Tool
 from sandglass import PROJECT_ROOT, sandbox, scan
 from sandglass.compare import (build_report, compare, compare_install, not_run, setup_line, summary_lines,
                                with_install, write_reports)
-from sandglass.inputs import DEFAULT_MODE, MODES, InputError, arguments_of, build_arguments, build_inputs
+from sandglass.inputs import (DEFAULT_MODE, MODES, InputError, arguments_of, build_arguments, build_inputs,
+                              sample_inputs, sample_path)
 from sandglass.policy import (BASELINE_FILES, Policy, PolicyError, check_scan_paths,
                               load_install_baseline, load_policy)
 from sandglass.trace_parser import parse_trace_file
@@ -280,6 +281,11 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
             for tool in tools:
                 try:
                     inputs = build_tool_inputs(tool, inputs_mode)
+                    if depth == "deep":
+                        # (#171) Path-like arguments get a sample file instead.
+                        inputs.update({name: entry for name, entry in
+                                       sample_inputs(tool.input_schema, tool.description, tool.name).items()
+                                       if name in inputs})
                     args = arguments_of(inputs)
                 except InputError as exc:
                     # Not guessed: the tool isn't called, and the report says why.
@@ -305,6 +311,14 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
                 call = {"tool": tool.name, "arguments": args, "status": "NO ANSWER",
                         "result": "the session ended before the call returned"}
                 session_record["calls"].append(call)
+                if depth == "deep":
+                    # (#171) Every sample path passed in any call of this run:
+                    # reads of exactly these are listed apart (compare.py).
+                    passed = session_record.setdefault("sample_paths", [])
+                    for value in args.values():
+                        path = sample_path(value)
+                        if path and path not in passed:
+                            passed.append(path)
                 timeout = min(CALL_TIMEOUT_SECONDS, remaining)
                 started = clock()
                 try:
@@ -409,7 +423,9 @@ def run_sandboxed(server_script: Path, policy_path: Path, server_args: list[str]
     setup = server_setup(["sandglass", str(server_script.relative_to(PROJECT_ROOT)),
                           "--policy", str(policy_path), "--sandbox"], server_args, server_env, inputs_mode,
                          depth)
-    command, args = sandbox.docker_command(server_script, server_args, list(server_env))
+    # (#171) A deep run copies the sample files into the work dir first.
+    command, args = sandbox.docker_command(server_script, server_args, list(server_env),
+                                           samples=depth == "deep")
     path_mapping = {
         str(sandbox.CONTAINER_PROJECT): f"{PROJECT_ROOT} (read-only)",
         str(sandbox.CONTAINER_REPORTS): "hidden (empty read-only tmpfs)",
@@ -610,7 +626,8 @@ def run_scan(spec: scan.PackageSpec, policy_path: Path, registry_dir: Path | Non
                     return _write_and_print(report, durations)
 
                 command, args = sandbox.scan_run_command(volume, server_path, runtime,
-                                                         server_args, list(server_env))
+                                                         server_args, list(server_env),
+                                                         samples=depth == "deep")  # (#171)
                 path_mapping = {
                     str(sandbox.CONTAINER_PACKAGE): "the installed package (a Docker volume, read-only)",
                     str(sandbox.CONTAINER_PROJECT): "not mounted: the project is never visible to a scan (#20)",

@@ -52,6 +52,13 @@ def test_every_deep_budget_fixture_is_protected():
         assert fixture.removesuffix(".py") in PROTECTED
 
 
+def test_every_sample_file_fixture_is_protected():
+    # (#171) the sample reader fixture and the sample-read rule.
+    assert "`EXPECTED_SAMPLE_FILES`" in PROTECTED
+    for fixture, _, _ in check_fixtures.EXPECTED_SAMPLE_FILES:
+        assert fixture.removesuffix(".py") in PROTECTED
+
+
 def test_every_runtime_fixture_is_protected():
     # (#142) the runtime noise fixture and its dangerous neighbours.
     assert "`EXPECTED_RUNTIME`" in PROTECTED

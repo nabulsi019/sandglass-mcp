@@ -80,6 +80,28 @@ COPY sandglass/netsink.py /usr/local/lib/mcp-runtime/sink.py
 COPY sandglass/stdin_relay.py /usr/local/lib/mcp-runtime/relay.py
 # (#147) The DNS recorder, the same way.
 COPY sandglass/dnssink.py /usr/local/lib/mcp-runtime/dns.py
+
+# (#171) The deep scan's sample files: fixed, harmless content written by a
+# stdlib script (the script itself isn't kept), plus a small git repository
+# with 2 commits, a fixed author and fixed dates, so every build is the same.
+# A deep run copies the folder to /tmp/work/samples before tracing starts
+# (sandglass/sandbox.py); quick runs never see it. Root-owned and read-only here.
+COPY scripts/build_samples.py /tmp/build_samples.py
+RUN python /tmp/build_samples.py /usr/local/lib/mcp-runtime/samples > /dev/null \
+    && rm /tmp/build_samples.py \
+    && cd /usr/local/lib/mcp-runtime/samples \
+    && git init -q -b main repo \
+    && cp notes.txt repo/README.txt \
+    && cd repo \
+    && export GIT_AUTHOR_NAME="Sample Author" GIT_AUTHOR_EMAIL="sample@example.com" \
+              GIT_COMMITTER_NAME="Sample Author" GIT_COMMITTER_EMAIL="sample@example.com" \
+              GIT_AUTHOR_DATE="2026-01-01T00:00:00Z" GIT_COMMITTER_DATE="2026-01-01T00:00:00Z" \
+    && git add README.txt && git commit -q -m "Add a readme" \
+    && cp ../notes.md notes.md \
+    && export GIT_AUTHOR_DATE="2026-01-02T00:00:00Z" GIT_COMMITTER_DATE="2026-01-02T00:00:00Z" \
+    && git add notes.md && git commit -q -m "Add notes" \
+    && rm -f .git/hooks/*.sample \
+    && chmod -R a+rX /usr/local/lib/mcp-runtime/samples
 USER 10001:10001
 
 ENV PATH=/opt/venv/bin:$PATH

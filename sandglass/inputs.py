@@ -485,6 +485,93 @@ def pattern_value(schema: dict) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Sample files (#171): deep scans only
+# ---------------------------------------------------------------------------
+
+# Where a deep scan's sample files are: copied there before tracing starts
+# (sandglass/sandbox.py), from the image (scripts/build_samples.py).
+SAMPLES_DIR = "/tmp/work/samples"
+# Words in an argument's or a tool's text -> which sample to pass, in this
+# order. The FIXED list of paths: a server's text only picks one of these,
+# it can never put a path of its own into an input.
+SAMPLE_CHOICES = [
+    (("excel", "xlsx", "xls", "spreadsheet", "workbook"), "book.xlsx"),
+    (("pdf",), "doc.pdf"),
+    (("csv",), "table.csv"),
+    (("json",), "data.json"),
+    (("markdown", "md"), "notes.md"),
+    (("image", "png", "picture", "photo"), "image.png"),
+    (("git", "repo", "repository"), "repo"),
+    (("dir", "directory", "folder"), ""),  # the samples folder itself
+]
+DEFAULT_SAMPLE = "notes.txt"
+# The samples that are directories (#171): passing one covers READS under it.
+SAMPLE_DIRS = (SAMPLES_DIR, f"{SAMPLES_DIR}/repo")
+# Argument names that ask for a path (or a URI / URL), as words of the name.
+PATH_WORDS = ("path", "file", "filename", "filepath", "dir", "directory", "folder",
+              "repo", "repository", "document", "uri", "url")
+
+
+def _words(text: str | None) -> list[str]:
+    """Lower-case words of a text: "repo_path" -> ["repo", "path"]."""
+    return re.findall(r"[a-z0-9]+", re.sub(r"([a-z])([A-Z])", r"\1 \2", text or "").lower())
+
+
+def choose_sample(*texts: str | None) -> str:
+    """The sample path for an argument: the first SAMPLE_CHOICES word found,
+    looking at each text in turn (the argument's, then the tool's)."""
+    for text in texts:
+        words = set(_words(text))
+        for hints, name in SAMPLE_CHOICES:
+            if words & set(hints):
+                return f"{SAMPLES_DIR}/{name}" if name else SAMPLES_DIR
+    return f"{SAMPLES_DIR}/{DEFAULT_SAMPLE}"
+
+
+def sample_inputs(input_schema: dict, tool_description: str | None, tool_name: str) -> dict:
+    """{argument: {"value", "source": "sample-file"}} for the arguments that
+    ask for a path, a URI or a URL (#171, deep only). The caller puts these
+    over the normal inputs; every other argument keeps its value.
+
+    Which arguments: string arguments named with a PATH_WORDS word, or with
+    `format: uri`. A const or enum is kept (the schema decides). Which file:
+    choose_sample on the argument's name and description, then the tool's.
+    URIs are file:///tmp/work/samples/...; a URL argument stays an http(s)
+    URL unless its or the tool's text names "file:".
+    """
+    schema = input_schema or {}
+    inputs = {}
+    for name, spec in schema.get("properties", {}).items():
+        try:
+            given, resolved = _walk(spec, schema)
+        except InputError:
+            continue
+        if _kind(resolved) != "string" or (given and given[1] in ("const", "enum")):
+            continue
+        words = set(_words(name))
+        is_uri = "uri" in words or resolved.get("format") in ("uri", "url")
+        if not (words & set(PATH_WORDS) or is_uri):
+            continue
+        description = (spec.get("description") if isinstance(spec, dict) else None) or resolved.get("description")
+        texts = (f"{name} {description or ''}", f"{tool_name} {tool_description or ''}")
+        if "url" in words and not is_uri and not any("file:" in text for text in texts):
+            continue  # a web URL: the described value (an http(s) URL) stays
+        path = choose_sample(*texts)
+        value = f"file://{path}" if is_uri or "url" in words else path
+        inputs[name] = {"value": value, "source": "sample-file"}
+    return inputs
+
+
+def sample_path(value) -> str | None:
+    """The sample path inside an input value, or None: "/tmp/work/samples/x"
+    or "file:///tmp/work/samples/x" -> "/tmp/work/samples/x"."""
+    if not isinstance(value, str):
+        return None
+    path = value.removeprefix("file://")
+    return path if path == SAMPLES_DIR or path.startswith(SAMPLES_DIR + "/") else None
+
+
 def _matches(pattern, value: str) -> bool:
     """Does the JSON Schema pattern (unanchored) match? A pattern that isn't a
     valid Python regex, or is over MAX_EXAMPLE_CHARS, matches nothing."""
