@@ -563,6 +563,77 @@ def sample_inputs(input_schema: dict, tool_description: str | None, tool_name: s
     return inputs
 
 
+# ---------------------------------------------------------------------------
+# Input variants (#172): deep scans call each tool up to MAX_VARIANTS times
+# ---------------------------------------------------------------------------
+
+MAX_VARIANTS = 5
+# The other modes, in the order deep tries them after the chosen one.
+VARIANT_ORDER = ("described", "sample-file", "schema", "minimal")
+# Edge cases: harmless values only, per argument type; an argument of another
+# type (boolean, object) or with a const/enum keeps its first variant's value.
+# No traversal strings, no shell characters, nothing that is a path.
+EDGE_VARIANTS = [
+    ("edge-empty", {"string": "", "integer": 0, "number": 0, "array": []}),
+    ("edge-long", {"string": "x" * 1000, "integer": -1, "number": -1, "array": []}),
+    ("edge-unicode", {"string": "héllo 🙂"}),
+]
+
+
+def input_variants(input_schema: dict, tool_description: str | None, tool_name: str,
+                   mode: str = DEFAULT_MODE) -> list[tuple[str, dict]]:
+    """[(variant name, inputs)] for one tool in a deep scan (#172), in order:
+    the chosen mode, then described, sample-file, schema, minimal, then the
+    edge cases. A variant that can't be built (InputError) is left out, an
+    argument set already in the list is dropped, at most MAX_VARIANTS.
+    Raises InputError only if no variant at all can be built."""
+    built = []
+    for name in dict.fromkeys((mode, *VARIANT_ORDER)):
+        try:
+            if name == "sample-file":
+                inputs = build_inputs(input_schema, tool_description, "described")
+                inputs.update({arg: entry for arg, entry in
+                               sample_inputs(input_schema, tool_description, tool_name).items() if arg in inputs})
+            else:
+                inputs = build_inputs(input_schema, tool_description, name)
+        except InputError as exc:
+            error = exc
+            continue
+        built.append((name, inputs))
+    if not built:
+        raise error
+    first = built[0][1]
+    for name, values in EDGE_VARIANTS:
+        built.append((name, _edge_inputs(input_schema or {}, first, values)))
+
+    variants, seen = [], set()
+    for name, inputs in built:
+        key = repr(sorted(arguments_of(inputs).items()))
+        if key not in seen and len(variants) < MAX_VARIANTS:
+            seen.add(key)
+            variants.append((name, inputs))
+    return variants
+
+
+def _edge_inputs(schema: dict, first: dict, values: dict) -> dict:
+    """`first`'s inputs with each argument's value replaced by the edge value
+    for its type (source "edge"), where `values` has one."""
+    properties = schema.get("properties", {})
+    inputs = {}
+    for name, entry in first.items():
+        try:
+            given, resolved = _walk(properties.get(name, {}), schema)
+        except InputError:
+            given, resolved = None, {}
+        kind = _kind(resolved)
+        if kind in values and not (given and given[1] in ("const", "enum")):
+            value = values[kind]
+            inputs[name] = {"value": list(value) if isinstance(value, list) else value, "source": "edge"}
+        else:
+            inputs[name] = entry
+    return inputs
+
+
 def sample_path(value) -> str | None:
     """The sample path inside an input value, or None: "/tmp/work/samples/x"
     or "file:///tmp/work/samples/x" -> "/tmp/work/samples/x"."""

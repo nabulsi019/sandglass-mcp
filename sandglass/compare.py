@@ -1133,6 +1133,91 @@ def with_install(result: dict, install: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Repeatability (#172): a deep scan runs the server twice
+# ---------------------------------------------------------------------------
+
+# Worst first, the same order as with_install: INCOMPLETE, VIOLATIONS, CLEAN.
+VERDICT_ORDER = ("INCOMPLETE", "VIOLATIONS", "CLEAN")
+UNSTABLE_LABEL = "unstable between runs"
+
+
+def _entries(result: dict) -> dict[tuple, dict]:
+    """A compare() result's violation entries (#141) by (label, phase).
+    Counts are not part of the key: lookup retries vary from run to run."""
+    groups = group_violations(result["violations"], result["domains"], result.get("resolvers"),
+                              result.get("dns_names"))
+    entries: dict[tuple, dict] = {}
+    for g in groups:
+        # Files, programs and evasions are one entry per event, with no label
+        # of their own: they are named by what was done to what ("read
+        # /home/sandglass/.aws/credentials"), so the same read twice is one key.
+        first = result["violations"][g["events"][0]]
+        label = g["label"] or f"{first['mode'] or first['syscall']} {first['target']}"
+        entry = entries.setdefault((label, g["phase"]), {"events": []})
+        entry["events"] += g["events"]
+    return entries
+
+
+def with_second_run(result: dict, result_2: dict, session_2: dict, trace_file_2) -> dict:
+    """Run 1's compare() result with run 2's added (#172).
+
+    The two runs are compared by their violation entries (label and phase,
+    not counts). The verdict is the worse of the two: no new verdict word,
+    no new exit code. Every violation keeps its run ("run": 1 or 2): run 1's
+    all, and run 2's that belong to an entry run 1 doesn't have, so a
+    difference can't hide and a stable run lists each finding once. Run 2's
+    INCOMPLETE reasons are kept, marked "run 2:". `stability` says whether
+    the runs agreed.
+    """
+    entries_1, entries_2 = _entries(result), _entries(result_2)
+    only_1 = [key for key in entries_1 if key not in entries_2]
+    only_2 = [key for key in entries_2 if key not in entries_1]
+    merged = dict(result)
+    extra = [result_2["violations"][i] for key in only_2 for i in entries_2[key]["events"]]
+    merged["violations"] = ([{**v, "run": 1} for v in result["violations"]]
+                            + [{**v, "run": 2} for v in sorted(extra, key=lambda v: v["timestamp"])])
+    merged["incomplete_reasons"] = (result["incomplete_reasons"]
+                                    + [f"run 2: {reason}" for reason in result_2["incomplete_reasons"]])
+    # What only run 2 asked for, so a run-2-only domain or name is shown too.
+    seen_domains = {(d["method"], d["host"], d["port"], d.get("phase")) for d in result["domains"]}
+    merged["domains"] = result["domains"] + [
+        {**d, "run": 2} for d in result_2["domains"]
+        if (d["method"], d["host"], d["port"], d.get("phase")) not in seen_domains]
+    seen_names = {(d["name"], d.get("phase")) for d in result.get("dns_names", [])}
+    merged["dns_names"] = result.get("dns_names", []) + [
+        {**d, "run": 2} for d in result_2.get("dns_names", []) if (d["name"], d.get("phase")) not in seen_names]
+    seen_reads = {v["target"] for v in result.get("sample_reads", [])}
+    merged["sample_reads"] = result.get("sample_reads", []) + [
+        {**v, "run": 2} for v in result_2.get("sample_reads", []) if v["target"] not in seen_reads]
+    verdicts = [result["verdict"], result_2["verdict"]]
+    merged["verdict"] = min(verdicts, key=VERDICT_ORDER.index)
+    merged["stability"] = {
+        "status": "stable" if not (only_1 or only_2) and verdicts[0] == verdicts[1] else "unstable",
+        "verdicts": verdicts,
+        "only_in_run_1": [f"{label} ({phase})" for label, phase in only_1],
+        "only_in_run_2": [f"{label} ({phase})" for label, phase in only_2],
+    }
+    merged["second_run"] = {"trace_file": str(trace_file_2), "verdict": result_2["verdict"],
+                            "incomplete_reasons": result_2["incomplete_reasons"],
+                            "calls": session_2.get("calls", []), "error": session_2.get("error")}
+    return merged
+
+
+def stability_line(r: dict) -> str | None:
+    """"Stability: stable between runs" or "Stability: unstable between runs
+    (verdicts CLEAN / VIOLATIONS; only in run 2: ...)" (#172); None if the
+    report has one run."""
+    s = r.get("stability")
+    if not s:
+        return None
+    if s["status"] == "stable":
+        return "Stability: stable between runs (2 runs, the same violation entries)"
+    details = [f"verdicts {s['verdicts'][0]} / {s['verdicts'][1]}"]
+    details += [f"only in run {n}: " + ", ".join(s[f"only_in_run_{n}"]) for n in (1, 2) if s[f"only_in_run_{n}"]]
+    return f"Stability: {UNSTABLE_LABEL} ({'; '.join(details)})"
+
+
+# ---------------------------------------------------------------------------
 # Coverage (#23): which tools ran, failed, or were skipped
 # ---------------------------------------------------------------------------
 
@@ -1171,21 +1256,25 @@ def coverage(session: dict) -> dict:
     Coverage is reported, not judged: it never changes the verdict.
     """
     calls = {c["tool"]: c for c in session.get("calls", [])}
+    # (#172) A deep scan calls a tool several times (each call has its
+    # "variant"): the row shows its BEST call, and lists them all.
+    deep = any("variant" in c for c in session.get("calls", []))
+    every_call: dict[str, list] = {}
+    for c in session.get("calls", []):
+        every_call.setdefault(c["tool"], []).append(c)
+    if deep:
+        calls = {name: min(tool_calls, key=lambda c: COVERAGE_STATUSES.index(_call_row(c)["status"]))
+                 for name, tool_calls in every_call.items()}
     skipped = {s["tool"]: s["reason"] for s in session.get("skipped", [])}
     not_called = {s["tool"]: s["reason"] for s in session.get("not_called", [])}
     rows = []
     for tool in session.get("tools", []):
         name = tool["name"]
         if name in calls:
-            call = calls[name]
-            if call["status"] == "OK":
-                rows.append({"tool": name, "status": "ran", "reason": None})
-            elif call["status"] == "TIMED OUT":
-                rows.append({"tool": name, "status": "timed out", "reason": call["result"]})
-            else:
-                text = " ".join(str(call["result"]).split())[:COVERAGE_REASON_CHARS]
-                status = "returned an error" if _returned_an_error(call) else "failed"
-                rows.append({"tool": name, "status": status, "reason": f"{call['status']}: {text}"})
+            rows.append({"tool": name, **_call_row(calls[name])})
+            if deep:
+                rows[-1]["calls"] = [{"variant": c["variant"], "seconds": c.get("seconds"), **_call_row(c)}
+                                     for c in every_call[name]]
         elif name in skipped:
             rows.append({"tool": name, "status": "skipped", "reason": skipped[name]})
         elif name in not_called:
@@ -1201,11 +1290,25 @@ def coverage(session: dict) -> dict:
               sum(1 for r in rows if r["status"] == status)
               for status in COVERAGE_STATUSES}
     totals["total"] = len(rows)
+    if deep:
+        totals["calls"] = len(session.get("calls", []))  # (#172) every call of every tool
     note = None
     if not rows:
         note = ("the server's tool list was never received" if session.get("error")
                 else "the server listed no tools")
     return {"tools": rows, "totals": totals, "note": note}
+
+
+def _call_row(call: dict) -> dict:
+    """One call's coverage status and reason: ran, timed out, returned an
+    error or failed (#23, #140, #143)."""
+    if call["status"] == "OK":
+        return {"status": "ran", "reason": None}
+    if call["status"] == "TIMED OUT":
+        return {"status": "timed out", "reason": call["result"]}
+    text = " ".join(str(call["result"]).split())[:COVERAGE_REASON_CHARS]
+    status = "returned an error" if _returned_an_error(call) else "failed"
+    return {"status": status, "reason": f"{call['status']}: {text}"}
 
 
 # The coverage summary's wording (#143), in this order; only counts above 0 show.
@@ -1235,9 +1338,11 @@ def verdict_line(r: dict) -> str:
     """The verdict with its coverage summary (#143): "but" after CLEAN, "and"
     otherwise. The verdict word itself never changes."""
     summary = r.get("coverage_summary")
+    # (#172) A deep scan whose two runs differ: the label, next to the verdict.
+    unstable = f", {UNSTABLE_LABEL}" if (r.get("stability") or {}).get("status") == "unstable" else ""
     if not summary:
-        return r["verdict"]
-    return f"{r['verdict']} ({'but' if r['verdict'] == 'CLEAN' else 'and'} {summary})"
+        return r["verdict"] + (f" ({UNSTABLE_LABEL})" if unstable else "")
+    return f"{r['verdict']} ({'but' if r['verdict'] == 'CLEAN' else 'and'} {summary}{unstable})"
 
 
 # ---------------------------------------------------------------------------
@@ -1376,6 +1481,8 @@ def summary_lines(r: dict) -> list[str]:
         lines.append(f"  VIOLATION {group['label']} ×{group['count']}" + (f" ({parts})" if parts else "")
                      + f", {group['first']} – {group['last']}, {group['phase']}")
     # (#174) Which scan ran, just before the Duration line (which stays last).
+    if stability_line(r):
+        lines.append(stability_line(r))  # (#172) deep: whether the two runs agreed
     lines.append(depth_line(r))
     if r.get("durations"):
         lines.append(duration_line(r["durations"], (r.get("package") or {}).get("files")))
@@ -1526,6 +1633,10 @@ def build_report(server: str, timestamp: str, policy: Policy, session: dict,
         # alone would have called violations (listed apart, never judged).
         report["sample_paths"] = session.get("sample_paths", [])
         report["sample_files_read"] = result.get("sample_reads", [])
+        # (#172) The two runs: whether they agreed, and run 2's own record.
+        report["stability"] = result.get("stability")
+        report["second_run"] = result.get("second_run")
+        report["calls_not_made"] = session.get("calls_not_made", 0)
     return report
 
 
@@ -1549,6 +1660,7 @@ def _markdown(r: dict) -> str:
         "",
         f"- Run: `{r['timestamp']}`",
         f"- {depth_line(r)}",  # quick or deep (#174)
+        *([f"- {stability_line(r)}"] if stability_line(r) else []),  # (#172)
         *([f"- {duration_line(r['durations'], (r.get('package') or {}).get('files'))}"]
           if r.get("durations") else []),
         f"- Policy: `{r['policy']['name']}`",
@@ -1563,6 +1675,8 @@ def _markdown(r: dict) -> str:
         f"- Baseline: `{r['baseline']['name']}` (`{r['baseline']['file']}`,"
         f" multiarch `{r['baseline']['multiarch']}`; reads only)",
         f"- Trace: `{r['trace_file']}`" if r["trace_file"] else "- Trace: none (the server was not run)",
+        *([f"- Trace of run 2: `{r['second_run']['trace_file']}` (verdict {r['second_run']['verdict']})"]
+          if r.get("second_run") else []),
         f"- Violations: {len(r['violations'])} · Attempted: {len(r['attempted'])}"
         f" · Probes: {len(r['probes'])}",
         f"- Note: {r.get('tracing_note', TRACING_NOTE)}",
@@ -1580,8 +1694,11 @@ def _markdown(r: dict) -> str:
         for c in r["exercised"]:
             result = str(c["result"]).replace("|", "\\|").replace("\n", " ")
             # Where each argument's value came from (#145), e.g. "`timezone`: param-description".
-            inputs = (r.get("inputs") or {}).get(c["tool"], {})
+            # (#172) A deep call carries its own inputs and its variant.
+            inputs = c.get("inputs") or (r.get("inputs") or {}).get(c["tool"], {})
             sources = ", ".join(f"`{name}`: {entry['source']}" for name, entry in inputs.items()) or "-"
+            if c.get("variant"):
+                sources = f"variant {c['variant']}: {sources}"
             arguments = json.dumps(c["arguments"]).replace("|", "\\|")
             out.append(f"| `{c['tool']}` | `{arguments}` | {sources} | {c['status']} | {result} |")
     else:
@@ -1654,13 +1771,25 @@ def _coverage_section(r: dict) -> list[str]:
     if cov is None:
         return []
     t = cov["totals"]
+    deep = "calls" in t  # (#172) several calls per tool
+    how = (f"; {t['calls']} calls: each tool up to 5 times, with different inputs, its best call counts"
+           if deep else " (each tool is called once, with one input; see the README)")
     lines = ["", "## Coverage", "",
              f"Ran {t['ran']} · Returned an error {t.get('returned_error', 0)}"
              f" · Failed {t['failed']} · Timed out {t.get('timed_out', 0)}"
-             f" · Not called {t.get('not_called', 0)} · Skipped {t['skipped']} · Total {t['total']}"
-             " (each tool is called once, with one input; see the README)", ""]
+             f" · Not called {t.get('not_called', 0)} · Skipped {t['skipped']} · Total {t['total']}" + how, ""]
     if cov["note"]:
         return lines + [f"No tools: {cov['note']}."]
+    if deep:
+        # One row per call, under its tool's best status.
+        lines += ["| Tool | Best | Variant | Status | Time | Reason |", "|---|---|---|---|---|---|"]
+        for row in cov["tools"]:
+            for call in row.get("calls") or [{"variant": "", "status": row["status"], "reason": row["reason"]}]:
+                took = call.get("seconds")
+                reason = (call["reason"] or "").replace("|", "\\|")
+                lines.append(f"| `{row['tool']}` | {row['status']} | {call['variant']} | {call['status']} |"
+                             f" {'' if took is None else f'{took:.2f} s'} | {reason} |")
+        return lines
     # Each call's duration (#156), from the exercised calls; empty if not called
     # or never answered.
     seconds = {c["tool"]: c.get("seconds") for c in r.get("exercised", [])}

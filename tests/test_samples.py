@@ -204,11 +204,13 @@ def host_session(depth: str) -> dict:
 
 def test_deep_passes_samples_and_records_them():
     record = host_session("deep")
-    assert [c["arguments"] for c in record["calls"]] == [
+    # (#172) The sample-file variant of each tool, among its other calls.
+    assert [c["arguments"] for c in record["calls"] if c["variant"] == "sample-file"] == [
         {"path": f"{SAMPLES_DIR}/notes.txt"}, {"repo_path": f"{SAMPLES_DIR}/repo"},
         {"path": f"{SAMPLES_DIR}/notes.txt"}]
     assert record["sample_paths"] == [f"{SAMPLES_DIR}/notes.txt", f"{SAMPLES_DIR}/repo"]
-    assert record["inputs"]["repo_head"]["repo_path"]["source"] == "sample-file"
+    sample_call = next(c for c in record["calls"] if c["tool"] == "repo_head" and c["variant"] == "sample-file")
+    assert sample_call["inputs"]["repo_path"]["source"] == "sample-file"
 
 
 def test_quick_passes_no_samples():

@@ -37,14 +37,16 @@ from mcp.types import REQUEST_TIMEOUT, CallToolResult, TextContent, Tool
 
 from sandglass import PROJECT_ROOT, sandbox, scan
 from sandglass.compare import (build_report, compare, compare_install, not_run, setup_line, summary_lines,
-                               with_install, write_reports)
-from sandglass.inputs import (DEFAULT_MODE, MODES, InputError, arguments_of, build_arguments, build_inputs,
-                              sample_inputs, sample_path)
+                               with_install, with_second_run, write_reports)
+from sandglass.inputs import (DEFAULT_MODE, MAX_VARIANTS, MODES, InputError, arguments_of, build_arguments,
+                              build_inputs, input_variants, sample_path)
 from sandglass.policy import (BASELINE_FILES, Policy, PolicyError, check_scan_paths,
                               load_install_baseline, load_policy)
 from sandglass.trace_parser import parse_trace_file
 
 REPORTS_DIR = PROJECT_ROOT / "reports"
+# (#172) A deep scan's second run's trace, next to the first (trace.txt).
+TRACE_2_FILENAME = "trace-2.txt"
 # The work dir in every run's path mapping (#144).
 WORKDIR_MAPPING = {str(sandbox.CONTAINER_WORKDIR): "the server's working directory: "
                                                    "an empty folder in the scratch /tmp (in memory)"}
@@ -236,7 +238,7 @@ async def server_answers_ping(session: ClientSession) -> bool:
 
 async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr,
               session_record: dict | None = None, inputs_mode: str = DEFAULT_MODE,
-              depth: str = DEFAULT_DEPTH) -> dict:
+              depth: str = DEFAULT_DEPTH, replay: dict | None = None) -> dict:
     """Run one MCP session and return a record of what was exercised.
 
     `errlog` receives the subprocess's stderr. In the sandbox that stream is
@@ -248,6 +250,9 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
     `depth` (#170): "deep" replaces that budget, once the tools are listed,
     with deep_budget(tool count), and starts no call with under
     DEEP_MIN_CALL_SECONDS left. "quick" is exactly the behaviour above.
+    Deep calls each tool up to MAX_VARIANTS times, round robin (#172).
+    `replay` (deep run 2, #172): run 1's session record; its calls are made
+    again in the same order, under run 1's budget.
     """
     if session_record is None:
         session_record = new_session_record()
@@ -271,21 +276,23 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
             print()
             if depth == "deep":
                 # (#170) The budget grows with the tool count, counted from here.
-                seconds = deep_budget(len(tools))
+                # Run 2 (#172) gets run 1's budget, whatever it lists now.
+                seconds = ((replay.get("budget") or {}).get("seconds") if replay else None) \
+                    or deep_budget(len(tools))
                 deadline = budget_clock() + seconds
                 session_record["budget"] = {"seconds": seconds, "per_tool": DEEP_PER_TOOL_SECONDS,
                                             "tools": len(tools)}
                 print(f"Deep scan: time budget {seconds} s for {len(tools)} tools\n")
 
+            if depth == "deep":
+                # (#172) Up to MAX_VARIANTS calls per tool, round robin.
+                await _deep_calls(session, tools, session_record, deadline, inputs_mode, replay)
+                return session_record
+
             stop_reason = None  # set once no more tools may be called (#140)
             for tool in tools:
                 try:
                     inputs = build_tool_inputs(tool, inputs_mode)
-                    if depth == "deep":
-                        # (#171) Path-like arguments get a sample file instead.
-                        inputs.update({name: entry for name, entry in
-                                       sample_inputs(tool.input_schema, tool.description, tool.name).items()
-                                       if name in inputs})
                     args = arguments_of(inputs)
                 except InputError as exc:
                     # Not guessed: the tool isn't called, and the report says why.
@@ -306,37 +313,7 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
                 if inputs:
                     print("  inputs from: " + ", ".join(f"{name} = {entry['source']}"
                                                         for name, entry in inputs.items()))
-                # Recorded BEFORE the call, so a session that dies during it
-                # still shows the call was made and never answered (#23).
-                call = {"tool": tool.name, "arguments": args, "status": "NO ANSWER",
-                        "result": "the session ended before the call returned"}
-                session_record["calls"].append(call)
-                if depth == "deep":
-                    # (#171) Every sample path passed in any call of this run:
-                    # reads of exactly these are listed apart (compare.py).
-                    passed = session_record.setdefault("sample_paths", [])
-                    for value in args.values():
-                        path = sample_path(value)
-                        if path and path not in passed:
-                            passed.append(path)
-                timeout = min(CALL_TIMEOUT_SECONDS, remaining)
-                started = clock()
-                try:
-                    result = await session.call_tool(tool.name, args, read_timeout_seconds=timeout)
-                    call["status"], call["result"] = result_text(result)
-                except Exception as exc:  # recorded, and the next tool is still called (#23)
-                    call["status"] = "TIMED OUT" if is_timeout(exc) else "FAILED"
-                    call["result"] = (f"no answer within {timeout:.0f} s" if is_timeout(exc)
-                                      else describe_error(exc))
-                    if isinstance(exc, MCPError):
-                        # Kept for coverage (#143): an error response from the
-                        # server is "returned an error", not a failed call. The
-                        # status stays FAILED, so the verdict rules don't change.
-                        call["error_code"] = exc.code
-                # How long the call took (#156). A call the session never
-                # answered (NO ANSWER) has none.
-                call["seconds"] = round(clock() - started, 2)
-                print(f"  -> [{call['status']}] {call['result']}")
+                call = await _call(session, session_record, tool.name, args, min(CALL_TIMEOUT_SECONDS, remaining))
                 # The SDK has already sent a cancel for the timed-out call. A
                 # server that can't even answer a ping now would time out
                 # every remaining call, so stop here instead.
@@ -345,6 +322,103 @@ async def run(params: StdioServerParameters, server_name: str, errlog=sys.stderr
     # Leaving the `async with` closes the server's stdin and waits for it to
     # exit. In the sandbox, that's what lets strace finish writing the trace.
     return session_record
+
+
+async def _call(session: ClientSession, session_record: dict, tool_name: str, args: dict,
+                timeout: float, extra: dict | None = None) -> dict:
+    """Call one tool once, record the call in session_record["calls"] and
+    return it. `extra` (deep, #172): more keys for the record (the variant)."""
+    # Recorded BEFORE the call, so a session that dies during it
+    # still shows the call was made and never answered (#23).
+    call = {"tool": tool_name, "arguments": args, "status": "NO ANSWER",
+            "result": "the session ended before the call returned", **(extra or {})}
+    session_record["calls"].append(call)
+    started = clock()
+    try:
+        result = await session.call_tool(tool_name, args, read_timeout_seconds=timeout)
+        call["status"], call["result"] = result_text(result)
+    except Exception as exc:  # recorded, and the next tool is still called (#23)
+        call["status"] = "TIMED OUT" if is_timeout(exc) else "FAILED"
+        call["result"] = (f"no answer within {timeout:.0f} s" if is_timeout(exc)
+                          else describe_error(exc))
+        if isinstance(exc, MCPError):
+            # Kept for coverage (#143): an error response from the
+            # server is "returned an error", not a failed call. The
+            # status stays FAILED, so the verdict rules don't change.
+            call["error_code"] = exc.code
+    # How long the call took (#156). A call the session never
+    # answered (NO ANSWER) has none.
+    call["seconds"] = round(clock() - started, 2)
+    print(f"  -> [{call['status']}] {call['result']}")
+    return call
+
+
+def deep_plan(tools: list[Tool], session_record: dict, inputs_mode: str) -> list[tuple[str, str, dict]]:
+    """(#172) Every call a deep scan plans, as (tool, variant, inputs), ROUND
+    ROBIN: every tool's first variant, then every tool's second, and so on,
+    so running out of budget can't starve a tool of its first call. A tool
+    with no buildable input is recorded as skipped, as in quick."""
+    variants = {}
+    for tool in tools:
+        try:
+            variants[tool.name] = input_variants(tool.input_schema, tool.description, tool.name, inputs_mode)
+        except InputError as exc:
+            print(f"Skipping {tool.name}: no valid input ({exc})")
+            session_record["skipped"].append({"tool": tool.name, "reason": f"no valid input: {exc}"})
+    return [(name, *tool_variants[k]) for k in range(MAX_VARIANTS)
+            for name, tool_variants in variants.items() if k < len(tool_variants)]
+
+
+async def _deep_calls(session: ClientSession, tools: list[Tool], session_record: dict, deadline: float,
+                      inputs_mode: str, replay: dict | None) -> None:
+    """The deep scan's calls (#172): deep_plan's, or with `replay` (run 1's
+    session record, for run 2) exactly run 1's calls in run 1's order.
+
+    The same rules as quick for each call: CALL_TIMEOUT_SECONDS, and the
+    ping after a timeout (#140). A tool that timed out gets no more calls.
+    No call starts with under DEEP_MIN_CALL_SECONDS left (#170). A tool
+    that got no call at all is "not called"; planned calls left out are
+    counted in "calls_not_made".
+    """
+    if replay is None:
+        plan = deep_plan(tools, session_record, inputs_mode)
+    else:
+        plan = [(c["tool"], c["variant"], c["inputs"]) for c in replay.get("calls", [])]
+    stop_reason = None
+    timed_out = set()
+    left = 0
+    for name, variant, inputs in plan:
+        if name in timed_out:
+            continue  # no more variants after a timeout
+        remaining = deadline - budget_clock()
+        if stop_reason is None and remaining <= DEEP_MIN_CALL_SECONDS:
+            stop_reason = "time budget"
+            print(f"Stopping the calls: {stop_reason}")
+        if stop_reason is not None:
+            left += 1
+            continue
+        args = arguments_of(inputs)
+        print(f"Calling {name}({args})  [variant: {variant}]")
+        # The first call's inputs per tool, like quick (#145); each call keeps its own.
+        session_record["inputs"].setdefault(name, inputs)
+        # (#171) Every sample path passed in any call of this run: reads of
+        # exactly these are listed apart (compare.py).
+        passed = session_record.setdefault("sample_paths", [])
+        for value in args.values():
+            path = sample_path(value)
+            if path and path not in passed:
+                passed.append(path)
+        call = await _call(session, session_record, name, args, min(CALL_TIMEOUT_SECONDS, remaining),
+                           {"variant": variant, "inputs": inputs})
+        if call["status"] == "TIMED OUT":
+            timed_out.add(name)
+            if not await server_answers_ping(session):
+                stop_reason = f"server stopped responding after {name} timed out"
+    called = {c["tool"] for c in session_record["calls"]}
+    for name in dict.fromkeys(name for name, _, _ in plan):
+        if name not in called:
+            session_record["not_called"].append({"tool": name, "reason": stop_reason or "time budget"})
+    session_record["calls_not_made"] = left
 
 
 # The clock for durations (#156): wall-clock, monotonic, on the host. A name
@@ -459,38 +533,65 @@ def _trace_and_report(server: str, timestamp: str, command: str, args: list[str]
     # container never sees this file: reports/ is hidden inside it.
     trace_file = _trace_dir(server, timestamp) / sandbox.TRACE_FILENAME
     params = StdioServerParameters(command=command, args=args, env=server_env or None)
+    # The input mode is recorded in the setup (#145); fixture mode and scans always have one.
+    inputs_mode = (setup or {}).get("inputs", DEFAULT_MODE)
 
-    # Any failure (image missing, server crash, timeout) is recorded, not
-    # raised: the report must still be written, with verdict INCOMPLETE.
-    # The container's stderr (the trace) goes straight into trace_file.
+    with durations.phase("run"):
+        session = _traced_session(params, server, trace_file, inputs_mode, depth)
+    session_2 = trace_file_2 = None
+    if depth == "deep":
+        # (#172) The repeatability check: the same server again, in a fresh
+        # container (the same installed package, nothing downloaded again),
+        # making exactly run 1's calls under run 1's budget.
+        print("\nRun 2 of 2 (repeatability check): the same calls in a fresh container\n")
+        trace_file_2 = trace_file.with_name(TRACE_2_FILENAME)
+        with durations.phase("run"):
+            session_2 = _traced_session(params, server, trace_file_2, inputs_mode, depth, replay=session)
+
+    with durations.phase("analysis"):
+        # Line by line, up to MAX_TRACE_BYTES: a huge trace can't use up memory (#83).
+        events, cut_short = parse_trace_file(trace_file, cwd=str(sandbox.CONTAINER_WORKDIR))
+        result = compare(events, policy, session, runtime=runtime, trace_cut_short=cut_short)
+        if session_2 is not None:
+            events_2, cut_short_2 = parse_trace_file(trace_file_2, cwd=str(sandbox.CONTAINER_WORKDIR))
+            result_2 = compare(events_2, policy, session_2, runtime=runtime, trace_cut_short=cut_short_2)
+            result = with_second_run(result, result_2, session_2, trace_file_2)
+        if install is not None:
+            result = with_install(result, install)
+
+        path_mapping = {**path_mapping,
+                        "(container stderr)": f"strace output, saved on the host as {trace_file}"
+                        + (f" (run 2: {trace_file_2})" if trace_file_2 else "")}
+        report = build_report(server, timestamp, policy, session, result, trace_file,
+                              path_mapping, _baseline(policy, runtime, multiarch), package, setup, depth)
+    return _write_and_print(report, durations)
+
+
+def _traced_session(params: StdioServerParameters, server: str, trace_file: Path, inputs_mode: str,
+                    depth: str, replay: dict | None = None) -> dict:
+    """One run of the server: the session's record, with the container's
+    stderr (the trace) written straight into `trace_file`. `replay` (deep
+    run 2, #172): run 1's record, whose calls are made again.
+
+    Any failure (image missing, server crash, timeout) is recorded in the
+    record's "error", not raised: the report must still be written, with
+    verdict INCOMPLETE.
+    """
     session = new_session_record()  # filled in by run(), kept even if it fails half-way
-    with durations.phase("run"), open(trace_file, "w", encoding="utf-8") as trace_out:
+    with open(trace_file, "w", encoding="utf-8") as trace_out:
         try:
             # run() keeps to the time budget itself (#140); this is only the
             # safety net for a handshake or shutdown that hangs (#170: deep's cap).
-            # The input mode is recorded in the setup (#145); fixture mode and scans always have one.
-            inputs_mode = (setup or {}).get("inputs", DEFAULT_MODE)
+            extra = {"replay": replay} if replay is not None else {}
             asyncio.run(asyncio.wait_for(run(params, server, trace_out, session, inputs_mode,
-                                             **depth_argument(depth)),
+                                             **depth_argument(depth), **extra),
                                          session_limit(depth)))
         except BaseException as exc:  # includes ExceptionGroup from anyio task groups
             if isinstance(exc, KeyboardInterrupt):
                 raise
             session["error"] = describe_error(exc)
             print(f"Session failed: {session['error']}")
-
-    with durations.phase("analysis"):
-        # Line by line, up to MAX_TRACE_BYTES: a huge trace can't use up memory (#83).
-        events, cut_short = parse_trace_file(trace_file, cwd=str(sandbox.CONTAINER_WORKDIR))
-        result = compare(events, policy, session, runtime=runtime, trace_cut_short=cut_short)
-        if install is not None:
-            result = with_install(result, install)
-
-        path_mapping = {**path_mapping,
-                        "(container stderr)": f"strace output, saved on the host as {trace_file}"}
-        report = build_report(server, timestamp, policy, session, result, trace_file,
-                              path_mapping, _baseline(policy, runtime, multiarch), package, setup, depth)
-    return _write_and_print(report, durations)
+    return session
 
 
 def _trace_dir(server: str, timestamp: str) -> Path:

@@ -437,6 +437,35 @@ and any program run (mcp-server-git running `git` stays a violation unless
 a deep scan, and a tool may change a sample that later tools then see; calls
 keep a fixed order, so it's the same every run.
 
+**Repeated calls** (#172, deep only). One call per tool can miss what a
+tool does with another kind of input. A deep scan calls each tool with up to
+5 input variants, in this order, dropping any whose arguments repeat an
+earlier one: the chosen `--inputs` mode (`described` by default), then
+`described`, `sample-file` (#171), `schema`, `minimal`, then harmless edge
+cases: an empty string, `0` and `[]`; a 1,000-character string and `-1`;
+the non-ASCII string `héllo 🙂`. No path traversal, no shell characters, no
+injection strings. The calls go **round robin**: every tool's first variant,
+then every tool's second, and so on, so running out of budget can't starve a
+tool of its first call. A tool that timed out gets no more variants, and the
+ping rule after a timeout still applies. Coverage shows one row per tool
+with its best call (`ran` if any variant ran), and the Markdown lists every
+call with its variant; the coverage summary still counts tools, not calls.
+
+**The repeatability check** (#172, deep only). A deep scan runs the server
+twice, each time in a fresh container, from the same installed package
+(nothing is downloaded or installed again): run 2 makes exactly run 1's
+calls, in the same order, under run 1's budget. Its trace is `trace-2.txt`.
+The two runs are compared by their violation entries (the label and the
+phase, not the counts, since lookup retries vary). The verdict is the worse
+of the two (INCOMPLETE, then VIOLATIONS, then CLEAN); there is no new verdict
+word or exit code. If the runs differ, the verdict line says `unstable between
+runs`, and a "Stability" line (terminal and Markdown) names the entries only
+in run 1 or only in run 2. Every violation is tagged with its run (`"run": 1`
+or `2`): all of run 1's, and run 2's that run 1 doesn't have, so a difference
+can't hide and a stable run lists each finding once. A server with honest
+randomness (a random CDN host) reads as unstable; that's accurate. Deep scans
+take about twice as long.
+
 **The depth label** (#174). Every report, scans and fixture runs alike,
 says which scan ran, in the terminal summary (just before the Duration
 line) and in the Markdown header:
