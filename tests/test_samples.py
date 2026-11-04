@@ -195,15 +195,16 @@ def test_sample_path():
 
 # --- the client: deep passes samples and records them -------------------------------------
 
-def host_session(depth: str) -> dict:
+def host_session(depth: str, monkeypatch) -> dict:
     """One session with sample_reader_server.py on the host (no Docker, so
     the samples don't exist there: the calls return errors, which is fine)."""
+    monkeypatch.setattr(client, "OBSERVE_SECONDS", 0)  # (#175) no idle window in these tests
     params = StdioServerParameters(command=sys.executable, args=[str(SERVER)])
     return asyncio.run(client.run(params, "sample_reader_server", depth=depth))
 
 
-def test_deep_passes_samples_and_records_them():
-    record = host_session("deep")
+def test_deep_passes_samples_and_records_them(monkeypatch):
+    record = host_session("deep", monkeypatch)
     # (#172) The sample-file variant of each tool, among its other calls.
     assert [c["arguments"] for c in record["calls"] if c["variant"] == "sample-file"] == [
         {"path": f"{SAMPLES_DIR}/notes.txt"}, {"repo_path": f"{SAMPLES_DIR}/repo"},
@@ -213,8 +214,8 @@ def test_deep_passes_samples_and_records_them():
     assert sample_call["inputs"]["repo_path"]["source"] == "sample-file"
 
 
-def test_quick_passes_no_samples():
-    record = host_session("quick")
+def test_quick_passes_no_samples(monkeypatch):
+    record = host_session("quick", monkeypatch)
     assert [c["arguments"] for c in record["calls"]] == [{"path": "hello"}, {"repo_path": "hello"},
                                                           {"path": "hello"}]
     assert "sample_paths" not in record

@@ -104,3 +104,11 @@ def test_explicit_quick_is_the_default(monkeypatch):
     assert sent_default == sent_quick
     assert ([(c["tool"], c["arguments"]) for c in default["calls"]]
             == [(c["tool"], c["arguments"]) for c in quick["calls"]])
+
+
+def test_quick_sends_no_observation_marker(monkeypatch):
+    # (#175) The observation window is deep only: quick never sends its
+    # notification (notifications/roots/list_changed) and never waits.
+    record, sent = run_recorded(monkeypatch)
+    assert ("notification", "notifications/roots/list_changed") not in sent
+    assert "observation" not in record
