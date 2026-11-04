@@ -27,7 +27,7 @@ from pathlib import Path
 
 from sandglass import PROJECT_ROOT, client, sandbox, scan
 from sandglass.client import EXIT_CODES, run_sandboxed, run_scan
-from sandglass.compare import _dns_lines
+from sandglass.compare import DEPTH_LABELS, _dns_lines, summary_lines
 from sandglass.scan import npm_tarball_name, parse_spec
 
 POLICY = PROJECT_ROOT / "policies" / "notes_readonly.yaml"
@@ -601,7 +601,19 @@ def check(fixture: str, report: dict, want_verdict: str, want_violations: set,
         failures.append(f"{fixture}: expected sink requests {EXPECTED_DOMAINS.get(fixture, [])}, "
                         f"got {domains}")
     failures += duration_failures(fixture, report)
+    failures += depth_failures(fixture, report)
     return failures
+
+
+def depth_failures(fixture: str, report: dict) -> list[str]:
+    """(#174) Every report says which scan ran: a depth of quick or deep,
+    and the matching label in its summary."""
+    depth = report.get("depth")
+    if depth not in DEPTH_LABELS:
+        return [f"{fixture}: expected a depth of quick or deep, got {depth!r}"]
+    if f"Depth: {DEPTH_LABELS[depth]}" not in summary_lines(report):
+        return [f"{fixture}: the summary lacks the {depth} label"]
+    return []
 
 
 def duration_failures(fixture: str, report: dict) -> list[str]:
@@ -669,7 +681,7 @@ def dns_failures(label: str, report: dict, want_verdict: str, want_names: set, w
         failures.append(f"{label}: network isolation check did not report isolated: {isolation}")
     if report["domains"]:
         failures.append(f"{label}: expected no sink requests, got {report['domains']}")
-    return failures + duration_failures(label, report)
+    return failures + duration_failures(label, report) + depth_failures(label, report)
 
 
 def process_failures(label: str, report: dict, fewest: int) -> list[str]:

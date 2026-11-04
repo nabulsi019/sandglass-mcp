@@ -69,7 +69,8 @@ def test_the_wikipedia_summary_lines():
     assert lines[1].startswith("  VIOLATION domain en.wikipedia.org ×13 (CONNECT :443 ×13), ")
     assert lines[2].startswith(f"  VIOLATION {NAME_LOOKUPS} ×130 (nscd socket (ENOENT) ×2, "
                                "port 53 at 0.250.250.200 (ENETUNREACH) ×128), ")
-    assert lines[1].endswith(", tool-call") and len(lines) == 3
+    assert lines[1].endswith(", tool-call") and len(lines) == 4
+    assert lines[3] == "Depth: quick scan: a first look"  # (#174) the depth line, no durations here
 
 
 DIRECT_DNS = ('13    02:34:20.400000 connect(8<socket:[1]>, {sa_family=AF_INET, sin_port=htons(53), '
