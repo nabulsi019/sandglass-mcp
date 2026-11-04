@@ -134,6 +134,11 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
     (#148: missing_program_server INCOMPLETE under notes_readonly, no
     violations, with exactly the reason "the server needs a program the
     sandbox doesn't have: sandglass-missing-program")
+  - every `EXPECTED_DEEP_BUDGET` entry in `scripts/check_fixtures.py`, with
+    `FIXTURE_BUDGETS` (#170: many_tools_server CLEAN under no_network.v1 in
+    both depths: quick with tools "not called" in its coverage summary, deep
+    with every tool run; test-only budgets), and `tests/test_quick_unchanged.py`
+    (the quick scan's frozen docker arguments, MCP messages and budget)
   - `EXPECTED_EXIT_CODES` in `scripts/check_fixtures.py` (the exit code of
     every verdict: 0 CLEAN, 1 VIOLATIONS, 3 INCOMPLETE; 2 is a usage error)
   - the sandbox hardening flags (--network none, --read-only, non-root user,

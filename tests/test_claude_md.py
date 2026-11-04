@@ -44,6 +44,14 @@ def test_every_timeout_fixture_is_protected():
             f"EXPECTED_TIMEOUTS entry {fixture} is not in CLAUDE.md's protected items"
 
 
+def test_every_deep_budget_fixture_is_protected():
+    # (#170) the many-tools fixture, its test-only budgets and the quick-scan freeze.
+    for item in ("`EXPECTED_DEEP_BUDGET`", "`FIXTURE_BUDGETS`", "`tests/test_quick_unchanged.py`"):
+        assert item in PROTECTED, f"{item!r} is not in CLAUDE.md's protected items"
+    for fixture, _ in check_fixtures.EXPECTED_DEEP_BUDGET:
+        assert fixture.removesuffix(".py") in PROTECTED
+
+
 def test_every_runtime_fixture_is_protected():
     # (#142) the runtime noise fixture and its dangerous neighbours.
     assert "`EXPECTED_RUNTIME`" in PROTECTED

@@ -1415,18 +1415,20 @@ def setup_line(setup: dict) -> str:
 def build_report(server: str, timestamp: str, policy: Policy, session: dict,
                  result: dict, trace_file: Path | None, path_mapping: dict,
                  baseline: dict, package: dict | None = None,
-                 server_setup: dict | None = None) -> dict:
+                 server_setup: dict | None = None, depth: str = "quick") -> dict:
     """Assemble everything into the final report dict.
 
     `package` (scan mode, #19): what was scanned, downloaded and installed.
     `trace_file` is None if the server never ran.
     `server_setup` (#144): the --server-arg/--env setup, env names only.
+    `depth` (#170): "quick" or "deep"; a deep run's budget comes from the session.
     """
     cov = coverage(session)
-    return {
+    report = {
         "server": server,
         "timestamp": timestamp,
         "verdict": result["verdict"],
+        "depth": depth,  # which scan ran (#170): "quick" or "deep"
         # The tools that didn't run normally, shown next to the verdict (#143); None if all ran.
         "coverage_summary": coverage_summary(cov),
         "incomplete_reasons": result["incomplete_reasons"],
@@ -1467,6 +1469,10 @@ def build_report(server: str, timestamp: str, policy: Policy, session: dict,
         "not_tested": [DEPENDENCY_HASH_NOTE] if package else [],
         "event_counts": result["event_counts"],
     }
+    if depth == "deep":
+        # (#170) {"seconds", "per_tool", "tools"}; None if the tools were never listed.
+        report["budget"] = session.get("budget")
+    return report
 
 
 def write_reports(report: dict, reports_dir: Path) -> tuple[Path, Path]:
@@ -1491,6 +1497,10 @@ def _markdown(r: dict) -> str:
         *([f"- {duration_line(r['durations'], (r.get('package') or {}).get('files'))}"]
           if r.get("durations") else []),
         f"- Policy: `{r['policy']['name']}`",
+        # (#170) A deep scan's time budget for the tool calls.
+        *([f"- Time budget: {r['budget']['seconds']} s ({r['budget']['per_tool']} s per tool,"
+           f" {r['budget']['tools']} {'tool' if r['budget']['tools'] == 1 else 'tools'})"]
+          if r.get("budget") else []),
         *([f"- Server setup: {setup_line(r['server_setup'])}",
            f"- Reproduce: `{r['server_setup']['command']}`"] if r.get("server_setup") else []),
         *([f"- Inputs: `{r['input_mode']}` mode (where each value came from: \"Tools exercised\")"]
