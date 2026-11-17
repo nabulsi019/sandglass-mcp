@@ -12,6 +12,8 @@ Sandglass runs an MCP server in a sandbox, records what it actually does
   to 'Mohammed AlNabulsi' and user.email to '223641424+nabulsi019@users.noreply.github.com'.
   Never commit as Claude.
 - **Open a PR with `Closes #<n>`.**
+- Every tagged release updates docs/results.md (numbers and its Last updated line) in the same PR, before the tag.
+- Every new issue gets a milestone and at least one label (sandbox, report, policy, fixture, cli, docs, validation).
 - **Merging**: Claude may merge a PR into main only when: both required checks pass,
   there are no conflicts, and none of these protected items were changed:
   - every `EXPECTED` and `EXPECTED_DOMAINS` entry in `scripts/check_fixtures.py`
